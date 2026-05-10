@@ -114,6 +114,13 @@ def handle_text(user_id: str, reply_token: str, text: str):
 
     if raw in {"遊戲設定", "設定遊戲", "遊戲館別", "館別設定"}:
         sess.phase = "choose_game"
+        sess.active = False
+        reply_messages(reply_token, [text_message(game_menu_text())])
+        return
+
+    if raw in {"開始分析", "開始", "啟動分析"}:
+        sess.phase = "choose_game"
+        sess.active = False
         reply_messages(reply_token, [text_message(game_menu_text())])
         return
 
@@ -137,17 +144,9 @@ def handle_text(user_id: str, reply_token: str, text: str):
         ])
         return
 
-    if raw in {"開始分析", "開始", "啟動分析"}:
-        sess.active = True
-        if not sess.game:
-            sess.game = DEFAULT_GAME
-        if not sess.table:
-            sess.table = DEFAULT_TABLE
-        reply_messages(reply_token, [text_message(start_text(sess.game, sess.table))])
-        return
-
     if raw in {"結束分析", "結束", "停止分析", "停止"}:
         sess.active = False
+        sess.phase = "idle"
         reply_messages(reply_token, [text_message(end_text())])
         return
 
@@ -197,7 +196,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
             "⚠️ 格式錯誤\n"
             "請直接輸入點數，例如：65\n"
             "規則：先輸入閒，再輸入莊。\n"
-            "也可輸入「遊戲設定」重新設定館別。"
+            "也可輸入「開始分析」重新設定館別。"
         )
     ])
 
