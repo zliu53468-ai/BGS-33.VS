@@ -156,6 +156,31 @@ MIRROR_RUN_OVERRIDE_EDGE = float(os.getenv("MIRROR_RUN_OVERRIDE_EDGE", "0.042"))
 MIRROR_RUN_CHAOS_RELIEF = float(os.getenv("MIRROR_RUN_CHAOS_RELIEF", "0.085"))
 
 
+# Majority Chase Guard:
+# Handles shoes where Banker/Player counts are very imbalanced and the model
+# keeps chasing the already-dominant side. It does NOT blindly force the minority;
+# it first checks whether the dominant side is truly still in a valid dragon, or
+# whether it is overheated and the minority side has started to revive.
+MAJORITY_CHASE_GUARD = os.getenv("MAJORITY_CHASE_GUARD", "1") == "1"
+MAJORITY_MIN_HISTORY = int(os.getenv("MAJORITY_MIN_HISTORY", "14"))
+MAJORITY_IMBALANCE_TRIGGER = float(os.getenv("MAJORITY_IMBALANCE_TRIGGER", "0.62"))
+MAJORITY_SIDE_RATE_WINDOW = int(os.getenv("MAJORITY_SIDE_RATE_WINDOW", "32"))
+MAJORITY_RECENT_WINDOW = int(os.getenv("MAJORITY_RECENT_WINDOW", "14"))
+MAJORITY_RECENT_STRENGTH_RATE = float(os.getenv("MAJORITY_RECENT_STRENGTH_RATE", "0.64"))
+MAJORITY_CHASE_DAMPEN = float(os.getenv("MAJORITY_CHASE_DAMPEN", "0.034"))
+MAJORITY_OVERHEAT_LEN = int(os.getenv("MAJORITY_OVERHEAT_LEN", "4"))
+MAJORITY_VALID_DRAGON_LEN = int(os.getenv("MAJORITY_VALID_DRAGON_LEN", "5"))
+MAJORITY_VALID_DRAGON_PROTECT = float(os.getenv("MAJORITY_VALID_DRAGON_PROTECT", "0.45"))
+MINORITY_REVIVE_LEN = int(os.getenv("MINORITY_REVIVE_LEN", "2"))
+MINORITY_REVIVE_EDGE = float(os.getenv("MINORITY_REVIVE_EDGE", "0.030"))
+MAJORITY_REVERSAL_TRIGGER = float(os.getenv("MAJORITY_REVERSAL_TRIGGER", "0.56"))
+MAJORITY_FORCE_REVERSAL_SCORE = float(os.getenv("MAJORITY_FORCE_REVERSAL_SCORE", "0.64"))
+MAJORITY_MAX_EDGE = float(os.getenv("MAJORITY_MAX_EDGE", "0.052"))
+MAJORITY_CONF_CAP = float(os.getenv("MAJORITY_CONF_CAP", "0.48"))
+MAJORITY_STRONG_CONF_CAP = float(os.getenv("MAJORITY_STRONG_CONF_CAP", "0.42"))
+MAJORITY_FINAL_OVERRIDE = os.getenv("MAJORITY_FINAL_OVERRIDE", "1") == "1"
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -1392,6 +1417,205 @@ def _tie_score(history: List[str]) -> float:
     return _clamp(pressure, 0.055, TIE_MAX_PROB)
 
 
+
+def _majority_chase_guard(
+    non_tie: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    road: Dict[str, Any],
+    chaos: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Majority Chase Guard / 多數邊追擊保護.
+
+    Problem this solves:
+    If Banker or Player count becomes very uneven, road/streak/recent layers can
+    keep chasing the already-dominant side. This guard does not blindly bet the
+    minority side. Instead, it checks whether the majority side is still a valid
+    strong dragon. If not, it dampens majority chasing; if the minority has begun
+    to connect or reversal evidence is strong, it can flip the final calibration.
+    """
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "多數邊保護未啟動",
+        "score": 0.0,
+        "reasons": [],
+    }
+    if not MAJORITY_CHASE_GUARD or len(non_tie) < MAJORITY_MIN_HISTORY:
+        return base
+
+    side_window = MAJORITY_SIDE_RATE_WINDOW if MAJORITY_SIDE_RATE_WINDOW > 0 else len(non_tie)
+    side_seq = non_tie[-min(len(non_tie), side_window):]
+    if not side_seq:
+        return base
+
+    b_count = side_seq.count("B")
+    p_count = side_seq.count("P")
+    if b_count == p_count:
+        return base
+
+    majority = "B" if b_count > p_count else "P"
+    minority = _opposite(majority)
+    majority_count = max(b_count, p_count)
+    side_rate = majority_count / len(side_seq)
+    if side_rate < MAJORITY_IMBALANCE_TRIGGER:
+        base.update({
+            "majority": majority,
+            "minority": minority,
+            "majority_rate": round(side_rate, 3),
+            "label": "莊閒顆數尚未達多數邊保護",
+        })
+        return base
+
+    pred_side = "B" if b_prob >= p_prob else "P"
+    current_side, current_len = _streak(non_tie)
+    recent = non_tie[-min(len(non_tie), max(4, MAJORITY_RECENT_WINDOW)):]
+    recent_majority_rate = recent.count(majority) / len(recent) if recent else 0.5
+    recent_minority_rate = recent.count(minority) / len(recent) if recent else 0.5
+
+    reasons: List[str] = []
+    score = 0.0
+    imbalance_score = _safe_div(side_rate - MAJORITY_IMBALANCE_TRIGGER, max(0.001, 1 - MAJORITY_IMBALANCE_TRIGGER), 0.0)
+    score += min(0.30, imbalance_score * 0.36)
+    reasons.append(f"{majority}顆數佔比{int(side_rate * 100)}%")
+
+    if pred_side == majority:
+        score += 0.12
+        reasons.append("模型追多數邊")
+    else:
+        # Already not chasing the majority; only keep debug context.
+        base.update({
+            "majority": majority,
+            "minority": minority,
+            "majority_rate": round(side_rate, 3),
+            "recent_majority_rate": round(recent_majority_rate, 3),
+            "current_streak": (current_side, current_len),
+            "label": f"多數邊{majority}已偏高但目前未追多數",
+            "reasons": reasons,
+        })
+        return base
+
+    if recent_majority_rate >= MAJORITY_RECENT_STRENGTH_RATE:
+        score += 0.08
+        reasons.append("近期多數邊仍偏強")
+
+    majority_overheat = current_side == majority and current_len >= MAJORITY_OVERHEAT_LEN
+    if majority_overheat:
+        score += 0.16 + min(0.12, max(0, current_len - MAJORITY_OVERHEAT_LEN) * 0.035)
+        reasons.append(f"多數邊{majority}{current_len}過熱")
+
+    minority_revive = current_side == minority and current_len >= MINORITY_REVIVE_LEN
+    if minority_revive:
+        score += 0.22 + min(0.10, max(0, current_len - MINORITY_REVIVE_LEN) * 0.035)
+        reasons.append(f"少數邊{minority}{current_len}回補啟動")
+
+    road_label = str(road.get("label", "")) if isinstance(road, dict) else ""
+    road_action = str(road.get("road_action", "")) if isinstance(road, dict) else ""
+
+    road_reversal = road.get("reversal") if isinstance(road, dict) else None
+    if isinstance(road_reversal, dict) and road_reversal.get("active") and road_reversal.get("target_side") == minority:
+        score += 0.16 + (0.08 if road_reversal.get("strong") else 0.0)
+        reasons.append("龍長反轉指向少數邊")
+
+    road_mirror = road.get("mirror_run") if isinstance(road, dict) else None
+    if isinstance(road_mirror, dict) and road_mirror.get("active") and road_mirror.get("target_side") == minority:
+        score += 0.10
+        reasons.append("對稱龍長指向少數邊")
+
+    road_chop_to_dragon = road.get("chop_to_dragon") if isinstance(road, dict) else None
+    if isinstance(road_chop_to_dragon, dict) and road_chop_to_dragon.get("active") and road_chop_to_dragon.get("target_side") == minority:
+        score += 0.10
+        reasons.append("單跳轉龍指向少數邊")
+
+    # If majority side is a fresh, valid road state, do not punish it too much.
+    valid_majority_dragon = (
+        current_side == majority
+        and current_len >= MAJORITY_VALID_DRAGON_LEN
+        and road_action == "續龍"
+        and any(key in road_label for key in ["首見", "突破", "長龍", "單跳反轉接龍"])
+        and not minority_revive
+        and not (isinstance(road_reversal, dict) and road_reversal.get("strong"))
+    )
+    if valid_majority_dragon:
+        score *= MAJORITY_VALID_DRAGON_PROTECT
+        reasons.append("多數邊真龍保護")
+
+    if chaos.get("active"):
+        score += 0.06 if not chaos.get("strong") else 0.10
+        reasons.append("混亂盤降低追擊信心")
+
+    score = _clamp(score, 0.0, 1.0)
+    if score < MAJORITY_REVERSAL_TRIGGER:
+        base.update({
+            "active": False,
+            "adjusted": False,
+            "forced": False,
+            "majority": majority,
+            "minority": minority,
+            "majority_rate": round(side_rate, 3),
+            "recent_majority_rate": round(recent_majority_rate, 3),
+            "recent_minority_rate": round(recent_minority_rate, 3),
+            "current_streak": (current_side, current_len),
+            "score": round(score, 3),
+            "label": f"多數邊{majority}偏高｜追擊風險未達修正",
+            "reasons": reasons,
+        })
+        return base
+
+    bp_total = max(0.001, 1 - tie_prob)
+    b_side = b_prob / bp_total
+    p_side = p_prob / bp_total
+
+    forced = MAJORITY_FINAL_OVERRIDE and (
+        score >= MAJORITY_FORCE_REVERSAL_SCORE
+        and (minority_revive or majority_overheat or (isinstance(road_reversal, dict) and road_reversal.get("strong")))
+    )
+
+    if forced:
+        edge = min(MAJORITY_MAX_EDGE, max(0.026, MINORITY_REVIVE_EDGE + (score - MAJORITY_FORCE_REVERSAL_SCORE) * 0.055))
+        if minority == "B":
+            b_side, p_side = 0.5 + edge, 0.5 - edge
+        else:
+            b_side, p_side = 0.5 - edge, 0.5 + edge
+        label = f"多數邊追擊保護｜{majority}過熱轉看{minority}"
+    else:
+        dampen = min(MAJORITY_MAX_EDGE, MAJORITY_CHASE_DAMPEN + max(0.0, score - MAJORITY_REVERSAL_TRIGGER) * 0.050)
+        if majority == "B":
+            b_side = max(0.5 + 0.002, b_side - dampen)
+            p_side = 1 - b_side
+        else:
+            p_side = max(0.5 + 0.002, p_side - dampen)
+            b_side = 1 - p_side
+        label = f"多數邊追擊保護｜降低{majority}追擊信心"
+
+    new_b = b_side * bp_total
+    new_p = p_side * bp_total
+    new_b, new_p, new_t = _normalize_three(new_b, new_p, tie_prob)
+    return {
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": new_b,
+        "P": new_p,
+        "T": new_t,
+        "majority": majority,
+        "minority": minority,
+        "majority_rate": round(side_rate, 3),
+        "recent_majority_rate": round(recent_majority_rate, 3),
+        "recent_minority_rate": round(recent_minority_rate, 3),
+        "current_streak": (current_side, current_len),
+        "score": round(score, 3),
+        "label": label,
+        "reasons": reasons,
+        "bet_mode_hint": "最小注" if not forced else "反轉小注",
+    }
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
@@ -1549,6 +1773,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         mirror_run_final_override = True
 
+
+    majority_guard = _majority_chase_guard(non_tie, b_prob, p_prob, tie_prob, road, chaos)
+    if majority_guard.get("active") and majority_guard.get("adjusted"):
+        b_prob = float(majority_guard.get("B", b_prob))
+        p_prob = float(majority_guard.get("P", p_prob))
+        tie_prob = float(majority_guard.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -1558,6 +1790,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     ]
     if chaos.get("active"):
         votes.append("B" if chaos.get("B", 0.5) >= chaos.get("P", 0.5) else "P")
+    if majority_guard.get("active") and majority_guard.get("adjusted"):
+        votes.append("B" if majority_guard.get("B", 0.5) >= majority_guard.get("P", 0.5) else "P")
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
 
@@ -1574,11 +1808,22 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         cap = CHAOS_STRONG_CONF_CAP if chaos.get("strong") else CHAOS_CONF_CAP
         conf = min(conf, cap)
         level = "混亂盤低信心" if chaos.get("strong") else "混亂盤弱訊號"
+    if majority_guard.get("active") and majority_guard.get("adjusted"):
+        cap = MAJORITY_STRONG_CONF_CAP if majority_guard.get("forced") else MAJORITY_CONF_CAP
+        conf = min(conf, cap)
+        if not chaos.get("active"):
+            level = "多數邊過熱警戒" if majority_guard.get("forced") else "多數邊保護弱訊號"
     reason_parts = [road.get("label", "牌路"), f"模型一致{int(agreement * 100)}%"]
     if chaos.get("active"):
         reason_parts.insert(0, f"{chaos.get('label')}({int(float(chaos.get('score', 0))*100)}%)")
         if LOW_CONFIDENCE_MINBET:
             reason_parts.append("建議最小注")
+    if majority_guard.get("active") and majority_guard.get("adjusted"):
+        reason_parts.insert(0, f"{majority_guard.get('label')}({int(float(majority_guard.get('score', 0))*100)}%)")
+        if majority_guard.get("forced"):
+            reason_parts.append("多數邊過熱轉向校準")
+        else:
+            reason_parts.append("降低多數邊追擊")
     if road.get("road_action"):
         reason_parts.append(f"動作:{road.get('road_action')}")
     if 'reversal_final_override' in locals() and reversal_final_override:
@@ -1608,7 +1853,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recommend_text": {"B": "莊", "P": "閒", "T": "和"}[recommend],
         "confidence": round(conf, 3),
         "signal_level": level,
-        "bet_mode": "最小注" if chaos.get("active") and LOW_CONFIDENCE_MINBET else "信心分級",
+        "bet_mode": "最小注" if ((chaos.get("active") and LOW_CONFIDENCE_MINBET) or (majority_guard.get("active") and majority_guard.get("adjusted"))) else "信心分級",
         "pattern_label": road.get("label", ""),
         "chaos_label": chaos.get("label", ""),
         "chaos_score": chaos.get("score", 0),
@@ -1625,6 +1870,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
+        "majority_guard": majority_guard,
         "effective_weights": {k: round(v, 4) for k, v in weights.items()},
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ai_result": ai_result if os.getenv("DEBUG_AI_RESULT", "0") == "1" else None,
