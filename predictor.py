@@ -136,6 +136,59 @@ CHOP_TO_DRAGON_CHAOS_RELIEF = float(os.getenv("CHOP_TO_DRAGON_CHAOS_RELIEF", "0.
 CHOP_TO_DRAGON_FINAL_OVERRIDE = os.getenv("CHOP_TO_DRAGON_FINAL_OVERRIDE", "1") == "1"
 CHOP_TO_DRAGON_OVERRIDE_EDGE = float(os.getenv("CHOP_TO_DRAGON_OVERRIDE_EDGE", "0.040"))
 
+# Room Pattern Mode:
+# Early detector for double chop, one-room-two-halls, and two-room-one-hall rhythms.
+# It reads run lengths directly so patterns like BB PP B, B PP B, or BB P BB
+# can be detected before the road is already fully obvious.
+ROOM_PATTERN_MODE = os.getenv("ROOM_PATTERN_MODE", "1") == "1"
+ROOM_PATTERN_LOOKBACK = int(os.getenv("ROOM_PATTERN_LOOKBACK", "8"))
+ROOM_PATTERN_MIN_RUNS = int(os.getenv("ROOM_PATTERN_MIN_RUNS", "3"))
+ROOM_PATTERN_EARLY_DETECT = os.getenv("ROOM_PATTERN_EARLY_DETECT", "1") == "1"
+ROOM_PATTERN_MIN_CONSISTENCY = float(os.getenv("ROOM_PATTERN_MIN_CONSISTENCY", "0.72"))
+ROOM_PATTERN_EDGE = float(os.getenv("ROOM_PATTERN_EDGE", "0.044"))
+ROOM_PATTERN_MAX_EDGE = float(os.getenv("ROOM_PATTERN_MAX_EDGE", "0.072"))
+ROOM_PATTERN_STRENGTH = float(os.getenv("ROOM_PATTERN_STRENGTH", "0.218"))
+ONE_TWO_PATTERN_MODE = os.getenv("ONE_TWO_PATTERN_MODE", "1") == "1"
+ONE_TWO_PATTERN_EDGE = float(os.getenv("ONE_TWO_PATTERN_EDGE", "0.046"))
+TWO_ONE_PATTERN_MODE = os.getenv("TWO_ONE_PATTERN_MODE", "1") == "1"
+TWO_ONE_PATTERN_EDGE = float(os.getenv("TWO_ONE_PATTERN_EDGE", "0.046"))
+DOUBLE_CHOP_EARLY_MODE = os.getenv("DOUBLE_CHOP_EARLY_MODE", "1") == "1"
+DOUBLE_CHOP_EARLY_HITS = int(os.getenv("DOUBLE_CHOP_EARLY_HITS", "2"))
+DOUBLE_CHOP_EDGE = float(os.getenv("DOUBLE_CHOP_EDGE", "0.050"))
+DOUBLE_CHOP_BREAK_GUARD = os.getenv("DOUBLE_CHOP_BREAK_GUARD", "1") == "1"
+ROOM_PATTERN_FINAL_OVERRIDE = os.getenv("ROOM_PATTERN_FINAL_OVERRIDE", "1") == "1"
+ROOM_PATTERN_OVERRIDE_EDGE = float(os.getenv("ROOM_PATTERN_OVERRIDE_EDGE", "0.050"))
+ROOM_PATTERN_CHAOS_RELIEF = float(os.getenv("ROOM_PATTERN_CHAOS_RELIEF", "0.080"))
+ROOM_PATTERN_PROTECT_RUNS = int(os.getenv("ROOM_PATTERN_PROTECT_RUNS", "2"))
+
+# Foot Alignment Mode / 對應齊腳模式:
+# Handles "aligned feet" situations: one side fills to the previous side's run length,
+# then decides whether the road usually breaks at the alignment point or continues past it.
+# Examples:
+#   B B -> P       : P may need to fill to P2.
+#   B B -> P P     : feet are aligned; decide P breaks to B or over-steps to P3.
+#   B B B -> P P   : P may need to fill to P3.
+FOOT_ALIGNMENT_MODE = os.getenv("FOOT_ALIGNMENT_MODE", "1") == "1"
+FOOT_ALIGN_LOOKBACK = int(os.getenv("FOOT_ALIGN_LOOKBACK", "10"))
+FOOT_ALIGN_MIN_LEN = int(os.getenv("FOOT_ALIGN_MIN_LEN", "2"))
+FOOT_ALIGN_MAX_LEN = int(os.getenv("FOOT_ALIGN_MAX_LEN", "5"))
+FOOT_ALIGN_MATCH_TOLERANCE = int(os.getenv("FOOT_ALIGN_MATCH_TOLERANCE", "0"))
+FOOT_ALIGN_MIN_CONTEXT = int(os.getenv("FOOT_ALIGN_MIN_CONTEXT", "2"))
+FOOT_ALIGN_EDGE = float(os.getenv("FOOT_ALIGN_EDGE", "0.044"))
+FOOT_ALIGN_BREAK_EDGE = float(os.getenv("FOOT_ALIGN_BREAK_EDGE", "0.050"))
+FOOT_ALIGN_OVER_EDGE = float(os.getenv("FOOT_ALIGN_OVER_EDGE", "0.038"))
+FOOT_ALIGN_MAX_EDGE = float(os.getenv("FOOT_ALIGN_MAX_EDGE", "0.074"))
+FOOT_ALIGN_STRENGTH = float(os.getenv("FOOT_ALIGN_STRENGTH", "0.220"))
+FOOT_ALIGN_BREAK_RATE = float(os.getenv("FOOT_ALIGN_BREAK_RATE", "0.58"))
+FOOT_ALIGN_OVER_RATE = float(os.getenv("FOOT_ALIGN_OVER_RATE", "0.58"))
+FOOT_ALIGN_DEFAULT_BREAK = os.getenv("FOOT_ALIGN_DEFAULT_BREAK", "1") == "1"
+FOOT_ALIGN_BREAK_GUARD = os.getenv("FOOT_ALIGN_BREAK_GUARD", "1") == "1"
+FOOT_ALIGN_OVERFLOW_HANDOFF = int(os.getenv("FOOT_ALIGN_OVERFLOW_HANDOFF", "2"))
+FOOT_ALIGN_FINAL_OVERRIDE = os.getenv("FOOT_ALIGN_FINAL_OVERRIDE", "1") == "1"
+FOOT_ALIGN_OVERRIDE_EDGE = float(os.getenv("FOOT_ALIGN_OVERRIDE_EDGE", "0.054"))
+FOOT_ALIGN_CHAOS_RELIEF = float(os.getenv("FOOT_ALIGN_CHAOS_RELIEF", "0.075"))
+FOOT_ALIGN_ROOM_BOOST = float(os.getenv("FOOT_ALIGN_ROOM_BOOST", "0.014"))
+
 # Mirror Run Mode:
 # Handles short mirror-length road behavior, e.g. B B B -> P P (expect P to fill to 3),
 # then after P P P is completed, prepare for B instead of blindly chasing P4.
@@ -958,6 +1011,462 @@ def _chop_to_dragon_score(non_tie: List[str]) -> Dict[str, Any]:
 
 
 
+def _room_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    Room Pattern Mode / 房型規律模型.
+
+    Detects these short-run rhythms early:
+    - Double chop / 雙跳:       2-2-2...  e.g. BB PP B -> expect B to fill BB; BB PP BB -> expect P
+    - One-room-two-halls / 一房兩廳: 1-2-1-2... e.g. B PP B -> expect P; B PP B P -> expect P to fill PP
+    - Two-room-one-hall / 兩房一廳: 2-1-2-1... e.g. BB P BB -> expect P; BB P BB P -> expect B
+
+    The key improvement is early detection: the current run is allowed to be
+    unfinished when it is shorter than the expected room length. This prevents
+    the model from lagging several hands behind the rhythm.
+    """
+    if not ROOM_PATTERN_MODE or len(non_tie) < 4:
+        return {"B": 0.5, "P": 0.5, "label": "房型資料不足", "strength": 0.0, "active": False}
+
+    runs = _runs(non_tie)
+    if len(runs) < max(3, ROOM_PATTERN_MIN_RUNS):
+        return {"B": 0.5, "P": 0.5, "label": "房型資料不足", "strength": 0.0, "active": False}
+
+    current_side, current_len = runs[-1]
+    lengths = [n for _s, n in runs]
+    tail_runs = runs[-ROOM_PATTERN_LOOKBACK:] if ROOM_PATTERN_LOOKBACK > 0 else runs
+    tail_lengths = [n for _s, n in tail_runs]
+
+    pattern_defs: List[Dict[str, Any]] = []
+    if DOUBLE_CHOP_EARLY_MODE:
+        pattern_defs.append({
+            "key": "double_chop",
+            "name": "雙跳",
+            "pattern": [2, 2],
+            "edge": DOUBLE_CHOP_EDGE,
+            "min_runs": max(3, DOUBLE_CHOP_EARLY_HITS + 1),
+        })
+    if ONE_TWO_PATTERN_MODE:
+        pattern_defs.append({
+            "key": "one_two",
+            "name": "一房兩廳",
+            "pattern": [1, 2],
+            "edge": ONE_TWO_PATTERN_EDGE,
+            "min_runs": max(3, ROOM_PATTERN_MIN_RUNS),
+        })
+    if TWO_ONE_PATTERN_MODE:
+        pattern_defs.append({
+            "key": "two_one",
+            "name": "兩房一廳",
+            "pattern": [2, 1],
+            "edge": TWO_ONE_PATTERN_EDGE,
+            "min_runs": max(3, ROOM_PATTERN_MIN_RUNS),
+        })
+
+    best_eval: Dict[str, Any] | None = None
+
+    for pdef in pattern_defs:
+        pattern = pdef["pattern"]
+        min_runs = int(pdef["min_runs"])
+        if len(tail_lengths) < min_runs:
+            continue
+
+        # Prefer the latest 3~8 runs. For each possible phase offset, score how
+        # well the observed run lengths fit the expected room rhythm.
+        max_eval_runs = min(len(tail_lengths), max(min_runs, ROOM_PATTERN_LOOKBACK))
+        eval_lengths = tail_lengths[-max_eval_runs:]
+        for offset in range(len(pattern)):
+            score = 0.0
+            exact_hits = 0
+            soft_hits = 0
+            completed_hits = 0
+            completed_total = 0
+            mismatch = 0
+            current_expected = pattern[(len(eval_lengths) - 1 + offset) % len(pattern)]
+
+            for i, observed in enumerate(eval_lengths):
+                expected = pattern[(i + offset) % len(pattern)]
+                is_current = i == len(eval_lengths) - 1
+                if is_current:
+                    if observed == expected:
+                        score += 1.0
+                        exact_hits += 1
+                    elif ROOM_PATTERN_EARLY_DETECT and observed < expected:
+                        # Current room has started but is not filled yet; this is
+                        # exactly the early signal we want to catch.
+                        score += 0.82
+                        soft_hits += 1
+                    else:
+                        mismatch += 1
+                else:
+                    completed_total += 1
+                    if observed == expected:
+                        score += 1.0
+                        exact_hits += 1
+                        completed_hits += 1
+                    else:
+                        # Old completed rooms should match more strictly. A small
+                        # mismatch in a longer tail is tolerated but penalized.
+                        mismatch += 1
+                        if len(eval_lengths) >= 6 and abs(observed - expected) == 1 and observed <= 3:
+                            score += 0.35
+
+            consistency = score / max(1, len(eval_lengths))
+            # Require enough completed confirmation; current soft-fill alone is not enough.
+            if completed_total and completed_hits < max(1, min_runs - 2):
+                consistency *= 0.72
+            # If the current run already exceeds expected, the room rhythm is broken.
+            current_overflow = current_len > current_expected
+            if current_overflow:
+                consistency *= 0.55
+
+            eval_data = {
+                "key": pdef["key"],
+                "name": pdef["name"],
+                "pattern": pattern,
+                "offset": offset,
+                "consistency": consistency,
+                "score": score,
+                "exact_hits": exact_hits,
+                "soft_hits": soft_hits,
+                "completed_hits": completed_hits,
+                "completed_total": completed_total,
+                "mismatch": mismatch,
+                "current_expected": current_expected,
+                "current_overflow": current_overflow,
+                "base_edge": float(pdef["edge"]),
+                "eval_lengths": eval_lengths,
+            }
+            if best_eval is None or eval_data["consistency"] > best_eval["consistency"]:
+                best_eval = eval_data
+
+    if not best_eval:
+        return {"B": 0.5, "P": 0.5, "label": "未見房型規律", "strength": 0.0, "active": False}
+
+    consistency = float(best_eval["consistency"])
+    current_expected = int(best_eval["current_expected"])
+    current_overflow = bool(best_eval["current_overflow"])
+
+    # Break guard: do not keep forcing a room pattern after it has clearly overflowed.
+    if current_overflow:
+        if DOUBLE_CHOP_BREAK_GUARD and consistency >= ROOM_PATTERN_MIN_CONSISTENCY * 0.70:
+            return {
+                "B": 0.5,
+                "P": 0.5,
+                "label": f"房型破壞觀察｜{best_eval['name']}超長",
+                "strength": 0.055,
+                "active": False,
+                "room_pattern": True,
+                "phase": "break_guard",
+                "pattern_name": best_eval["name"],
+                "current_side": current_side,
+                "current_len": current_len,
+                "expected_len": current_expected,
+                "consistency": round(consistency, 3),
+                "road_action": "房型破壞/交回全局反轉",
+            }
+        return {"B": 0.5, "P": 0.5, "label": "房型已破壞", "strength": 0.0, "active": False}
+
+    if consistency < ROOM_PATTERN_MIN_CONSISTENCY:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "房型規律未達門檻",
+            "strength": 0.0,
+            "active": False,
+            "best_pattern": best_eval["name"],
+            "consistency": round(consistency, 3),
+        }
+
+    # If current run is shorter than expected, predict same side to fill it.
+    # If it already reached expected length, predict the opposite side to start the next room.
+    if current_len < current_expected:
+        phase = "fill"
+        target_side = current_side
+        action = f"補足{current_side}{current_expected}"
+        label = f"{best_eval['name']}早期補房｜{current_side}{current_len}→{current_expected}"
+    else:
+        phase = "turn"
+        target_side = _opposite(current_side)
+        next_expected = best_eval["pattern"][(len(best_eval["eval_lengths"]) + best_eval["offset"]) % len(best_eval["pattern"])]
+        action = f"轉邊開{target_side}{next_expected}"
+        label = f"{best_eval['name']}節奏成型｜{current_side}{current_len}後{action}"
+
+    # Edge/strength grow with consistency and exact hits, but stay capped so a room
+    # pattern does not overpower a genuinely strong dragon forever.
+    edge = ROOM_PATTERN_EDGE + (consistency - ROOM_PATTERN_MIN_CONSISTENCY) * 0.055
+    edge += min(0.010, int(best_eval.get("exact_hits", 0)) * 0.0025)
+    if best_eval["key"] == "double_chop":
+        edge = max(edge, DOUBLE_CHOP_EDGE)
+    elif best_eval["key"] == "one_two":
+        edge = max(edge, ONE_TWO_PATTERN_EDGE)
+    elif best_eval["key"] == "two_one":
+        edge = max(edge, TWO_ONE_PATTERN_EDGE)
+    edge = min(ROOM_PATTERN_MAX_EDGE, edge)
+
+    strength = ROOM_PATTERN_STRENGTH + min(0.045, (consistency - ROOM_PATTERN_MIN_CONSISTENCY) * 0.18)
+    if phase == "fill":
+        strength += 0.012
+    if int(best_eval.get("exact_hits", 0)) >= 4:
+        strength += 0.012
+    strength = _clamp(strength, 0.10, 0.285)
+
+    b, p = _bp_score(target_side, 0.5 + edge)
+    return {
+        "B": b,
+        "P": p,
+        "label": label,
+        "strength": strength,
+        "active": True,
+        "room_pattern": True,
+        "phase": phase,
+        "pattern_key": best_eval["key"],
+        "pattern_name": best_eval["name"],
+        "pattern": best_eval["pattern"],
+        "target_side": target_side,
+        "current_side": current_side,
+        "current_len": current_len,
+        "expected_len": current_expected,
+        "edge": round(edge, 5),
+        "consistency": round(consistency, 3),
+        "exact_hits": int(best_eval.get("exact_hits", 0)),
+        "soft_hits": int(best_eval.get("soft_hits", 0)),
+        "mismatch": int(best_eval.get("mismatch", 0)),
+        "eval_lengths": best_eval.get("eval_lengths", []),
+        "road_action": "房型補足/轉邊",
+        "bet_mode_hint": "房型小注" if consistency < 0.82 else "房型順勢",
+    }
+
+
+
+def _foot_alignment_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    Foot Alignment Mode / 對應齊腳模式.
+
+    This layer focuses on the exact situation the user described:
+    - One side is filling up to the previous side's run length (對應齊腳前補腳).
+    - Once both sides have the same run length, decide whether that alignment usually
+      breaks to the other side or continues past the foot.
+    - If it over-steps by only 1~2 hands, treat it as "not broken yet" but hand it
+      back to dragon/reversal if it keeps extending.
+
+    It is deliberately more specific than Mirror Run and Room Pattern:
+    Mirror Run asks whether the current run should mirror the prior length;
+    Foot Alignment asks what to do exactly at the aligned foot and immediately after it.
+    """
+    if not FOOT_ALIGNMENT_MODE or len(non_tie) < 4:
+        return {"B": 0.5, "P": 0.5, "label": "齊腳資料不足", "strength": 0.0, "active": False}
+
+    runs = _runs(non_tie)
+    if len(runs) < 2:
+        return {"B": 0.5, "P": 0.5, "label": "齊腳資料不足", "strength": 0.0, "active": False}
+
+    prev_side, prev_len = runs[-2]
+    current_side, current_len = runs[-1]
+    if prev_side == current_side:
+        return {"B": 0.5, "P": 0.5, "label": "非對應齊腳", "strength": 0.0, "active": False}
+
+    if prev_len < FOOT_ALIGN_MIN_LEN or prev_len > FOOT_ALIGN_MAX_LEN:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "齊腳長度不適用",
+            "strength": 0.0,
+            "active": False,
+            "prev_len": prev_len,
+            "current_len": current_len,
+        }
+
+    tol = max(0, FOOT_ALIGN_MATCH_TOLERANCE)
+    completed = runs[:-1]
+    recent_completed = completed[-FOOT_ALIGN_LOOKBACK:] if FOOT_ALIGN_LOOKBACK > 0 else completed
+
+    break_count = 0      # aligned then broke at that foot length
+    over_count = 0       # aligned then continued past the foot length
+    under_count = 0      # did not reach the previous foot length
+    pair_samples = 0
+    same_target_samples = 0
+
+    # Study prior opposite-side run pairs: prev run length -> next run length.
+    # If next run length == prev run length, the road broke right after alignment.
+    # If next run length > prev run length, it did not break and over-stepped.
+    for i in range(1, len(recent_completed)):
+        ps, pl = recent_completed[i - 1]
+        cs, cl = recent_completed[i]
+        if ps == cs:
+            continue
+        if pl < FOOT_ALIGN_MIN_LEN or pl > FOOT_ALIGN_MAX_LEN:
+            continue
+        pair_samples += 1
+        if abs(pl - prev_len) <= tol:
+            same_target_samples += 1
+            if abs(cl - pl) <= tol:
+                break_count += 1
+            elif cl > pl + tol:
+                over_count += 1
+            else:
+                under_count += 1
+
+    useful_samples = break_count + over_count
+    break_rate = _safe_div(break_count, useful_samples, 0.0)
+    over_rate = _safe_div(over_count, useful_samples, 0.0)
+
+    # Phase 1: current side has not aligned yet, so fill to the previous foot.
+    if current_len < prev_len - tol:
+        missing = prev_len - current_len
+        edge = FOOT_ALIGN_EDGE + min(0.014, current_len * 0.005) + min(0.010, same_target_samples * 0.003)
+        edge = min(FOOT_ALIGN_MAX_EDGE, edge)
+        strength = FOOT_ALIGN_STRENGTH + 0.012 + min(0.020, same_target_samples * 0.005)
+        b, p = _bp_score(current_side, 0.5 + edge)
+        return {
+            "B": b,
+            "P": p,
+            "label": f"對應補齊腳{current_side}{current_len}→{prev_len}｜承接{prev_side}{prev_len}",
+            "strength": _clamp(strength, 0.10, 0.255),
+            "active": True,
+            "foot_alignment": True,
+            "phase": "fill_to_foot",
+            "target_side": current_side,
+            "prev_side": prev_side,
+            "prev_len": prev_len,
+            "current_side": current_side,
+            "current_len": current_len,
+            "missing": missing,
+            "edge": round(edge, 5),
+            "break_count": break_count,
+            "over_count": over_count,
+            "break_rate": round(break_rate, 3),
+            "over_rate": round(over_rate, 3),
+            "same_target_samples": same_target_samples,
+            "road_action": "對應補齊腳/續到同長度",
+        }
+
+    # Phase 2: exactly at the foot. Decide break versus no-break.
+    aligned_now = abs(current_len - prev_len) <= tol
+    if aligned_now:
+        has_context = useful_samples >= FOOT_ALIGN_MIN_CONTEXT
+        room_pattern = _room_pattern_score(non_tie) if ROOM_PATTERN_MODE else {"active": False}
+        room_target = room_pattern.get("target_side") if isinstance(room_pattern, dict) else None
+        room_active = bool(isinstance(room_pattern, dict) and room_pattern.get("active"))
+
+        # Historical evidence: if prior equal-foot situations usually broke, turn.
+        if has_context and break_rate >= FOOT_ALIGN_BREAK_RATE:
+            target_side = _opposite(current_side)
+            phase = "aligned_break"
+            edge = FOOT_ALIGN_BREAK_EDGE + min(0.016, (break_rate - FOOT_ALIGN_BREAK_RATE) * 0.08)
+            label = f"齊腳破路觀察{current_side}{current_len}={prev_side}{prev_len}｜轉看{target_side}"
+            action = "齊腳後破路/轉邊"
+            strength_bonus = 0.030
+        # Historical evidence: if prior equal-foot situations usually over-stepped, continue.
+        elif has_context and over_rate >= FOOT_ALIGN_OVER_RATE:
+            target_side = current_side
+            phase = "aligned_over"
+            edge = FOOT_ALIGN_OVER_EDGE + min(0.014, (over_rate - FOOT_ALIGN_OVER_RATE) * 0.07)
+            label = f"齊腳未破續腳{current_side}{current_len}={prev_side}{prev_len}｜觀察過腳"
+            action = "齊腳未破/續腳"
+            strength_bonus = 0.018
+        # Room rhythm can resolve tie-breaks at the foot.
+        elif room_active and room_target in {"B", "P"}:
+            target_side = str(room_target)
+            phase = "aligned_room"
+            edge = FOOT_ALIGN_EDGE + FOOT_ALIGN_ROOM_BOOST
+            label = f"齊腳對應房型{current_side}{current_len}={prev_side}{prev_len}｜房型指向{target_side}"
+            action = "齊腳後依房型補足/轉邊"
+            strength_bonus = 0.022
+        elif FOOT_ALIGN_DEFAULT_BREAK:
+            target_side = _opposite(current_side)
+            phase = "aligned_default_break"
+            # Default break is intentionally weaker than evidence-backed break.
+            edge = max(0.026, FOOT_ALIGN_BREAK_EDGE * 0.72)
+            label = f"齊腳轉邊觀察{current_side}{current_len}={prev_side}{prev_len}｜樣本不足先看{target_side}"
+            action = "齊腳樣本不足/小注轉邊觀察"
+            strength_bonus = 0.000
+        else:
+            return {
+                "B": 0.5,
+                "P": 0.5,
+                "label": "齊腳樣本不足",
+                "strength": 0.0,
+                "active": False,
+                "phase": "aligned_unclear",
+                "prev_len": prev_len,
+                "current_len": current_len,
+                "break_rate": round(break_rate, 3),
+                "over_rate": round(over_rate, 3),
+            }
+
+        edge = min(FOOT_ALIGN_MAX_EDGE, edge)
+        strength = FOOT_ALIGN_STRENGTH + strength_bonus + min(0.018, useful_samples * 0.004)
+        b, p = _bp_score(target_side, 0.5 + edge)
+        return {
+            "B": b,
+            "P": p,
+            "label": label,
+            "strength": _clamp(strength, 0.10, 0.270),
+            "active": True,
+            "foot_alignment": True,
+            "phase": phase,
+            "target_side": target_side,
+            "prev_side": prev_side,
+            "prev_len": prev_len,
+            "current_side": current_side,
+            "current_len": current_len,
+            "edge": round(edge, 5),
+            "break_count": break_count,
+            "over_count": over_count,
+            "under_count": under_count,
+            "break_rate": round(break_rate, 3),
+            "over_rate": round(over_rate, 3),
+            "useful_samples": useful_samples,
+            "same_target_samples": same_target_samples,
+            "room_pattern": room_pattern if room_active else None,
+            "road_action": action,
+            "bet_mode_hint": "齊腳小注" if phase == "aligned_default_break" else "齊腳順勢",
+        }
+
+    # Phase 3: already over-stepped the foot. If the over-step is small, treat it
+    # as "not broken yet"; if it keeps going, hand back to dragon/global reversal.
+    if current_len > prev_len + tol:
+        overflow = current_len - prev_len
+        if FOOT_ALIGN_BREAK_GUARD and overflow <= FOOT_ALIGN_OVERFLOW_HANDOFF:
+            # Continue only mildly: this confirms no-break, but should not fight a strong reversal forever.
+            edge = FOOT_ALIGN_OVER_EDGE + min(0.012, overflow * 0.005) + min(0.010, over_rate * 0.012)
+            edge = min(FOOT_ALIGN_MAX_EDGE, edge)
+            strength = FOOT_ALIGN_STRENGTH * 0.78 + min(0.018, over_count * 0.004)
+            b, p = _bp_score(current_side, 0.5 + edge)
+            return {
+                "B": b,
+                "P": p,
+                "label": f"齊腳未破過腳{current_side}{current_len}>{prev_side}{prev_len}｜短延伸續路",
+                "strength": _clamp(strength, 0.08, 0.220),
+                "active": True,
+                "foot_alignment": True,
+                "phase": "overfoot_continue",
+                "target_side": current_side,
+                "prev_side": prev_side,
+                "prev_len": prev_len,
+                "current_side": current_side,
+                "current_len": current_len,
+                "overflow": overflow,
+                "edge": round(edge, 5),
+                "break_rate": round(break_rate, 3),
+                "over_rate": round(over_rate, 3),
+                "over_count": over_count,
+                "road_action": "齊腳未破/短過腳續路",
+            }
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "齊腳已過長交回龍判斷",
+            "strength": 0.0,
+            "active": False,
+            "phase": "overfoot_handoff",
+            "prev_len": prev_len,
+            "current_len": current_len,
+        }
+
+    return {"B": 0.5, "P": 0.5, "label": "未見齊腳對應", "strength": 0.0, "active": False}
+
+
 def _mirror_run_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     Mirror Run Mode / 對稱龍長模式.
@@ -1250,6 +1759,37 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
         score -= MIRROR_RUN_CHAOS_RELIEF
         reasons.append("對稱補龍/補滿轉邊")
 
+    # 7.7) Room patterns are structured rhythms, not pure chaos. When a clear
+    # one-two / two-one / double-chop rhythm is active, reduce chaos so the room
+    # model can guide the next fill/turn earlier.
+    room_pattern = _room_pattern_score(non_tie)
+    if room_pattern.get("active"):
+        metrics["room_pattern"] = {
+            "phase": room_pattern.get("phase"),
+            "pattern_name": room_pattern.get("pattern_name"),
+            "target_side": room_pattern.get("target_side"),
+            "current_len": room_pattern.get("current_len"),
+            "expected_len": room_pattern.get("expected_len"),
+            "consistency": room_pattern.get("consistency"),
+        }
+        score -= ROOM_PATTERN_CHAOS_RELIEF
+        reasons.append("房型規律補足/轉邊")
+
+    # 7.8) Foot alignment is also a structured road state. It should reduce chaos
+    # when it is guiding a fill / aligned-foot break / no-break continuation.
+    foot_alignment = _foot_alignment_score(non_tie)
+    if foot_alignment.get("active"):
+        metrics["foot_alignment"] = {
+            "phase": foot_alignment.get("phase"),
+            "target_side": foot_alignment.get("target_side"),
+            "prev_len": foot_alignment.get("prev_len"),
+            "current_len": foot_alignment.get("current_len"),
+            "break_rate": foot_alignment.get("break_rate"),
+            "over_rate": foot_alignment.get("over_rate"),
+        }
+        score -= FOOT_ALIGN_CHAOS_RELIEF
+        reasons.append("對應齊腳補腳/破路")
+
     # 8) Alternating tail failed at the end.
     if PATTERN_FAILURE_COUNTER and len(recent) >= 8:
         before = recent[-8:-2]
@@ -1297,6 +1837,10 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
         "chop_to_dragon": locals().get("chop_to_dragon", None),
         "mirror_run_active": bool(locals().get("mirror_run", {}).get("active")),
         "mirror_run": locals().get("mirror_run", None),
+        "room_pattern_active": bool(locals().get("room_pattern", {}).get("active")),
+        "room_pattern": locals().get("room_pattern", None),
+        "foot_alignment_active": bool(locals().get("foot_alignment", {}).get("active")),
+        "foot_alignment": locals().get("foot_alignment", None),
     }
 
 
@@ -1327,6 +1871,16 @@ def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
             streak_factor = max(streak_factor, 0.64)
             recent_factor = max(recent_factor, 1.32)
             markov_factor = max(markov_factor, 1.10)
+        if chaos.get("room_pattern_active"):
+            road_factor = max(road_factor, 0.78)
+            streak_factor = max(streak_factor, 0.60)
+            recent_factor = max(recent_factor, 1.28)
+            markov_factor = max(markov_factor, 1.08)
+        if chaos.get("foot_alignment_active"):
+            road_factor = max(road_factor, 0.80)
+            streak_factor = max(streak_factor, 0.58)
+            recent_factor = max(recent_factor, 1.26)
+            markov_factor = max(markov_factor, 1.08)
         weights = {
             "markov": MARKOV_WEIGHT * markov_factor,
             "road": ROAD_WEIGHT * road_factor,
@@ -1343,6 +1897,8 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     candidates = [
         _dragon_score(non_tie),
         _run_cycle_score(non_tie),
+        _room_pattern_score(non_tie),
+        _foot_alignment_score(non_tie),
         _mirror_run_score(non_tie),
         _chop_score(non_tie),
         _chop_to_dragon_score(non_tie),
@@ -1367,6 +1923,10 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
         best["chop_to_dragon"] = dict(best)
     if best.get("active") and "對稱" in str(best.get("label", "")):
         best["mirror_run"] = dict(best)
+    if best.get("active") and best.get("room_pattern"):
+        best["room_pattern"] = dict(best)
+    if best.get("active") and best.get("foot_alignment"):
+        best["foot_alignment"] = dict(best)
     if second and second.get("strength", 0) >= 0.12 and second.get("label") != best.get("label"):
         best["secondary_label"] = second.get("label")
         # Small blend to avoid one pattern totally dominating another valid road mode.
@@ -1990,6 +2550,19 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "trigger": GLOBAL_REVERSAL_TRIGGER,
             "after_tie": AFTER_TIE_REVERSAL_MODE,
         },
+        "room_pattern_config": {
+            "enabled": ROOM_PATTERN_MODE,
+            "lookback": ROOM_PATTERN_LOOKBACK,
+            "min_consistency": ROOM_PATTERN_MIN_CONSISTENCY,
+            "final_override": ROOM_PATTERN_FINAL_OVERRIDE,
+        },
+        "foot_alignment_config": {
+            "enabled": FOOT_ALIGNMENT_MODE,
+            "lookback": FOOT_ALIGN_LOOKBACK,
+            "break_rate": FOOT_ALIGN_BREAK_RATE,
+            "over_rate": FOOT_ALIGN_OVER_RATE,
+            "final_override": FOOT_ALIGN_FINAL_OVERRIDE,
+        },
     }
 
     ai_result = None
@@ -2084,6 +2657,68 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         mirror_run_final_override = True
 
+    room_pattern_final_override = False
+    road_room_pattern = road.get("room_pattern") if isinstance(road, dict) else None
+    if (
+        ROOM_PATTERN_FINAL_OVERRIDE
+        and isinstance(road_room_pattern, dict)
+        and road_room_pattern.get("active")
+        and road_room_pattern.get("target_side") in {"B", "P"}
+        and road_room_pattern.get("phase") in {"fill", "turn"}
+    ):
+        target_side = str(road_room_pattern.get("target_side"))
+        raw_edge = float(road_room_pattern.get("edge", ROOM_PATTERN_EDGE))
+        # Fill phase gets a stronger override because it is often the exact hand
+        # where the old model lagged behind one-two/two-one/double-chop rhythm.
+        factor = 1.0 if road_room_pattern.get("phase") == "fill" else 0.92
+        edge = min(ROOM_PATTERN_OVERRIDE_EDGE, max(0.024, raw_edge * factor))
+        bp_total = max(0.001, 1 - tie_prob)
+        if target_side == "B":
+            b_prob = (0.5 + edge) * bp_total
+            p_prob = (0.5 - edge) * bp_total
+        else:
+            b_prob = (0.5 - edge) * bp_total
+            p_prob = (0.5 + edge) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        room_pattern_final_override = True
+
+    foot_alignment_final_override = False
+    road_foot_alignment = road.get("foot_alignment") if isinstance(road, dict) else None
+    if (
+        FOOT_ALIGN_FINAL_OVERRIDE
+        and isinstance(road_foot_alignment, dict)
+        and road_foot_alignment.get("active")
+        and road_foot_alignment.get("target_side") in {"B", "P"}
+        and road_foot_alignment.get("phase") in {"fill_to_foot", "aligned_break", "aligned_over", "aligned_room", "aligned_default_break", "overfoot_continue"}
+    ):
+        target_side = str(road_foot_alignment.get("target_side"))
+        raw_edge = float(road_foot_alignment.get("edge", FOOT_ALIGN_EDGE))
+        phase = str(road_foot_alignment.get("phase", ""))
+        # Evidence-backed aligned break can be stronger. Fill/default/overfoot are helpful
+        # but should stay a little softer so they do not fight strong dragon reversal.
+        if phase == "aligned_break":
+            factor = 1.00
+        elif phase == "aligned_room":
+            factor = 0.94
+        elif phase == "fill_to_foot":
+            factor = 0.88
+        elif phase == "aligned_over":
+            factor = 0.82
+        elif phase == "overfoot_continue":
+            factor = 0.72
+        else:
+            factor = 0.76
+        edge = min(FOOT_ALIGN_OVERRIDE_EDGE, max(0.022, raw_edge * factor))
+        bp_total = max(0.001, 1 - tie_prob)
+        if target_side == "B":
+            b_prob = (0.5 + edge) * bp_total
+            p_prob = (0.5 - edge) * bp_total
+        else:
+            b_prob = (0.5 - edge) * bp_total
+            p_prob = (0.5 + edge) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        foot_alignment_final_override = True
+
 
     majority_guard = _majority_chase_guard(non_tie, b_prob, p_prob, tie_prob, road, chaos)
     if majority_guard.get("active") and majority_guard.get("adjusted"):
@@ -2112,6 +2747,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if majority_guard.get("B", 0.5) >= majority_guard.get("P", 0.5) else "P")
     if global_reversal.get("active") and global_reversal.get("adjusted"):
         votes.append("B" if global_reversal.get("B", 0.5) >= global_reversal.get("P", 0.5) else "P")
+    if 'road_room_pattern' in locals() and isinstance(road_room_pattern, dict) and road_room_pattern.get("active"):
+        votes.append("B" if road_room_pattern.get("B", 0.5) >= road_room_pattern.get("P", 0.5) else "P")
+    if 'road_foot_alignment' in locals() and isinstance(road_foot_alignment, dict) and road_foot_alignment.get("active"):
+        votes.append("B" if road_foot_alignment.get("B", 0.5) >= road_foot_alignment.get("P", 0.5) else "P")
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
 
@@ -2163,6 +2802,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.append("單跳轉龍校準")
     if 'mirror_run_final_override' in locals() and mirror_run_final_override:
         reason_parts.append("對稱龍長校準")
+    if 'room_pattern_final_override' in locals() and room_pattern_final_override:
+        reason_parts.append("房型規律校準")
+    if 'foot_alignment_final_override' in locals() and foot_alignment_final_override:
+        reason_parts.append("對應齊腳校準")
     if road.get("secondary_label"):
         reason_parts.append(f"副路:{road.get('secondary_label')}")
     if ai_result and ai_result.get("pattern_label"):
@@ -2202,11 +2845,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "reversal": road.get("reversal"),
             "chop_to_dragon": road.get("chop_to_dragon"),
             "mirror_run": road.get("mirror_run"),
+            "room_pattern": road.get("room_pattern"),
+            "foot_alignment": road.get("foot_alignment"),
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
+        "room_pattern": road.get("room_pattern") if isinstance(road, dict) else None,
+        "foot_alignment": road.get("foot_alignment") if isinstance(road, dict) else None,
         "effective_weights": {k: round(v, 4) for k, v in weights.items()},
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ai_result": ai_result if os.getenv("DEBUG_AI_RESULT", "0") == "1" else None,
