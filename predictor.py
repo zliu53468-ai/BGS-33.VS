@@ -89,6 +89,54 @@ CHOP_BREAK_MIN_PRE_RATE = float(os.getenv("CHOP_BREAK_MIN_PRE_RATE", "0.72"))
 CHOP_BREAK_DROP = float(os.getenv("CHOP_BREAK_DROP", "0.22"))
 
 
+# First-side Dragon Mode:
+# Handles the first Banker/Player dragon in a shoe. If this side has not shown
+# a same-side dragon earlier, do not treat the absence of history as evidence
+# against continuation.
+FIRST_SIDE_DRAGON_MODE = os.getenv("FIRST_SIDE_DRAGON_MODE", "1") == "1"
+FIRST_SIDE_DRAGON_MIN_LEN = int(os.getenv("FIRST_SIDE_DRAGON_MIN_LEN", "4"))
+FIRST_SIDE_DRAGON_BASELINE = int(os.getenv("FIRST_SIDE_DRAGON_BASELINE", "3"))
+FIRST_SIDE_DRAGON_PROTECT_STEPS = int(os.getenv("FIRST_SIDE_DRAGON_PROTECT_STEPS", "2"))
+FIRST_SIDE_DRAGON_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_EDGE", "0.034"))
+FIRST_SIDE_DRAGON_MAX_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_MAX_EDGE", "0.055"))
+SIDE_AWARE_BREAKOUT = os.getenv("SIDE_AWARE_BREAKOUT", "1") == "1"
+
+# Dragon reversal / turning-point controls.
+# This layer asks whether an active dragon is likely entering a turning zone.
+# It uses length fatigue, repeated same-side cut lengths, imbalance, and prior
+# max length instead of blindly following every long dragon.
+DRAGON_REVERSAL_MODE = os.getenv("DRAGON_REVERSAL_MODE", "1") == "1"
+REVERSAL_MIN_LEN = int(os.getenv("REVERSAL_MIN_LEN", "6"))
+REVERSAL_FATIGUE_LEN = int(os.getenv("REVERSAL_FATIGUE_LEN", "8"))
+REVERSAL_TRIGGER = float(os.getenv("REVERSAL_TRIGGER", "0.46"))
+REVERSAL_STRONG_TRIGGER = float(os.getenv("REVERSAL_STRONG_TRIGGER", "0.62"))
+REVERSAL_REPEAT_NEAR_MIN = int(os.getenv("REVERSAL_REPEAT_NEAR_MIN", "2"))
+REVERSAL_OVER_MAX_LEN = int(os.getenv("REVERSAL_OVER_MAX_LEN", "2"))
+REVERSAL_IMBALANCE_TRIGGER = float(os.getenv("REVERSAL_IMBALANCE_TRIGGER", "0.62"))
+REVERSAL_EDGE = float(os.getenv("REVERSAL_EDGE", "0.040"))
+REVERSAL_HARD_EDGE = float(os.getenv("REVERSAL_HARD_EDGE", "0.070"))
+REVERSAL_PROTECT_FIRST_STEPS = int(os.getenv("REVERSAL_PROTECT_FIRST_STEPS", "1"))
+REVERSAL_FINAL_OVERRIDE = os.getenv("REVERSAL_FINAL_OVERRIDE", "1") == "1"
+REVERSAL_OVERRIDE_EDGE = float(os.getenv("REVERSAL_OVERRIDE_EDGE", "0.058"))
+
+# Single-chop to dragon transition controls.
+# Handles shoes that start as short single-jump / alternating road, then suddenly
+# stop jumping and begin connecting one side into a dragon. This prevents the
+# model from continuing to force chop after the first 2~3 connected hands.
+CHOP_TO_DRAGON_MODE = os.getenv("CHOP_TO_DRAGON_MODE", "1") == "1"
+CHOP_TO_DRAGON_WINDOW = int(os.getenv("CHOP_TO_DRAGON_WINDOW", "12"))
+CHOP_TO_DRAGON_PRE_MIN_RATE = float(os.getenv("CHOP_TO_DRAGON_PRE_MIN_RATE", "0.72"))
+CHOP_TO_DRAGON_MIN_RUN = int(os.getenv("CHOP_TO_DRAGON_MIN_RUN", "2"))
+CHOP_TO_DRAGON_CONFIRM_RUN = int(os.getenv("CHOP_TO_DRAGON_CONFIRM_RUN", "3"))
+CHOP_TO_DRAGON_PROTECT_STEPS = int(os.getenv("CHOP_TO_DRAGON_PROTECT_STEPS", "2"))
+CHOP_TO_DRAGON_EDGE = float(os.getenv("CHOP_TO_DRAGON_EDGE", "0.038"))
+CHOP_TO_DRAGON_MAX_EDGE = float(os.getenv("CHOP_TO_DRAGON_MAX_EDGE", "0.068"))
+CHOP_TO_DRAGON_STRENGTH = float(os.getenv("CHOP_TO_DRAGON_STRENGTH", "0.195"))
+CHOP_TO_DRAGON_CHAOS_RELIEF = float(os.getenv("CHOP_TO_DRAGON_CHAOS_RELIEF", "0.10"))
+CHOP_TO_DRAGON_FINAL_OVERRIDE = os.getenv("CHOP_TO_DRAGON_FINAL_OVERRIDE", "1") == "1"
+CHOP_TO_DRAGON_OVERRIDE_EDGE = float(os.getenv("CHOP_TO_DRAGON_OVERRIDE_EDGE", "0.040"))
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -252,7 +300,13 @@ def _breakout_dragon_context(non_tie: List[str], side: str, n: int) -> Dict[str,
 
     max_same = max(same_side_lengths) if same_side_lengths else 0
     max_all = max(all_lengths)
-    baseline = max_same if max_same > 0 else max_all
+    if SIDE_AWARE_BREAKOUT:
+        # Important: Banker and Player dragons must be judged separately.
+        # If Player never had a long dragon, do not use Banker's max dragon length
+        # to suppress the first Player dragon, and vice versa.
+        baseline = max_same if max_same > 0 else FIRST_SIDE_DRAGON_BASELINE
+    else:
+        baseline = max_same if max_same > 0 else max_all
 
     # Not a breakout yet.
     if n <= baseline:
@@ -310,6 +364,193 @@ def _breakout_dragon_context(non_tie: List[str], side: str, n: int) -> Dict[str,
         "label": label,
     }
 
+
+
+def _first_side_dragon_context(non_tie: List[str], side: str, n: int) -> Dict[str, Any]:
+    """
+    First-side Dragon Mode.
+
+    Some shoes do not show a same-side dragon early. If the current side reaches
+    4+ for the first time, the old model may be too slow because it reads
+    "no same-side history" as "this side does not pull dragons." This context
+    treats the first same-side dragon as a possible new road state and protects
+    the first 1~2 continuation hands.
+    """
+    if not FIRST_SIDE_DRAGON_MODE or not side or n < FIRST_SIDE_DRAGON_MIN_LEN:
+        return {"active": False}
+
+    runs = _runs(non_tie)
+    if len(runs) < 3:
+        return {"active": False}
+
+    completed = runs[:-1]
+    recent = completed[-DRAGON_MEMORY_LOOKBACK:] if DRAGON_MEMORY_LOOKBACK > 0 else completed
+    same_side_lengths = [length for s, length in recent if s == side]
+    opp_side_lengths = [length for s, length in recent if s != side]
+
+    max_same = max(same_side_lengths) if same_side_lengths else 0
+    max_opp = max(opp_side_lengths) if opp_side_lengths else 0
+    same_long_count = sum(1 for length in same_side_lengths if length >= FIRST_SIDE_DRAGON_BASELINE)
+
+    # This side has not really shown a dragon yet, but the current run is now forming one.
+    first_side = same_long_count == 0 or max_same < FIRST_SIDE_DRAGON_BASELINE
+    if not first_side:
+        return {"active": False, "max_same": max_same, "same_long_count": same_long_count}
+
+    # Protect the first side dragon only around its starting zone. If it becomes very long,
+    # reversal mode should be allowed to take over.
+    over = max(0, n - FIRST_SIDE_DRAGON_MIN_LEN)
+    if over <= FIRST_SIDE_DRAGON_PROTECT_STEPS:
+        edge = min(FIRST_SIDE_DRAGON_MAX_EDGE, FIRST_SIDE_DRAGON_EDGE + over * 0.008)
+        phase = "first_side_protect"
+        label = f"首見{side}龍{n}｜同邊首次成龍續龍保護"
+        strength_bonus = 0.038
+    else:
+        edge = max(0.006, FIRST_SIDE_DRAGON_EDGE * 0.45 - (over - FIRST_SIDE_DRAGON_PROTECT_STEPS) * 0.006)
+        phase = "first_side_extend"
+        label = f"首見{side}龍{n}｜首見龍延伸降信心"
+        strength_bonus = 0.018
+
+    return {
+        "active": True,
+        "phase": phase,
+        "side": side,
+        "length": n,
+        "over": over,
+        "max_same": max_same,
+        "max_opp": max_opp,
+        "same_long_count": same_long_count,
+        "cont_adjust": round(edge, 5),
+        "strength_bonus": strength_bonus,
+        "label": label,
+    }
+
+
+def _dragon_reversal_context(
+    non_tie: List[str],
+    side: str,
+    n: int,
+    breakout: Dict[str, Any] | None = None,
+    first_side: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Dragon reversal / turning-point detector.
+
+    It does not blindly reverse every long dragon. It waits for several pieces of
+    evidence: fatigue length, repeated near cut lengths, over-extension versus
+    same-side historical max, heavy side imbalance, or many recent runs below the
+    current length.
+    """
+    if not DRAGON_REVERSAL_MODE or not side or n < REVERSAL_MIN_LEN:
+        return {"active": False, "score": 0.0}
+
+    runs = _runs(non_tie)
+    if len(runs) < 4:
+        return {"active": False, "score": 0.0}
+
+    completed = runs[:-1]
+    recent_completed = completed[-DRAGON_MEMORY_LOOKBACK:] if DRAGON_MEMORY_LOOKBACK > 0 else completed
+    recent_lengths = [length for _s, length in recent_completed]
+    same_side_lengths = [length for s, length in recent_completed if s == side]
+    if not recent_lengths:
+        return {"active": False, "score": 0.0}
+
+    max_same = max(same_side_lengths) if same_side_lengths else 0
+    max_all = max(recent_lengths)
+    med_len = median(recent_lengths) if recent_lengths else 1
+    near_same_cut = sum(1 for length in same_side_lengths[-12:] if abs(length - n) <= 1)
+    near_all_cut = sum(1 for length in recent_lengths[-12:] if abs(length - n) <= 1)
+    below_cut_count = sum(1 for length in recent_lengths[-12:] if length < n)
+
+    recent_tail = non_tie[-min(len(non_tie), max(12, CHAOS_WINDOW)):] if non_tie else []
+    side_rate = recent_tail.count(side) / len(recent_tail) if recent_tail else 0.5
+
+    score = 0.0
+    reasons: List[str] = []
+
+    # Long enough to start looking for a turn.
+    if n >= REVERSAL_FATIGUE_LEN:
+        score += 0.22 + min(0.14, (n - REVERSAL_FATIGUE_LEN) * 0.035)
+        reasons.append("疲勞長度")
+
+    # Same side used to break around this zone.
+    if near_same_cut >= REVERSAL_REPEAT_NEAR_MIN:
+        score += 0.22 + min(0.08, (near_same_cut - REVERSAL_REPEAT_NEAR_MIN) * 0.035)
+        reasons.append("同邊近長度斷點")
+    elif near_all_cut >= REVERSAL_REPEAT_NEAR_MIN + 1:
+        score += 0.12
+        reasons.append("全局近長度斷點")
+
+    # Current run is over its same-side historical high by a meaningful margin.
+    if max_same >= DRAGON_STRONG_LEN and n >= max_same + REVERSAL_OVER_MAX_LEN:
+        score += 0.18
+        reasons.append("超過同邊前高過多")
+
+    # Most recent completed runs were shorter than current length.
+    if below_cut_count >= 7 and n >= DRAGON_STRONG_LEN:
+        score += 0.10
+        reasons.append("近期多數未達此長度")
+
+    # Heavy side imbalance after a long dragon increases turning risk.
+    if side_rate >= REVERSAL_IMBALANCE_TRIGGER and n >= REVERSAL_FATIGUE_LEN:
+        score += 0.12
+        reasons.append("單邊偏重")
+
+    # Very far above median length is also a warning, but keep it small.
+    if med_len and n >= max(REVERSAL_FATIGUE_LEN, med_len + 5):
+        score += 0.08
+        reasons.append("遠高於中位龍長")
+
+    breakout_phase = (breakout or {}).get("phase", "")
+    first_phase = (first_side or {}).get("phase", "")
+
+    # Do not let reversal kill a fresh breakout / first-side dragon too early.
+    if breakout_phase in {"breakout_protect", "breakout_extend"} and n < REVERSAL_FATIGUE_LEN:
+        score *= 0.45
+        reasons.append("突破龍保護中")
+    if first_phase == "first_side_protect" and int((first_side or {}).get("over", 0)) <= REVERSAL_PROTECT_FIRST_STEPS:
+        score *= 0.50
+        reasons.append("首見龍保護中")
+
+    score = _clamp(score, 0.0, 1.0)
+    active = score >= REVERSAL_TRIGGER
+    strong = score >= REVERSAL_STRONG_TRIGGER
+    if not active:
+        return {
+            "active": False,
+            "score": round(score, 3),
+            "reasons": reasons,
+            "max_same": max_same,
+            "max_all": max_all,
+            "near_same_cut": near_same_cut,
+            "side_rate": round(side_rate, 3),
+        }
+
+    edge = REVERSAL_EDGE + max(0.0, score - REVERSAL_TRIGGER) * 0.07
+    if strong:
+        edge += 0.012
+    edge = min(REVERSAL_HARD_EDGE, edge)
+
+    return {
+        "active": True,
+        "strong": strong,
+        "score": round(score, 3),
+        "side": side,
+        "target_side": _opposite(side),
+        "length": n,
+        "cont_adjust": round(-edge, 5),
+        "break_edge": round(edge, 5),
+        "label": f"轉龍風險{side}{n}｜" + "+".join(reasons[:3]),
+        "reasons": reasons,
+        "max_same": max_same,
+        "max_all": max_all,
+        "median_len": med_len,
+        "near_same_cut": near_same_cut,
+        "near_all_cut": near_all_cut,
+        "below_cut_count": below_cut_count,
+        "side_rate": round(side_rate, 3),
+    }
+
 def _dragon_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 4:
         return {"B": 0.5, "P": 0.5, "label": "龍型資料不足", "strength": 0.0}
@@ -336,49 +577,92 @@ def _dragon_score(non_tie: List[str]) -> Dict[str, Any]:
     max_same = max(same_side_lengths) if same_side_lengths else 0
     max_all = max(recent_lengths) if recent_lengths else 0
 
+    first_side = _first_side_dragon_context(non_tie, last, n)
     breakout = _breakout_dragon_context(non_tie, last, n)
+    first_phase = first_side.get("phase", "") if first_side.get("active") else ""
     breakout_phase = breakout.get("phase", "") if breakout.get("active") else ""
+
+    # First-side Dragon Mode: when the same side never formed a dragon before,
+    # protect the early forming dragon instead of reading missing history as a no-dragon signal.
+    if first_side.get("active"):
+        cont_prob += float(first_side.get("cont_adjust", 0.0))
 
     # Breakout Dragon Mode: if this dragon just exceeded history, protect continuation first.
     if breakout.get("active"):
         cont_prob += float(breakout.get("cont_adjust", 0.0))
 
+    reversal = _dragon_reversal_context(non_tie, last, n, breakout=breakout, first_side=first_side)
+
     # If many recent runs ended exactly at this length, add break pressure.
-    # During breakout protection, reduce this penalty so the model does not break too early.
+    # During protected first-side / breakout stages, reduce this penalty so the model does not break too early.
     if same_cut_count >= DRAGON_BREAK_REPEAT_MIN and n >= DRAGON_MIN_LEN:
         penalty = min(0.055, same_cut_count * 0.014)
         if breakout_phase in {"breakout_protect", "breakout_extend"}:
             penalty *= 0.35
+        if first_phase == "first_side_protect":
+            penalty *= 0.45
         cont_prob -= penalty
 
     # If many recent runs could not reach this length, very long dragons should be chased with lower confidence.
-    # But do not punish the first breakout hands too heavily.
+    # But do not punish the first breakout / first-side hands too heavily.
     if n >= DRAGON_FATIGUE_START and below_cut_count >= 4:
         fatigue_penalty = 0.030
         if breakout_phase in {"breakout_protect", "breakout_extend"}:
             fatigue_penalty *= 0.40
+        if first_phase == "first_side_protect":
+            fatigue_penalty *= 0.50
         cont_prob -= fatigue_penalty
 
-    # If current dragon is above same-side historical max but not in protected breakout mode,
-    # avoid hard reverse: keep it near neutral instead of forcing break.
-    if max_same and n > max_same and not breakout.get("active"):
+    # Reversal layer is applied after protections so it can override only when real turning evidence appears.
+    if reversal.get("active"):
+        cont_prob += float(reversal.get("cont_adjust", 0.0))
+        # Strong reversal evidence should be allowed to actually turn the model,
+        # otherwise the system only warns but still follows too late.
+        if (
+            reversal.get("strong")
+            and n >= REVERSAL_FATIGUE_LEN
+            and first_phase != "first_side_protect"
+            and breakout_phase != "breakout_protect"
+        ):
+            forced_break_gap = min(0.040, float(reversal.get("break_edge", REVERSAL_EDGE)) * 0.55)
+            cont_prob = min(cont_prob, 0.5 - forced_break_gap)
+
+    # If current dragon is above same-side historical max but not in protected breakout / first-side mode,
+    # avoid hard reverse unless reversal mode has enough evidence.
+    if max_same and n > max_same and not breakout.get("active") and not first_side.get("active") and not reversal.get("active"):
         cont_prob = max(cont_prob, 0.515)
 
-    cont_prob = _clamp(cont_prob, 0.405, 0.642)
+    cont_prob = _clamp(cont_prob, 0.385, 0.648)
     side = last if cont_prob >= 0.5 else _opposite(last)
     prob = 0.5 + min(DRAGON_MAX_EDGE, abs(cont_prob - 0.5))
     if cont_prob < 0.5:
-        prob = 0.5 + min(DRAGON_BREAK_EDGE, abs(cont_prob - 0.5))
+        # Reversal can use a slightly stronger break edge, but still capped.
+        dynamic_break_edge = DRAGON_BREAK_EDGE
+        if reversal.get("active"):
+            dynamic_break_edge = min(max(DRAGON_BREAK_EDGE, float(reversal.get("break_edge", DRAGON_BREAK_EDGE))), REVERSAL_HARD_EDGE)
+        prob = 0.5 + min(dynamic_break_edge, abs(cont_prob - 0.5))
     b, p = _bp_score(side, prob)
 
-    if breakout.get("active"):
+    if reversal.get("active") and side != last:
+        label = str(reversal.get("label", f"轉龍風險{last}{n}"))
+        strength = 0.18 + (0.045 if reversal.get("strong") else 0.025)
+    elif first_side.get("active"):
+        label = str(first_side.get("label", f"首見{last}龍{n}"))
+        strength = 0.17 + float(first_side.get("strength_bonus", 0.0))
+        if reversal.get("active"):
+            label += f"｜{reversal.get('label', '轉龍風險')}"
+    elif breakout.get("active"):
         label = str(breakout.get("label", f"突破龍{last}{n}"))
         strength = 0.18 + float(breakout.get("strength_bonus", 0.0))
         if side != last:
             label += "｜轉斷"
+        elif reversal.get("active"):
+            label += f"｜{reversal.get('label', '轉龍風險')}"
     elif n >= DRAGON_STRONG_LEN:
         label = f"長龍{last}{n}｜{'續龍' if side == last else '斷龍壓力'}"
         strength = 0.18 + min(0.06, (n - DRAGON_STRONG_LEN) * 0.012)
+        if reversal.get("active"):
+            label += f"｜{reversal.get('label', '轉龍風險')}"
     elif n >= DRAGON_MIN_LEN:
         label = f"中龍{last}{n}｜{'續龍' if side == last else '斷龍壓力'}"
         strength = 0.145
@@ -387,20 +671,26 @@ def _dragon_score(non_tie: List[str]) -> Dict[str, Any]:
         strength = 0.105
 
     strength *= 0.85 + min(0.25, sample * 0.03)
+    if first_side.get("active"):
+        strength += min(0.030, float(first_side.get("over", 0)) * 0.008)
     if breakout.get("active"):
         strength += min(0.035, float(breakout.get("over", 0)) * 0.010)
+    if reversal.get("active") and side != last:
+        strength += min(0.025, float(reversal.get("score", 0)) * 0.025)
 
     action = "續龍" if side == last else "斷龍/轉邊"
     return {
         "B": b,
         "P": p,
         "label": label,
-        "strength": _clamp(strength, 0.05, 0.30),
+        "strength": _clamp(strength, 0.05, 0.32),
         "streak": n,
         "dragon_side": last,
         "cont_prob": round(cont_prob, 4),
         "road_action": action,
+        "first_side": first_side,
         "breakout": breakout,
+        "reversal": reversal,
         "run_stats": {
             **stats,
             "max_same": max_same,
@@ -480,6 +770,111 @@ def _chop_score(non_tie: List[str]) -> Dict[str, Any]:
         return {"B": b, "P": p, "label": "雙跳/兩房型", "strength": 0.165, "switch_rate": switch_rate}
 
     return {"B": 0.5, "P": 0.5, "label": "非跳路", "strength": 0.0, "switch_rate": switch_rate}
+
+
+def _chop_to_dragon_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    Detect single-jump / short-road reversal into a dragon.
+
+    Pattern idea:
+    - Previous tail was highly alternating: B P B P B P ...
+    - The newest side suddenly repeats: ... B P B P P or ... P B P B B
+    - If that repeat reaches 2~3 hands, stop forcing chop and begin treating it
+      as a possible connected dragon / road reversal.
+
+    This layer is intentionally side-following, not opposite-following.
+    """
+    if not CHOP_TO_DRAGON_MODE or len(non_tie) < 7:
+        return {"B": 0.5, "P": 0.5, "label": "單跳轉龍資料不足", "strength": 0.0, "active": False}
+
+    current_side, current_len = _streak(non_tie)
+    if not current_side or current_len < CHOP_TO_DRAGON_MIN_RUN:
+        return {"B": 0.5, "P": 0.5, "label": "未形成單跳轉龍", "strength": 0.0, "active": False}
+
+    before_current = non_tie[:-current_len]
+    if len(before_current) < 5:
+        return {"B": 0.5, "P": 0.5, "label": "單跳轉龍前段不足", "strength": 0.0, "active": False}
+
+    pre = before_current[-CHOP_TO_DRAGON_WINDOW:]
+    pre_rate = _window_switch_rate(pre)
+    pre_runs = _runs(pre)
+    pre_lengths = [n for _s, n in pre_runs]
+    one_run_rate = _safe_div(sum(1 for n in pre_lengths if n == 1), len(pre_lengths), 0.0)
+
+    # The side immediately before the new connected run should usually be opposite.
+    # This confirms it was a jump road that just failed by repeating current_side.
+    prev_side = before_current[-1] if before_current else ""
+    broke_single_jump = prev_side == _opposite(current_side)
+
+    # Tail check catches cases like B P B P B P P / P B P B P B B.
+    last_before = before_current[-min(6, len(before_current)):]
+    tail_rate = _window_switch_rate(last_before)
+
+    if not broke_single_jump:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "未破單跳",
+            "strength": 0.0,
+            "active": False,
+            "pre_switch_rate": round(pre_rate, 3),
+            "tail_switch_rate": round(tail_rate, 3),
+        }
+
+    if max(pre_rate, tail_rate) < CHOP_TO_DRAGON_PRE_MIN_RATE and one_run_rate < 0.58:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "前段非單跳短路",
+            "strength": 0.0,
+            "active": False,
+            "pre_switch_rate": round(pre_rate, 3),
+            "tail_switch_rate": round(tail_rate, 3),
+            "one_run_rate": round(one_run_rate, 3),
+        }
+
+    # Phase control: 2 hands is early reversal, 3+ hands is confirmed connection.
+    over = max(0, current_len - CHOP_TO_DRAGON_MIN_RUN)
+    if current_len >= CHOP_TO_DRAGON_CONFIRM_RUN:
+        phase = "confirmed"
+        label = f"單跳反轉接龍{current_side}{current_len}｜跳路破壞後同邊延伸"
+        base_strength = CHOP_TO_DRAGON_STRENGTH + 0.025
+    else:
+        phase = "early"
+        label = f"單跳反轉觀察{current_side}{current_len}｜短跳破壞疑似接龍"
+        base_strength = CHOP_TO_DRAGON_STRENGTH * 0.82
+
+    edge = CHOP_TO_DRAGON_EDGE + over * 0.010
+    if tail_rate >= 0.82:
+        edge += 0.006
+    if one_run_rate >= 0.70:
+        edge += 0.006
+    edge = min(CHOP_TO_DRAGON_MAX_EDGE, edge)
+
+    # If the connected side already got too long, hand over to dragon reversal layer.
+    # Do not keep this layer blindly following beyond the protected zone.
+    if current_len >= max(REVERSAL_MIN_LEN, CHOP_TO_DRAGON_CONFIRM_RUN + CHOP_TO_DRAGON_PROTECT_STEPS + 2):
+        edge *= 0.70
+        base_strength *= 0.82
+        label += "｜後續交給轉龍判斷"
+
+    b, p = _bp_score(current_side, 0.5 + edge)
+    return {
+        "B": b,
+        "P": p,
+        "label": label,
+        "strength": _clamp(base_strength, 0.08, 0.245),
+        "active": True,
+        "phase": phase,
+        "target_side": current_side,
+        "current_len": current_len,
+        "edge": round(edge, 5),
+        "road_action": "單跳反轉接龍/續龍",
+        "pre_switch_rate": round(pre_rate, 3),
+        "tail_switch_rate": round(tail_rate, 3),
+        "one_run_rate": round(one_run_rate, 3),
+        "protect_zone": current_len <= CHOP_TO_DRAGON_CONFIRM_RUN + CHOP_TO_DRAGON_PROTECT_STEPS,
+    }
 
 
 def _pattern_memory_score(non_tie: List[str]) -> Dict[str, Any]:
@@ -627,6 +1022,22 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
             score += 0.12
             reasons.append("單跳破壞")
 
+    # 7.5) If the single-jump break is turning into a connected dragon, do not
+    # treat it as pure chaos. This is the exact transition pattern the model
+    # previously missed: short chop -> repeat -> dragon continuation.
+    chop_to_dragon = _chop_to_dragon_score(non_tie)
+    if chop_to_dragon.get("active"):
+        metrics["chop_to_dragon"] = {
+            "phase": chop_to_dragon.get("phase"),
+            "target_side": chop_to_dragon.get("target_side"),
+            "current_len": chop_to_dragon.get("current_len"),
+            "pre_switch_rate": chop_to_dragon.get("pre_switch_rate"),
+            "tail_switch_rate": chop_to_dragon.get("tail_switch_rate"),
+        }
+        relief = CHOP_TO_DRAGON_CHAOS_RELIEF if chop_to_dragon.get("protect_zone") else CHOP_TO_DRAGON_CHAOS_RELIEF * 0.45
+        score -= relief
+        reasons.append("單跳反轉接龍")
+
     # 8) Alternating tail failed at the end.
     if PATTERN_FAILURE_COUNTER and len(recent) >= 8:
         before = recent[-8:-2]
@@ -670,6 +1081,8 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
         "metrics": metrics,
         "short_markov": short_markov,
         "short_recent": short_recent,
+        "chop_to_dragon_active": bool(locals().get("chop_to_dragon", {}).get("active")),
+        "chop_to_dragon": locals().get("chop_to_dragon", None),
     }
 
 
@@ -687,6 +1100,14 @@ def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
         streak_factor = CHAOS_STREAK_WEIGHT_FACTOR * (0.80 if strong else 1.0)
         recent_factor = CHAOS_RECENT_WEIGHT_FACTOR * (1.08 if strong else 1.0)
         markov_factor = CHAOS_MARKOV_WEIGHT_FACTOR * (1.05 if strong else 1.0)
+        # When chaos is caused by a clean single-jump break into a connected run,
+        # keep enough road/streak weight to catch the new dragon instead of
+        # flattening everything into weak chaos mode.
+        if chaos.get("chop_to_dragon_active"):
+            road_factor = max(road_factor, 0.72)
+            streak_factor = max(streak_factor, 0.66)
+            recent_factor = max(recent_factor, 1.38)
+            markov_factor = max(markov_factor, 1.12)
         weights = {
             "markov": MARKOV_WEIGHT * markov_factor,
             "road": ROAD_WEIGHT * road_factor,
@@ -704,6 +1125,7 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
         _dragon_score(non_tie),
         _run_cycle_score(non_tie),
         _chop_score(non_tie),
+        _chop_to_dragon_score(non_tie),
         _pattern_memory_score(non_tie),
     ]
 
@@ -721,10 +1143,14 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     best = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
     best = dict(best)
+    if best.get("active") and "單跳反轉" in str(best.get("label", "")):
+        best["chop_to_dragon"] = dict(best)
     if second and second.get("strength", 0) >= 0.12 and second.get("label") != best.get("label"):
         best["secondary_label"] = second.get("label")
         # Small blend to avoid one pattern totally dominating another valid road mode.
-        blend = 0.25
+        # Exception: if dragon reversal is the best mode, do not let pattern-memory
+        # pull the score back to the old dragon side and make the action inconsistent.
+        blend = 0.0 if best.get("road_action") == "斷龍/轉邊" else 0.25
         best["B"] = best["B"] * (1 - blend) + second["B"] * blend
         best["P"] = 1 - best["B"]
     return best
@@ -890,6 +1316,55 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    # If the dragon reversal detector is strong, allow it to actually flip the final
+    # recommendation. Without this guard, Markov/Streak often keep following the old
+    # dragon even when the road layer has already detected a turning zone.
+    reversal_final_override = False
+    road_reversal = road.get("reversal") if isinstance(road, dict) else None
+    if (
+        REVERSAL_FINAL_OVERRIDE
+        and isinstance(road_reversal, dict)
+        and road_reversal.get("active")
+        and road_reversal.get("strong")
+        and road.get("road_action") == "斷龍/轉邊"
+        and road_reversal.get("target_side") in {"B", "P"}
+    ):
+        target_side = str(road_reversal.get("target_side"))
+        edge = min(REVERSAL_OVERRIDE_EDGE, max(0.026, float(road_reversal.get("break_edge", REVERSAL_EDGE)) * 0.90))
+        bp_total = max(0.001, 1 - tie_prob)
+        if target_side == "B":
+            b_prob = (0.5 + edge) * bp_total
+            p_prob = (0.5 - edge) * bp_total
+        else:
+            b_prob = (0.5 - edge) * bp_total
+            p_prob = (0.5 + edge) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        reversal_final_override = True
+
+    chop_to_dragon_final_override = False
+    road_chop_to_dragon = road.get("chop_to_dragon") if isinstance(road, dict) else None
+    if (
+        CHOP_TO_DRAGON_FINAL_OVERRIDE
+        and isinstance(road_chop_to_dragon, dict)
+        and road_chop_to_dragon.get("active")
+        and road_chop_to_dragon.get("target_side") in {"B", "P"}
+        and road_chop_to_dragon.get("phase") in {"confirmed", "early"}
+    ):
+        target_side = str(road_chop_to_dragon.get("target_side"))
+        raw_edge = float(road_chop_to_dragon.get("edge", CHOP_TO_DRAGON_EDGE))
+        # Early phase should guide but not overrule too aggressively.
+        factor = 0.78 if road_chop_to_dragon.get("phase") == "early" else 1.0
+        edge = min(CHOP_TO_DRAGON_OVERRIDE_EDGE, max(0.022, raw_edge * factor))
+        bp_total = max(0.001, 1 - tie_prob)
+        if target_side == "B":
+            b_prob = (0.5 + edge) * bp_total
+            p_prob = (0.5 - edge) * bp_total
+        else:
+            b_prob = (0.5 - edge) * bp_total
+            p_prob = (0.5 + edge) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        chop_to_dragon_final_override = True
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -922,6 +1397,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             reason_parts.append("建議最小注")
     if road.get("road_action"):
         reason_parts.append(f"動作:{road.get('road_action')}")
+    if 'reversal_final_override' in locals() and reversal_final_override:
+        reason_parts.append("強轉龍校準")
+    if 'chop_to_dragon_final_override' in locals() and chop_to_dragon_final_override:
+        reason_parts.append("單跳轉龍校準")
     if road.get("secondary_label"):
         reason_parts.append(f"副路:{road.get('secondary_label')}")
     if ai_result and ai_result.get("pattern_label"):
@@ -952,7 +1431,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "current_streak": _streak(non_tie),
             "runs_tail": run_data[-10:],
             "road_strength": round(float(road.get("strength", 0)), 3),
+            "first_side": road.get("first_side"),
             "breakout": road.get("breakout"),
+            "reversal": road.get("reversal"),
+            "chop_to_dragon": road.get("chop_to_dragon"),
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
