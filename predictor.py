@@ -180,6 +180,42 @@ MAJORITY_CONF_CAP = float(os.getenv("MAJORITY_CONF_CAP", "0.48"))
 MAJORITY_STRONG_CONF_CAP = float(os.getenv("MAJORITY_STRONG_CONF_CAP", "0.42"))
 MAJORITY_FINAL_OVERRIDE = os.getenv("MAJORITY_FINAL_OVERRIDE", "1") == "1"
 
+# Global Reversal Mode:
+# Final reversal radar for ordinary road states, complex roads, and after-tie turns.
+# This is not limited to long dragons. It checks whether the current final pick is
+# still chasing the old direction while recent momentum, minority revival, chaos,
+# mirror/chop transition, or after-tie behavior already points to the other side.
+GLOBAL_REVERSAL_MODE = os.getenv("GLOBAL_REVERSAL_MODE", "1") == "1"
+GLOBAL_REVERSAL_MIN_HISTORY = int(os.getenv("GLOBAL_REVERSAL_MIN_HISTORY", "10"))
+GLOBAL_REVERSAL_WINDOW = int(os.getenv("GLOBAL_REVERSAL_WINDOW", "10"))
+GLOBAL_REVERSAL_TRIGGER = float(os.getenv("GLOBAL_REVERSAL_TRIGGER", "0.50"))
+GLOBAL_REVERSAL_STRONG_TRIGGER = float(os.getenv("GLOBAL_REVERSAL_STRONG_TRIGGER", "0.64"))
+GLOBAL_REVERSAL_EDGE = float(os.getenv("GLOBAL_REVERSAL_EDGE", "0.034"))
+GLOBAL_REVERSAL_HARD_EDGE = float(os.getenv("GLOBAL_REVERSAL_HARD_EDGE", "0.060"))
+GLOBAL_REVERSAL_FINAL_OVERRIDE = os.getenv("GLOBAL_REVERSAL_FINAL_OVERRIDE", "1") == "1"
+GLOBAL_REVERSAL_CONF_CAP = float(os.getenv("GLOBAL_REVERSAL_CONF_CAP", "0.44"))
+GLOBAL_REVERSAL_STRONG_CONF_CAP = float(os.getenv("GLOBAL_REVERSAL_STRONG_CONF_CAP", "0.38"))
+GLOBAL_REVERSAL_VALID_DRAGON_PROTECT = float(os.getenv("GLOBAL_REVERSAL_VALID_DRAGON_PROTECT", "0.55"))
+GLOBAL_REVERSAL_RECENT_SHIFT = float(os.getenv("GLOBAL_REVERSAL_RECENT_SHIFT", "0.58"))
+GLOBAL_REVERSAL_MIN_TARGET_SCORE = float(os.getenv("GLOBAL_REVERSAL_MIN_TARGET_SCORE", "0.26"))
+
+# Momentum shift detector.
+# Looks for the road changing from one side dominance to the opposite side in the
+# last few non-tie results, even when no clear long dragon exists.
+MOMENTUM_SHIFT_MODE = os.getenv("MOMENTUM_SHIFT_MODE", "1") == "1"
+MOMENTUM_SHIFT_WINDOW = int(os.getenv("MOMENTUM_SHIFT_WINDOW", "8"))
+MOMENTUM_SHIFT_TRIGGER = float(os.getenv("MOMENTUM_SHIFT_TRIGGER", "0.58"))
+MOMENTUM_SHIFT_EDGE = float(os.getenv("MOMENTUM_SHIFT_EDGE", "0.030"))
+
+# After-tie reversal assistant.
+# Tie is not recommended directly by default, but a tie often makes the next
+# 1~2 hands less suitable for blindly chasing the old side.
+AFTER_TIE_REVERSAL_MODE = os.getenv("AFTER_TIE_REVERSAL_MODE", "1") == "1"
+AFTER_TIE_WINDOW = int(os.getenv("AFTER_TIE_WINDOW", "2"))
+AFTER_TIE_CHASE_DAMPEN = float(os.getenv("AFTER_TIE_CHASE_DAMPEN", "0.030"))
+AFTER_TIE_REVERSAL_EDGE = float(os.getenv("AFTER_TIE_REVERSAL_EDGE", "0.026"))
+AFTER_TIE_SCORE_BONUS = float(os.getenv("AFTER_TIE_SCORE_BONUS", "0.080"))
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -1616,6 +1652,275 @@ def _majority_chase_guard(
         "bet_mode_hint": "最小注" if not forced else "反轉小注",
     }
 
+
+def _last_tie_gap(history: List[str]) -> int:
+    """Return number of rounds since the last tie. Large value means no recent tie."""
+    if not history:
+        return 999
+    gap = 0
+    for x in reversed(history):
+        if x == "T":
+            return gap
+        gap += 1
+    return 999
+
+
+def _global_reversal_guard(
+    non_tie: List[str],
+    history: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    road: Dict[str, Any],
+    chaos: Dict[str, Any],
+    majority_guard: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Global Reversal Mode / 全局反轉雷達.
+
+    Purpose:
+    - Catch ordinary reversals, not only long-dragon reversals.
+    - Make complex-road turns more sensitive when recent momentum has shifted.
+    - Treat the 1~2 hands after a tie as a caution zone against blindly chasing.
+    - Avoid killing true valid dragons too early by protecting strong, fresh dragon states.
+
+    It only changes the final probability if evidence points to the opposite side
+    of the current final pick. Otherwise it returns debug context without action.
+    """
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "全局反轉未啟動",
+        "score": 0.0,
+        "target_side": "",
+        "reasons": [],
+    }
+    if not GLOBAL_REVERSAL_MODE or len(non_tie) < GLOBAL_REVERSAL_MIN_HISTORY:
+        return base
+
+    bp_total = max(0.001, 1 - tie_prob)
+    b_side = b_prob / bp_total
+    p_side = p_prob / bp_total
+    pred_side = "B" if b_side >= p_side else "P"
+    opp_side = _opposite(pred_side)
+
+    current_side, current_len = _streak(non_tie)
+    recent_window = max(4, GLOBAL_REVERSAL_WINDOW)
+    recent = non_tie[-min(len(non_tie), recent_window):]
+    prev = non_tie[-min(len(non_tie), recent_window * 2):-min(len(non_tie), recent_window)] if len(non_tie) > recent_window else []
+    runs = _runs(non_tie)
+
+    target_scores = {"B": 0.0, "P": 0.0}
+    target_reasons = {"B": [], "P": []}
+    general_score = 0.0
+    general_reasons: List[str] = []
+
+    def add_target(side: str, points: float, reason: str) -> None:
+        if side in {"B", "P"} and points > 0:
+            target_scores[side] += points
+            target_reasons[side].append(reason)
+
+    # 1) The newest side is already connecting against the current final pick.
+    if current_side in {"B", "P"} and current_side != pred_side and current_len >= 2:
+        add_target(current_side, 0.20 + min(0.12, (current_len - 2) * 0.045), f"近期{current_side}{current_len}反向連接")
+
+    # 2) Recent side-rate shift points against the current final pick.
+    if recent:
+        recent_b = recent.count("B") / len(recent)
+        recent_p = recent.count("P") / len(recent)
+        recent_side = "B" if recent_b >= recent_p else "P"
+        recent_rate = max(recent_b, recent_p)
+        if recent_side != pred_side and recent_rate >= GLOBAL_REVERSAL_RECENT_SHIFT:
+            add_target(recent_side, 0.16 + min(0.10, (recent_rate - GLOBAL_REVERSAL_RECENT_SHIFT) * 0.45), f"近{len(recent)}手{recent_side}轉強{int(recent_rate * 100)}%")
+
+    # 3) Momentum shifted from old dominance to the opposite side.
+    if MOMENTUM_SHIFT_MODE and len(non_tie) >= max(10, MOMENTUM_SHIFT_WINDOW * 2):
+        w = max(4, MOMENTUM_SHIFT_WINDOW)
+        old = non_tie[-2 * w:-w]
+        new = non_tie[-w:]
+        if old and new:
+            old_b = old.count("B") / len(old)
+            old_p = old.count("P") / len(old)
+            new_b = new.count("B") / len(new)
+            new_p = new.count("P") / len(new)
+            old_side = "B" if old_b >= old_p else "P"
+            new_side = "B" if new_b >= new_p else "P"
+            old_rate = max(old_b, old_p)
+            new_rate = max(new_b, new_p)
+            if old_side == pred_side and new_side != pred_side and new_rate >= MOMENTUM_SHIFT_TRIGGER:
+                add_target(new_side, 0.18 + min(0.10, (new_rate - MOMENTUM_SHIFT_TRIGGER) * 0.45), f"動能由{old_side}轉{new_side}")
+            elif new_side != pred_side and new_rate >= MOMENTUM_SHIFT_TRIGGER + 0.08:
+                add_target(new_side, 0.12, f"短窗動能{new_side}偏強")
+
+    # 4) Road sub-models already point to an opposite turn.
+    road_reversal = road.get("reversal") if isinstance(road, dict) else None
+    if isinstance(road_reversal, dict) and road_reversal.get("active") and road_reversal.get("target_side") in {"B", "P"}:
+        target = str(road_reversal.get("target_side"))
+        if target != pred_side:
+            add_target(target, 0.17 + (0.08 if road_reversal.get("strong") else 0.0), "龍長反轉同步指向")
+
+    road_mirror = road.get("mirror_run") if isinstance(road, dict) else None
+    if isinstance(road_mirror, dict) and road_mirror.get("active") and road_mirror.get("target_side") in {"B", "P"}:
+        target = str(road_mirror.get("target_side"))
+        if target != pred_side:
+            add_target(target, 0.12, "對稱補滿/補龍指向反邊")
+
+    road_chop_to_dragon = road.get("chop_to_dragon") if isinstance(road, dict) else None
+    if isinstance(road_chop_to_dragon, dict) and road_chop_to_dragon.get("active") and road_chop_to_dragon.get("target_side") in {"B", "P"}:
+        target = str(road_chop_to_dragon.get("target_side"))
+        if target != pred_side:
+            add_target(target, 0.12, "單跳轉龍指向反邊")
+
+    # 5) Chaos mode means the current road is not stable; become more sensitive to short-window turns.
+    if chaos.get("active"):
+        general_score += 0.07 if not chaos.get("strong") else 0.12
+        general_reasons.append("複雜/破路盤提高反轉靈敏")
+        chaos_side = "B" if float(chaos.get("B", 0.5)) >= float(chaos.get("P", 0.5)) else "P"
+        chaos_gap = abs(float(chaos.get("B", 0.5)) - float(chaos.get("P", 0.5)))
+        if chaos_side != pred_side and chaos_gap >= 0.012:
+            add_target(chaos_side, 0.08 + min(0.06, chaos_gap * 1.5), "短窗混亂校準反向")
+
+    # 6) Majority guard has detected overheating but may not fully flip yet.
+    if isinstance(majority_guard, dict) and majority_guard.get("active"):
+        maj_target = "B" if float(majority_guard.get("B", 0.5)) >= float(majority_guard.get("P", 0.5)) else "P"
+        if maj_target != pred_side:
+            add_target(maj_target, 0.11 + (0.06 if majority_guard.get("forced") else 0.0), "多數邊過熱校準同步")
+        if majority_guard.get("adjusted"):
+            general_score += 0.04
+            general_reasons.append("多數邊保護已啟動")
+
+    # 7) After a tie: do not chase old direction too hard; if a side connects after the tie,
+    # treat that side as early reversal evidence.
+    tie_gap = _last_tie_gap(history)
+    after_tie_active = AFTER_TIE_REVERSAL_MODE and tie_gap <= AFTER_TIE_WINDOW
+    if after_tie_active:
+        general_score += AFTER_TIE_SCORE_BONUS
+        general_reasons.append(f"和局後{tie_gap}手內降追擊")
+        if current_side in {"B", "P"} and current_side != pred_side:
+            add_target(current_side, 0.10 + min(0.06, current_len * 0.025), f"和局後{current_side}轉向")
+        elif current_side in {"B", "P"} and current_side == pred_side and current_len >= 2:
+            # Same-side after tie can still continue, but reduce overconfidence instead of flipping.
+            general_score += min(0.06, AFTER_TIE_CHASE_DAMPEN * 1.7)
+            general_reasons.append("和局後同邊追擊降信心")
+
+    # 8) Run rhythm reversal: two completed runs in a row cut shorter than the model's current side.
+    if len(runs) >= 4:
+        last_side, last_len = runs[-1]
+        prev_side, prev_len = runs[-2]
+        prev2_side, prev2_len = runs[-3]
+        if last_side != pred_side and last_len >= 2 and prev_side == pred_side and prev_len <= 2:
+            add_target(last_side, 0.10, "短連段轉向")
+        if prev2_side == pred_side and prev_len <= 2 and last_side != pred_side and last_len >= prev_len + 1:
+            add_target(last_side, 0.08, "前段短切後反邊延伸")
+
+    # Protect a true valid dragon from getting killed too early.
+    road_label = str(road.get("label", "")) if isinstance(road, dict) else ""
+    road_action = str(road.get("road_action", "")) if isinstance(road, dict) else ""
+    valid_dragon_protect = (
+        current_side == pred_side
+        and current_len >= max(DRAGON_MIN_LEN, MAJORITY_VALID_DRAGON_LEN)
+        and road_action == "續龍"
+        and any(key in road_label for key in ["首見", "突破", "長龍", "單跳反轉接龍"])
+        and not after_tie_active
+        and not chaos.get("strong")
+    )
+
+    # Pick target side.
+    target_side = "B" if target_scores["B"] >= target_scores["P"] else "P"
+    target_score = target_scores[target_side]
+    if target_side == pred_side or target_score < GLOBAL_REVERSAL_MIN_TARGET_SCORE:
+        base.update({
+            "active": False,
+            "adjusted": False,
+            "forced": False,
+            "target_side": target_side if target_side != pred_side else "",
+            "score": round(_clamp(general_score + target_score, 0.0, 1.0), 3),
+            "label": "全局反轉證據不足",
+            "reasons": general_reasons + target_reasons.get(target_side, []),
+            "tie_gap": tie_gap,
+            "target_scores": {k: round(v, 3) for k, v in target_scores.items()},
+        })
+        return base
+
+    score = _clamp(general_score + target_score, 0.0, 1.0)
+    if valid_dragon_protect:
+        score *= GLOBAL_REVERSAL_VALID_DRAGON_PROTECT
+        general_reasons.append("有效龍保護降低反轉")
+
+    if score < GLOBAL_REVERSAL_TRIGGER:
+        base.update({
+            "active": False,
+            "adjusted": False,
+            "forced": False,
+            "target_side": target_side,
+            "score": round(score, 3),
+            "label": "全局反轉未達門檻",
+            "reasons": general_reasons + target_reasons.get(target_side, []),
+            "tie_gap": tie_gap,
+            "target_scores": {k: round(v, 3) for k, v in target_scores.items()},
+        })
+        return base
+
+    forced = GLOBAL_REVERSAL_FINAL_OVERRIDE and score >= GLOBAL_REVERSAL_STRONG_TRIGGER
+    edge = GLOBAL_REVERSAL_EDGE + max(0.0, score - GLOBAL_REVERSAL_TRIGGER) * 0.060
+    if after_tie_active:
+        edge += AFTER_TIE_REVERSAL_EDGE * 0.55
+    if MOMENTUM_SHIFT_MODE and target_score >= 0.34:
+        edge += MOMENTUM_SHIFT_EDGE * 0.35
+    edge = min(GLOBAL_REVERSAL_HARD_EDGE, max(0.020, edge))
+
+    if forced:
+        if target_side == "B":
+            b_side, p_side = 0.5 + edge, 0.5 - edge
+        else:
+            b_side, p_side = 0.5 - edge, 0.5 + edge
+        label = f"全局反轉校準｜轉看{target_side}"
+    else:
+        # Non-forced mode: lower the old pick and move close to neutral / slight target.
+        damp = min(edge, abs((b_side if pred_side == "B" else p_side) - 0.5) + edge * 0.45)
+        if pred_side == "B":
+            b_side = max(0.5 - edge * 0.20, b_side - damp)
+            p_side = 1 - b_side
+        else:
+            p_side = max(0.5 - edge * 0.20, p_side - damp)
+            b_side = 1 - p_side
+        # If target evidence is clearly above trigger, allow slight flip even before strong trigger.
+        if target_score >= GLOBAL_REVERSAL_MIN_TARGET_SCORE + 0.12:
+            if target_side == "B":
+                b_side = max(b_side, 0.5 + min(edge, GLOBAL_REVERSAL_EDGE))
+                p_side = 1 - b_side
+            else:
+                p_side = max(p_side, 0.5 + min(edge, GLOBAL_REVERSAL_EDGE))
+                b_side = 1 - p_side
+        label = f"全局反轉雷達｜降低{pred_side}追擊"
+
+    new_b = b_side * bp_total
+    new_p = p_side * bp_total
+    new_b, new_p, new_t = _normalize_three(new_b, new_p, tie_prob)
+    return {
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": new_b,
+        "P": new_p,
+        "T": new_t,
+        "target_side": target_side,
+        "from_side": pred_side,
+        "score": round(score, 3),
+        "label": label,
+        "reasons": general_reasons + target_reasons.get(target_side, []),
+        "tie_gap": tie_gap,
+        "after_tie_active": after_tie_active,
+        "valid_dragon_protect": valid_dragon_protect,
+        "target_scores": {k: round(v, 3) for k, v in target_scores.items()},
+        "edge": round(edge, 5),
+        "bet_mode_hint": "反轉小注" if forced else "最小注/觀察",
+    }
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
@@ -1679,6 +1984,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "chaos": chaos,
         "effective_weights": {k: round(v, 5) for k, v in weights.items()},
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
+        "global_reversal_config": {
+            "enabled": GLOBAL_REVERSAL_MODE,
+            "window": GLOBAL_REVERSAL_WINDOW,
+            "trigger": GLOBAL_REVERSAL_TRIGGER,
+            "after_tie": AFTER_TIE_REVERSAL_MODE,
+        },
     }
 
     ai_result = None
@@ -1781,6 +2092,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         tie_prob = float(majority_guard.get("T", tie_prob))
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    global_reversal = _global_reversal_guard(non_tie, history, b_prob, p_prob, tie_prob, road, chaos, majority_guard)
+    if global_reversal.get("active") and global_reversal.get("adjusted"):
+        b_prob = float(global_reversal.get("B", b_prob))
+        p_prob = float(global_reversal.get("P", p_prob))
+        tie_prob = float(global_reversal.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -1792,6 +2110,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if chaos.get("B", 0.5) >= chaos.get("P", 0.5) else "P")
     if majority_guard.get("active") and majority_guard.get("adjusted"):
         votes.append("B" if majority_guard.get("B", 0.5) >= majority_guard.get("P", 0.5) else "P")
+    if global_reversal.get("active") and global_reversal.get("adjusted"):
+        votes.append("B" if global_reversal.get("B", 0.5) >= global_reversal.get("P", 0.5) else "P")
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
 
@@ -1813,6 +2133,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, cap)
         if not chaos.get("active"):
             level = "多數邊過熱警戒" if majority_guard.get("forced") else "多數邊保護弱訊號"
+    if global_reversal.get("active") and global_reversal.get("adjusted"):
+        cap = GLOBAL_REVERSAL_STRONG_CONF_CAP if global_reversal.get("forced") else GLOBAL_REVERSAL_CONF_CAP
+        conf = min(conf, cap)
+        if not chaos.get("active") and not (majority_guard.get("active") and majority_guard.get("adjusted")):
+            level = "全局反轉警戒" if global_reversal.get("forced") else "反轉觀察弱訊號"
     reason_parts = [road.get("label", "牌路"), f"模型一致{int(agreement * 100)}%"]
     if chaos.get("active"):
         reason_parts.insert(0, f"{chaos.get('label')}({int(float(chaos.get('score', 0))*100)}%)")
@@ -1824,6 +2149,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             reason_parts.append("多數邊過熱轉向校準")
         else:
             reason_parts.append("降低多數邊追擊")
+    if global_reversal.get("active") and global_reversal.get("adjusted"):
+        reason_parts.insert(0, f"{global_reversal.get('label')}({int(float(global_reversal.get('score', 0))*100)}%)")
+        if global_reversal.get("forced"):
+            reason_parts.append("全局反轉校準")
+        else:
+            reason_parts.append("反轉雷達降追擊")
     if road.get("road_action"):
         reason_parts.append(f"動作:{road.get('road_action')}")
     if 'reversal_final_override' in locals() and reversal_final_override:
@@ -1853,7 +2184,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recommend_text": {"B": "莊", "P": "閒", "T": "和"}[recommend],
         "confidence": round(conf, 3),
         "signal_level": level,
-        "bet_mode": "最小注" if ((chaos.get("active") and LOW_CONFIDENCE_MINBET) or (majority_guard.get("active") and majority_guard.get("adjusted"))) else "信心分級",
+        "bet_mode": "最小注" if (
+            (chaos.get("active") and LOW_CONFIDENCE_MINBET)
+            or (majority_guard.get("active") and majority_guard.get("adjusted"))
+            or (global_reversal.get("active") and global_reversal.get("adjusted"))
+        ) else "信心分級",
         "pattern_label": road.get("label", ""),
         "chaos_label": chaos.get("label", ""),
         "chaos_score": chaos.get("score", 0),
@@ -1871,6 +2206,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         },
         "chaos": chaos,
         "majority_guard": majority_guard,
+        "global_reversal": global_reversal,
         "effective_weights": {k: round(v, 4) for k, v in weights.items()},
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ai_result": ai_result if os.getenv("DEBUG_AI_RESULT", "0") == "1" else None,
