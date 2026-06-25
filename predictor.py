@@ -54,6 +54,40 @@ BREAKOUT_CONT_EDGE = float(os.getenv("BREAKOUT_CONT_EDGE", "0.038"))
 BREAKOUT_NEW_HIGH_BONUS = float(os.getenv("BREAKOUT_NEW_HIGH_BONUS", "0.014"))
 BREAKOUT_OVERHEAT_PENALTY = float(os.getenv("BREAKOUT_OVERHEAT_PENALTY", "0.018"))
 
+# Chaos / broken-road regime controls.
+# These protect the model from forcing dragon/chop/double-chop logic on unstable shoes.
+CHAOS_MODE = os.getenv("CHAOS_MODE", "1") == "1"
+PATTERN_FAILURE_COUNTER = os.getenv("PATTERN_FAILURE_COUNTER", "1") == "1"
+FAKE_DRAGON_DETECTOR = os.getenv("FAKE_DRAGON_DETECTOR", "1") == "1"
+CHOP_BREAK_DETECTOR = os.getenv("CHOP_BREAK_DETECTOR", "1") == "1"
+LOW_CONFIDENCE_MINBET = os.getenv("LOW_CONFIDENCE_MINBET", "1") == "1"
+
+CHAOS_WINDOW = int(os.getenv("CHAOS_WINDOW", "18"))
+CHAOS_TRIGGER = float(os.getenv("CHAOS_TRIGGER", "0.58"))
+CHAOS_STRONG_TRIGGER = float(os.getenv("CHAOS_STRONG_TRIGGER", "0.72"))
+CHAOS_MAX_EDGE = float(os.getenv("CHAOS_MAX_EDGE", "0.045"))
+CHAOS_RECENT_BLEND = float(os.getenv("CHAOS_RECENT_BLEND", "0.26"))
+CHAOS_CONF_CAP = float(os.getenv("CHAOS_CONF_CAP", "0.46"))
+CHAOS_STRONG_CONF_CAP = float(os.getenv("CHAOS_STRONG_CONF_CAP", "0.38"))
+CHAOS_AI_BLEND_FACTOR = float(os.getenv("CHAOS_AI_BLEND_FACTOR", "0.55"))
+
+# Dynamic weight factors used only when chaos mode is active.
+CHAOS_MARKOV_WEIGHT_FACTOR = float(os.getenv("CHAOS_MARKOV_WEIGHT_FACTOR", "1.22"))
+CHAOS_ROAD_WEIGHT_FACTOR = float(os.getenv("CHAOS_ROAD_WEIGHT_FACTOR", "0.45"))
+CHAOS_STREAK_WEIGHT_FACTOR = float(os.getenv("CHAOS_STREAK_WEIGHT_FACTOR", "0.48"))
+CHAOS_BALANCE_WEIGHT_FACTOR = float(os.getenv("CHAOS_BALANCE_WEIGHT_FACTOR", "0.70"))
+CHAOS_RECENT_WEIGHT_FACTOR = float(os.getenv("CHAOS_RECENT_WEIGHT_FACTOR", "1.60"))
+
+# Chaos scoring knobs.
+CHAOS_MIN_RUN_VARIETY = int(os.getenv("CHAOS_MIN_RUN_VARIETY", "3"))
+CHAOS_MODE_CONSISTENCY_MAX = float(os.getenv("CHAOS_MODE_CONSISTENCY_MAX", "0.48"))
+CHAOS_SWITCH_DIFF_TRIGGER = float(os.getenv("CHAOS_SWITCH_DIFF_TRIGGER", "0.28"))
+ROUTE_SWITCH_PENALTY = float(os.getenv("ROUTE_SWITCH_PENALTY", "0.11"))
+FAKE_DRAGON_MIN_LEN = int(os.getenv("FAKE_DRAGON_MIN_LEN", "4"))
+FAKE_DRAGON_SHORT_RUN_RATE = float(os.getenv("FAKE_DRAGON_SHORT_RUN_RATE", "0.62"))
+CHOP_BREAK_MIN_PRE_RATE = float(os.getenv("CHOP_BREAK_MIN_PRE_RATE", "0.72"))
+CHOP_BREAK_DROP = float(os.getenv("CHOP_BREAK_DROP", "0.22"))
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -473,6 +507,195 @@ def _pattern_memory_score(non_tie: List[str]) -> Dict[str, Any]:
     return best or {"B": 0.5, "P": 0.5, "label": "無回測重複", "strength": 0.0}
 
 
+
+def _run_category(length: int) -> str:
+    if length <= 1:
+        return "S1"
+    if length == 2:
+        return "S2"
+    if length <= 4:
+        return "MID"
+    return "LONG"
+
+
+def _window_switch_rate(seq: List[str]) -> float:
+    if len(seq) < 2:
+        return 0.5
+    return _safe_div(sum(1 for a, b in zip(seq, seq[1:]) if a != b), len(seq) - 1, 0.5)
+
+
+def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any]:
+    """
+    Detect broken-road / fake-pattern shoes.
+
+    Goal:
+    - If the shoe has stable road state, let road/dragon/chop models work.
+    - If every pattern breaks after 1~3 hands, lower ROAD/STREAK confidence and
+      switch to short-window Markov + Recent with weak signal.
+    """
+    if not CHAOS_MODE or len(non_tie) < 10:
+        return {"active": False, "score": 0.0, "label": "混亂偵測資料不足", "B": 0.5, "P": 0.5}
+
+    window = max(10, CHAOS_WINDOW)
+    recent = non_tie[-window:]
+    runs = _runs(recent)
+    lengths = [n for _s, n in runs]
+    current_side, current_len = _streak(non_tie)
+
+    score = 0.0
+    reasons: List[str] = []
+    metrics: Dict[str, Any] = {}
+
+    switch_rate = _window_switch_rate(recent)
+    half = max(4, len(recent) // 2)
+    first_rate = _window_switch_rate(recent[:half])
+    second_rate = _window_switch_rate(recent[-half:])
+    switch_diff = abs(first_rate - second_rate)
+    metrics.update({
+        "switch_rate": round(switch_rate, 3),
+        "first_switch_rate": round(first_rate, 3),
+        "second_switch_rate": round(second_rate, 3),
+        "switch_diff": round(switch_diff, 3),
+    })
+
+    # 1) Mixed switching: not a clean chop, not a stable dragon.
+    if 0.38 <= switch_rate <= 0.72:
+        score += 0.13
+        reasons.append("切換率混合")
+
+    # 2) Switch-rate changed too much between early and late windows.
+    if switch_diff >= CHAOS_SWITCH_DIFF_TRIGGER:
+        score += 0.16
+        reasons.append("路態前後切換")
+
+    if lengths:
+        capped = [min(5, n) for n in lengths]
+        variety = len(set(capped))
+        c = Counter(capped)
+        mode_len, mode_count = c.most_common(1)[0]
+        mode_consistency = mode_count / len(capped)
+        short_rate = sum(1 for n in lengths if n <= 2) / len(lengths)
+        metrics.update({
+            "run_lengths": lengths[-10:],
+            "run_variety": variety,
+            "mode_len": mode_len,
+            "mode_consistency": round(mode_consistency, 3),
+            "short_run_rate": round(short_rate, 3),
+        })
+
+        # 3) Run lengths are too scattered; no stable 1/2/3 rhythm.
+        if variety >= CHAOS_MIN_RUN_VARIETY and mode_consistency <= CHAOS_MODE_CONSISTENCY_MAX:
+            score += 0.18
+            reasons.append("龍長分散")
+
+        # 4) Frequent route category switching: S1 -> LONG -> S2 -> MID...
+        cats = [_run_category(n) for n in lengths[-8:]]
+        if len(cats) >= 5:
+            cat_switches = sum(1 for a, b in zip(cats, cats[1:]) if a != b)
+            cat_switch_rate = cat_switches / max(1, len(cats) - 1)
+            metrics["category_switch_rate"] = round(cat_switch_rate, 3)
+            if cat_switch_rate >= 0.62:
+                score += ROUTE_SWITCH_PENALTY
+                reasons.append("規律類型頻繁切換")
+
+        # 5) Fake dragon: many short runs, then a dragon appears in a messy regime.
+        if FAKE_DRAGON_DETECTOR and current_len >= FAKE_DRAGON_MIN_LEN and short_rate >= FAKE_DRAGON_SHORT_RUN_RATE:
+            breakout = _breakout_dragon_context(non_tie, current_side, current_len)
+            if breakout.get("active") and breakout.get("phase") in {"breakout_protect", "breakout_extend"}:
+                # True breakout should not be punished too hard.
+                score += 0.04
+                reasons.append("短路後突破龍觀察")
+            else:
+                score += 0.14
+                reasons.append("假長龍風險")
+
+        # 6) Double-chop was expected but got broken.
+        if PATTERN_FAILURE_COUNTER and len(lengths) >= 5:
+            prev5 = lengths[-6:-1]
+            if prev5 and sum(1 for n in prev5 if n == 2) >= 3 and lengths[-1] != 2:
+                score += 0.10
+                reasons.append("雙跳破壞")
+
+    # 7) Single chop got broken: previous window was jumpy, latest window no longer is.
+    if CHOP_BREAK_DETECTOR and len(recent) >= 10:
+        pre = recent[-10:-3]
+        post = recent[-5:]
+        pre_rate = _window_switch_rate(pre)
+        post_rate = _window_switch_rate(post)
+        metrics.update({"pre_chop_rate": round(pre_rate, 3), "post_chop_rate": round(post_rate, 3)})
+        if pre_rate >= CHOP_BREAK_MIN_PRE_RATE and (pre_rate - post_rate) >= CHOP_BREAK_DROP:
+            score += 0.12
+            reasons.append("單跳破壞")
+
+    # 8) Alternating tail failed at the end.
+    if PATTERN_FAILURE_COUNTER and len(recent) >= 8:
+        before = recent[-8:-2]
+        before_rate = _window_switch_rate(before)
+        if before_rate >= 0.80 and recent[-1] == recent[-2]:
+            score += 0.10
+            reasons.append("單跳尾端失敗")
+
+    # If a clean breakout dragon is active, reduce chaos slightly so it can continue 1~2 hands.
+    if current_side and current_len >= BREAKOUT_MIN_LEN:
+        breakout = _breakout_dragon_context(non_tie, current_side, current_len)
+        if breakout.get("active") and breakout.get("phase") in {"breakout_protect", "breakout_extend"}:
+            score -= 0.06
+            metrics["breakout_guard"] = breakout.get("phase")
+
+    score = _clamp(score, 0.0, 1.0)
+    active = score >= CHAOS_TRIGGER
+    strong = score >= CHAOS_STRONG_TRIGGER
+
+    # Chaos recommendation source: short-window transition + recent trend, capped to a small edge.
+    tail = recent[-min(12, len(recent)):]
+    short_markov = _transition_prob(tail)
+    short_recent = _recent_score(tail)
+    b_raw = short_markov["B"] * 0.55 + short_recent["B"] * 0.45
+    edge_cap = CHAOS_MAX_EDGE * (0.70 if strong else 1.0)
+    b = 0.5 + _clamp(b_raw - 0.5, -edge_cap, edge_cap)
+    p = 1 - b
+
+    if not reasons:
+        reasons.append("路態穩定")
+    label = "混亂盤/破路盤｜" + "+".join(reasons[:3]) if active else "路態尚可｜" + "+".join(reasons[:2])
+
+    return {
+        "active": active,
+        "strong": strong,
+        "score": round(score, 3),
+        "B": b,
+        "P": p,
+        "label": label,
+        "reasons": reasons,
+        "metrics": metrics,
+        "short_markov": short_markov,
+        "short_recent": short_recent,
+    }
+
+
+def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
+    weights = {
+        "markov": MARKOV_WEIGHT,
+        "road": ROAD_WEIGHT,
+        "streak": STREAK_WEIGHT,
+        "balance": BALANCE_WEIGHT,
+        "recent": RECENT_WEIGHT,
+    }
+    if chaos.get("active"):
+        strong = bool(chaos.get("strong"))
+        road_factor = CHAOS_ROAD_WEIGHT_FACTOR * (0.72 if strong else 1.0)
+        streak_factor = CHAOS_STREAK_WEIGHT_FACTOR * (0.80 if strong else 1.0)
+        recent_factor = CHAOS_RECENT_WEIGHT_FACTOR * (1.08 if strong else 1.0)
+        markov_factor = CHAOS_MARKOV_WEIGHT_FACTOR * (1.05 if strong else 1.0)
+        weights = {
+            "markov": MARKOV_WEIGHT * markov_factor,
+            "road": ROAD_WEIGHT * road_factor,
+            "streak": STREAK_WEIGHT * streak_factor,
+            "balance": BALANCE_WEIGHT * CHAOS_BALANCE_WEIGHT_FACTOR,
+            "recent": RECENT_WEIGHT * recent_factor,
+        }
+    return weights
+
 def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 3:
         return {"B": 0.5, "P": 0.5, "label": "資料不足", "strength": 0.0}
@@ -605,16 +828,24 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     balance = _balance_score(non_tie)
     streak = _streak_score(non_tie)
     run_data = _runs(non_tie)
+    chaos = _chaos_regime_score(non_tie, history)
+    weights = _effective_weights(chaos)
 
-    total_w = MARKOV_WEIGHT + ROAD_WEIGHT + STREAK_WEIGHT + BALANCE_WEIGHT + RECENT_WEIGHT
+    total_w = weights["markov"] + weights["road"] + weights["streak"] + weights["balance"] + weights["recent"]
     b_side = (
-        markov["B"] * MARKOV_WEIGHT
-        + road["B"] * ROAD_WEIGHT
-        + streak["B"] * STREAK_WEIGHT
-        + balance["B"] * BALANCE_WEIGHT
-        + recent["B"] * RECENT_WEIGHT
+        markov["B"] * weights["markov"]
+        + road["B"] * weights["road"]
+        + streak["B"] * weights["streak"]
+        + balance["B"] * weights["balance"]
+        + recent["B"] * weights["recent"]
     ) / total_w
     p_side = 1 - b_side
+
+    # In chaos mode, blend toward short-window Markov/Recent and cap confidence later.
+    if chaos.get("active"):
+        chaos_blend = _clamp(CHAOS_RECENT_BLEND + max(0.0, float(chaos.get("score", 0)) - CHAOS_TRIGGER) * 0.22, 0.12, 0.42)
+        b_side = b_side * (1 - chaos_blend) + float(chaos.get("B", 0.5)) * chaos_blend
+        p_side = 1 - b_side
 
     tie_prob = _tie_score(history)
     b_prob = b_side * (1 - tie_prob)
@@ -634,6 +865,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recent": recent,
         "balance": balance,
         "streak": streak,
+        "chaos": chaos,
+        "effective_weights": {k: round(v, 5) for k, v in weights.items()},
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
     }
 
@@ -647,6 +880,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 ta = _clamp(float(ai_result.get("tie_adjust", 0)), -0.020, 0.020)
                 ai_conf = _clamp(float(ai_result.get("confidence", 0.4)), 0, 1)
                 blend = AI_BLEND * (0.45 + ai_conf * 0.55)
+                if chaos.get("active"):
+                    blend *= CHAOS_AI_BLEND_FACTOR
                 b_prob += ba * blend
                 p_prob += pa * blend
                 tie_prob += ta * blend
@@ -662,6 +897,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "B" if balance["B"] >= balance["P"] else "P",
         "B" if recent["B"] >= recent["P"] else "P",
     ]
+    if chaos.get("active"):
+        votes.append("B" if chaos.get("B", 0.5) >= chaos.get("P", 0.5) else "P")
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
 
@@ -670,8 +907,19 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     else:
         recommend = main_pick
 
-    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, float(road.get("strength", 0)))
+    road_strength_for_conf = float(road.get("strength", 0))
+    if chaos.get("active"):
+        road_strength_for_conf *= 0.45 if chaos.get("strong") else 0.62
+    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, road_strength_for_conf)
+    if chaos.get("active"):
+        cap = CHAOS_STRONG_CONF_CAP if chaos.get("strong") else CHAOS_CONF_CAP
+        conf = min(conf, cap)
+        level = "混亂盤低信心" if chaos.get("strong") else "混亂盤弱訊號"
     reason_parts = [road.get("label", "牌路"), f"模型一致{int(agreement * 100)}%"]
+    if chaos.get("active"):
+        reason_parts.insert(0, f"{chaos.get('label')}({int(float(chaos.get('score', 0))*100)}%)")
+        if LOW_CONFIDENCE_MINBET:
+            reason_parts.append("建議最小注")
     if road.get("road_action"):
         reason_parts.append(f"動作:{road.get('road_action')}")
     if road.get("secondary_label"):
@@ -695,7 +943,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recommend_text": {"B": "莊", "P": "閒", "T": "和"}[recommend],
         "confidence": round(conf, 3),
         "signal_level": level,
+        "bet_mode": "最小注" if chaos.get("active") and LOW_CONFIDENCE_MINBET else "信心分級",
         "pattern_label": road.get("label", ""),
+        "chaos_label": chaos.get("label", ""),
+        "chaos_score": chaos.get("score", 0),
         "reason": " / ".join(reason_parts),
         "dragon": {
             "current_streak": _streak(non_tie),
@@ -704,6 +955,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "breakout": road.get("breakout"),
             "road_action": road.get("road_action", ""),
         },
+        "chaos": chaos,
+        "effective_weights": {k: round(v, 4) for k, v in weights.items()},
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ai_result": ai_result if os.getenv("DEBUG_AI_RESULT", "0") == "1" else None,
         "debug": feature_payload if os.getenv("DEBUG_PREDICTOR", "0") == "1" else None,
