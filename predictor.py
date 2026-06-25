@@ -136,6 +136,25 @@ CHOP_TO_DRAGON_CHAOS_RELIEF = float(os.getenv("CHOP_TO_DRAGON_CHAOS_RELIEF", "0.
 CHOP_TO_DRAGON_FINAL_OVERRIDE = os.getenv("CHOP_TO_DRAGON_FINAL_OVERRIDE", "1") == "1"
 CHOP_TO_DRAGON_OVERRIDE_EDGE = float(os.getenv("CHOP_TO_DRAGON_OVERRIDE_EDGE", "0.040"))
 
+# Mirror Run Mode:
+# Handles short mirror-length road behavior, e.g. B B B -> P P (expect P to fill to 3),
+# then after P P P is completed, prepare for B instead of blindly chasing P4.
+MIRROR_RUN_MODE = os.getenv("MIRROR_RUN_MODE", "1") == "1"
+MIRROR_RUN_LOOKBACK = int(os.getenv("MIRROR_RUN_LOOKBACK", "8"))
+MIRROR_RUN_MIN_LEN = int(os.getenv("MIRROR_RUN_MIN_LEN", "2"))
+MIRROR_RUN_CURRENT_MIN = int(os.getenv("MIRROR_RUN_CURRENT_MIN", "2"))
+MIRROR_RUN_MAX_TARGET = int(os.getenv("MIRROR_RUN_MAX_TARGET", "5"))
+MIRROR_RUN_MATCH_TOLERANCE = int(os.getenv("MIRROR_RUN_MATCH_TOLERANCE", "0"))
+MIRROR_RUN_EDGE = float(os.getenv("MIRROR_RUN_EDGE", "0.036"))
+MIRROR_RUN_MAX_EDGE = float(os.getenv("MIRROR_RUN_MAX_EDGE", "0.060"))
+MIRROR_RUN_STRENGTH = float(os.getenv("MIRROR_RUN_STRENGTH", "0.185"))
+MIRROR_RUN_COMPLETE_REVERSAL = os.getenv("MIRROR_RUN_COMPLETE_REVERSAL", "1") == "1"
+MIRROR_RUN_REVERSAL_EDGE = float(os.getenv("MIRROR_RUN_REVERSAL_EDGE", "0.042"))
+MIRROR_RUN_REVERSAL_MAX_EDGE = float(os.getenv("MIRROR_RUN_REVERSAL_MAX_EDGE", "0.066"))
+MIRROR_RUN_FINAL_OVERRIDE = os.getenv("MIRROR_RUN_FINAL_OVERRIDE", "1") == "1"
+MIRROR_RUN_OVERRIDE_EDGE = float(os.getenv("MIRROR_RUN_OVERRIDE_EDGE", "0.042"))
+MIRROR_RUN_CHAOS_RELIEF = float(os.getenv("MIRROR_RUN_CHAOS_RELIEF", "0.085"))
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -877,6 +896,125 @@ def _chop_to_dragon_score(non_tie: List[str]) -> Dict[str, Any]:
     }
 
 
+
+def _mirror_run_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    Mirror Run Mode / 對稱龍長模式.
+
+    This catches the road type the user described:
+        previous run: B3
+        current run:  P2 -> expect P to fill one more hand to P3
+        current run:  P3 -> mirror length completed, prepare B instead of chasing P4 blindly
+
+    It looks only at run lengths, not card points. Tie is ignored upstream.
+    """
+    if not MIRROR_RUN_MODE or len(non_tie) < 4:
+        return {"B": 0.5, "P": 0.5, "label": "對稱龍資料不足", "strength": 0.0, "active": False}
+
+    runs = _runs(non_tie)
+    if len(runs) < 2:
+        return {"B": 0.5, "P": 0.5, "label": "對稱龍資料不足", "strength": 0.0, "active": False}
+
+    current_side, current_len = runs[-1]
+    prev_side, prev_len = runs[-2]
+
+    if prev_side == current_side:
+        return {"B": 0.5, "P": 0.5, "label": "非對稱轉邊", "strength": 0.0, "active": False}
+
+    if prev_len < MIRROR_RUN_MIN_LEN or prev_len > MIRROR_RUN_MAX_TARGET:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "前段龍長不適合對稱",
+            "strength": 0.0,
+            "active": False,
+            "prev_len": prev_len,
+            "current_len": current_len,
+        }
+
+    if current_len < MIRROR_RUN_CURRENT_MIN:
+        return {
+            "B": 0.5,
+            "P": 0.5,
+            "label": "對稱龍尚未啟動",
+            "strength": 0.0,
+            "active": False,
+            "prev_len": prev_len,
+            "current_len": current_len,
+        }
+
+    recent_completed = runs[:-1]
+    recent_lengths = [n for _s, n in recent_completed[-MIRROR_RUN_LOOKBACK:]] if MIRROR_RUN_LOOKBACK > 0 else [n for _s, n in recent_completed]
+    near_prev_hits = sum(1 for n in recent_lengths if abs(n - prev_len) <= max(0, MIRROR_RUN_MATCH_TOLERANCE))
+    short_mirror_context = prev_len <= 4 and current_len <= prev_len + max(0, MIRROR_RUN_MATCH_TOLERANCE)
+
+    # Phase 1: fill to the previous run length.
+    # Example: B3 -> P2, target P to complete P3.
+    fill_threshold = prev_len - max(0, MIRROR_RUN_MATCH_TOLERANCE)
+    if current_len < fill_threshold:
+        target_side = current_side
+        missing = max(1, prev_len - current_len)
+        edge = MIRROR_RUN_EDGE + min(0.016, current_len * 0.006) + min(0.010, near_prev_hits * 0.003)
+        edge = min(MIRROR_RUN_MAX_EDGE, edge)
+        b, p = _bp_score(target_side, 0.5 + edge)
+        return {
+            "B": b,
+            "P": p,
+            "label": f"對稱補龍{current_side}{current_len}→{prev_len}｜承接前段{prev_side}{prev_len}",
+            "strength": _clamp(MIRROR_RUN_STRENGTH + min(0.025, near_prev_hits * 0.006), 0.08, 0.235),
+            "active": True,
+            "phase": "fill",
+            "target_side": target_side,
+            "prev_side": prev_side,
+            "prev_len": prev_len,
+            "current_side": current_side,
+            "current_len": current_len,
+            "missing": missing,
+            "edge": round(edge, 5),
+            "near_prev_hits": near_prev_hits,
+            "road_action": "對稱補龍/續到前段長度",
+        }
+
+    # Phase 2: mirror length completed; prepare reversal.
+    # Example: B3 -> P3, target B instead of blindly following P4.
+    if MIRROR_RUN_COMPLETE_REVERSAL and short_mirror_context:
+        target_side = _opposite(current_side)
+        edge = MIRROR_RUN_REVERSAL_EDGE + min(0.014, near_prev_hits * 0.004)
+        # If the current side is also a first-side/breakout dragon, do not over-punish.
+        if current_len >= DRAGON_STRONG_LEN + 1:
+            edge *= 0.75
+        edge = min(MIRROR_RUN_REVERSAL_MAX_EDGE, edge)
+        b, p = _bp_score(target_side, 0.5 + edge)
+        return {
+            "B": b,
+            "P": p,
+            "label": f"對稱補滿轉邊{current_side}{current_len}≈前段{prev_side}{prev_len}｜補滿觀察{target_side}",
+            "strength": _clamp(MIRROR_RUN_STRENGTH + 0.028 + min(0.025, near_prev_hits * 0.006), 0.10, 0.255),
+            "active": True,
+            "phase": "complete_reversal",
+            "target_side": target_side,
+            "prev_side": prev_side,
+            "prev_len": prev_len,
+            "current_side": current_side,
+            "current_len": current_len,
+            "edge": round(edge, 5),
+            "near_prev_hits": near_prev_hits,
+            "road_action": "對稱補滿/轉邊",
+        }
+
+    # If current run already exceeds the mirror target, hand it back to dragon / breakout logic.
+    return {
+        "B": 0.5,
+        "P": 0.5,
+        "label": "對稱已超長交回龍判斷",
+        "strength": 0.0,
+        "active": False,
+        "prev_side": prev_side,
+        "prev_len": prev_len,
+        "current_side": current_side,
+        "current_len": current_len,
+    }
+
 def _pattern_memory_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 8:
         return {"B": 0.5, "P": 0.5, "label": "回測資料不足", "strength": 0.0}
@@ -1038,6 +1176,19 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
         score -= relief
         reasons.append("單跳反轉接龍")
 
+    # 7.6) Mirror-run behavior is not pure chaos either: it is a short-run length
+    # completion pattern. Reduce chaos so the mirror layer can guide fill/reversal.
+    mirror_run = _mirror_run_score(non_tie)
+    if mirror_run.get("active"):
+        metrics["mirror_run"] = {
+            "phase": mirror_run.get("phase"),
+            "target_side": mirror_run.get("target_side"),
+            "prev_len": mirror_run.get("prev_len"),
+            "current_len": mirror_run.get("current_len"),
+        }
+        score -= MIRROR_RUN_CHAOS_RELIEF
+        reasons.append("對稱補龍/補滿轉邊")
+
     # 8) Alternating tail failed at the end.
     if PATTERN_FAILURE_COUNTER and len(recent) >= 8:
         before = recent[-8:-2]
@@ -1083,6 +1234,8 @@ def _chaos_regime_score(non_tie: List[str], history: List[str]) -> Dict[str, Any
         "short_recent": short_recent,
         "chop_to_dragon_active": bool(locals().get("chop_to_dragon", {}).get("active")),
         "chop_to_dragon": locals().get("chop_to_dragon", None),
+        "mirror_run_active": bool(locals().get("mirror_run", {}).get("active")),
+        "mirror_run": locals().get("mirror_run", None),
     }
 
 
@@ -1108,6 +1261,11 @@ def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
             streak_factor = max(streak_factor, 0.66)
             recent_factor = max(recent_factor, 1.38)
             markov_factor = max(markov_factor, 1.12)
+        if chaos.get("mirror_run_active"):
+            road_factor = max(road_factor, 0.70)
+            streak_factor = max(streak_factor, 0.64)
+            recent_factor = max(recent_factor, 1.32)
+            markov_factor = max(markov_factor, 1.10)
         weights = {
             "markov": MARKOV_WEIGHT * markov_factor,
             "road": ROAD_WEIGHT * road_factor,
@@ -1124,6 +1282,7 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     candidates = [
         _dragon_score(non_tie),
         _run_cycle_score(non_tie),
+        _mirror_run_score(non_tie),
         _chop_score(non_tie),
         _chop_to_dragon_score(non_tie),
         _pattern_memory_score(non_tie),
@@ -1145,6 +1304,8 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     best = dict(best)
     if best.get("active") and "單跳反轉" in str(best.get("label", "")):
         best["chop_to_dragon"] = dict(best)
+    if best.get("active") and "對稱" in str(best.get("label", "")):
+        best["mirror_run"] = dict(best)
     if second and second.get("strength", 0) >= 0.12 and second.get("label") != best.get("label"):
         best["secondary_label"] = second.get("label")
         # Small blend to avoid one pattern totally dominating another valid road mode.
@@ -1365,6 +1526,29 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         chop_to_dragon_final_override = True
 
+    mirror_run_final_override = False
+    road_mirror_run = road.get("mirror_run") if isinstance(road, dict) else None
+    if (
+        MIRROR_RUN_FINAL_OVERRIDE
+        and isinstance(road_mirror_run, dict)
+        and road_mirror_run.get("active")
+        and road_mirror_run.get("target_side") in {"B", "P"}
+        and road_mirror_run.get("phase") in {"fill", "complete_reversal"}
+    ):
+        target_side = str(road_mirror_run.get("target_side"))
+        raw_edge = float(road_mirror_run.get("edge", MIRROR_RUN_EDGE))
+        factor = 0.82 if road_mirror_run.get("phase") == "fill" else 1.0
+        edge = min(MIRROR_RUN_OVERRIDE_EDGE, max(0.022, raw_edge * factor))
+        bp_total = max(0.001, 1 - tie_prob)
+        if target_side == "B":
+            b_prob = (0.5 + edge) * bp_total
+            p_prob = (0.5 - edge) * bp_total
+        else:
+            b_prob = (0.5 - edge) * bp_total
+            p_prob = (0.5 + edge) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        mirror_run_final_override = True
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -1401,6 +1585,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.append("強轉龍校準")
     if 'chop_to_dragon_final_override' in locals() and chop_to_dragon_final_override:
         reason_parts.append("單跳轉龍校準")
+    if 'mirror_run_final_override' in locals() and mirror_run_final_override:
+        reason_parts.append("對稱龍長校準")
     if road.get("secondary_label"):
         reason_parts.append(f"副路:{road.get('secondary_label')}")
     if ai_result and ai_result.get("pattern_label"):
@@ -1435,6 +1621,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "breakout": road.get("breakout"),
             "reversal": road.get("reversal"),
             "chop_to_dragon": road.get("chop_to_dragon"),
+            "mirror_run": road.get("mirror_run"),
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
