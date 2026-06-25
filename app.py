@@ -45,7 +45,12 @@ ACK_EVERY_N_ROUNDS = int(os.getenv("ACK_EVERY_N_ROUNDS", "0") or "0")
 PREDICT_TIMEOUT_SEC = float(os.getenv("PREDICT_TIMEOUT_SEC", "14"))
 _PREDICT_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PREDICT_WORKERS", "2") or "2"))
 
-app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.1.0")
+# 開始 AI 判斷時，先用 replyToken 回「處理中」，再用 Push 補送結果。
+# 這樣可避免 predictor / DeepSeek 太慢時，LINE replyToken 過期造成使用者完全沒反應。
+PREDICT_ASYNC_PUSH = os.getenv("PREDICT_ASYNC_PUSH", "1") == "1"
+_PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PUSH_WORKERS", "2") or "2"))
+
+app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -142,6 +147,28 @@ def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
     )
     if r.status_code >= 300:
         print("LINE reply failed", r.status_code, r.text)
+
+
+def line_push(to: str, messages: List[Dict[str, Any]]) -> bool:
+    if not CHANNEL_ACCESS_TOKEN:
+        print("LINE_CHANNEL_ACCESS_TOKEN is empty; push skipped.")
+        return False
+    if not to:
+        print("LINE push target is empty; push skipped.")
+        return False
+    r = requests.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"to": to, "messages": messages[:5]},
+        timeout=8,
+    )
+    if r.status_code >= 300:
+        print("LINE push failed", r.status_code, r.text)
+        return False
+    return True
 
 
 def text_msg(text: str) -> Dict[str, Any]:
@@ -575,14 +602,38 @@ def predict_and_save(user_id: str) -> Tuple[Dict[str, Any], bool, str]:
     return saved, used_fallback, note
 
 
+def push_predict_result(user_id: str) -> None:
+    try:
+        session, used_fallback, note = predict_and_save(user_id)
+        msgs = [result_flex(session)]
+        if used_fallback and note:
+            msgs.append(text_msg(note))
+        ok = line_push(user_id, msgs)
+        if not ok:
+            # Flex 格式或推播失敗時，至少補一則文字版結果，方便在 Render log 對照。
+            pred = session.get("last_prediction") or {}
+            line_push(user_id, [text_msg(
+                f"AI判斷完成\n"
+                f"莊：{percent_text(pred.get('banker_rate', 0))}\n"
+                f"閒：{percent_text(pred.get('player_rate', 0))}\n"
+                f"和：{percent_text(pred.get('tie_rate', 0))}\n"
+                f"推薦：{pred.get('recommend_text') or pred.get('recommend') or '-'}\n"
+                f"{pred.get('signal_level', '')}｜{pred.get('reason', '')}"
+            )])
+    except Exception as exc:
+        print("push_predict_result failed:", repr(exc))
+        traceback.print_exc()
+        line_push(user_id, [text_msg(f"AI判斷失敗：{exc}")])
+
+
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.1.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.2.0"}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.1.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.2.0"}
 
 
 @app.get("/ping")
@@ -699,14 +750,18 @@ async def callback(request: Request) -> JSONResponse:
                 continue
 
             if text in ["AI", "開始AI判斷", "判斷", "預測"]:
-                try:
-                    session, used_fallback, note = predict_and_save(user_id)
-                    msgs = [result_flex(session)]
-                    if used_fallback and note:
-                        msgs.append(text_msg(note))
-                    line_reply(reply_token, msgs)
-                except Exception as exc:
-                    line_reply(reply_token, [text_msg(str(exc))])
+                if PREDICT_ASYNC_PUSH:
+                    line_reply(reply_token, [text_msg("AI 規律模型判斷中，請稍候 3～15 秒。結果會自動跳出。")])
+                    _PUSH_EXECUTOR.submit(push_predict_result, user_id)
+                else:
+                    try:
+                        session, used_fallback, note = predict_and_save(user_id)
+                        msgs = [result_flex(session)]
+                        if used_fallback and note:
+                            msgs.append(text_msg(note))
+                        line_reply(reply_token, msgs)
+                    except Exception as exc:
+                        line_reply(reply_token, [text_msg(str(exc))])
                 continue
 
             if text in ["結束", "結束分析"]:
@@ -788,11 +843,15 @@ async def callback(request: Request) -> JSONResponse:
                     line_reply(reply_token, [end_flex(session)])
 
                 elif action == "predict":
-                    session, used_fallback, note = predict_and_save(user_id)
-                    msgs = [result_flex(session)]
-                    if used_fallback and note:
-                        msgs.append(text_msg(note))
-                    line_reply(reply_token, msgs)
+                    if PREDICT_ASYNC_PUSH:
+                        line_reply(reply_token, [text_msg("AI 規律模型判斷中，請稍候 3～15 秒。結果會自動跳出。")])
+                        _PUSH_EXECUTOR.submit(push_predict_result, user_id)
+                    else:
+                        session, used_fallback, note = predict_and_save(user_id)
+                        msgs = [result_flex(session)]
+                        if used_fallback and note:
+                            msgs.append(text_msg(note))
+                        line_reply(reply_token, msgs)
 
                 else:
                     line_reply(reply_token, [start_menu_flex("尚未選擇動作", "請點擊「開始分析」重新開始。")])
