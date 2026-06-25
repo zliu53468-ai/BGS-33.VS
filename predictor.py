@@ -1,31 +1,26 @@
-import os
 import math
+import os
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple, Optional
+from statistics import median
+from typing import Any, Dict, List, Tuple
 
 from deepseek_client import DeepSeekClient
 
-# -----------------------------
-# Base priors / environment
-# -----------------------------
+# Base baccarat long-run priors, used only as soft priors for display calibration.
 B_PRIOR = float(os.getenv("B_PRIOR", "0.4586"))
 P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
-# Main ensemble weights. These are still used, but v3 adds a road-state router on top.
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.20"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.36"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.14"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.08"))
+# Main ensemble weights.
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.22"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.30"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.16"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.10"))
 RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.10"))
+TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
 AI_BLEND = float(os.getenv("AI_BLEND", "0.14"))
 
-# Dynamic router controls.
-ROAD_STATE_ROUTER = os.getenv("ROAD_STATE_ROUTER", "1") == "1"
-DYNAMIC_WEIGHT_MODE = os.getenv("DYNAMIC_WEIGHT_MODE", "1") == "1"
-FRONT_PATTERN_MATCH = os.getenv("FRONT_PATTERN_MATCH", "1") == "1"
-
-# Tie handling. Tie is a warning layer by default, not a main recommendation.
+# Tie handling. Tie should usually be a warning layer, not a main recommendation.
 TIE_SHRINK = float(os.getenv("TIE_SHRINK", "0.35"))
 TIE_MAX_PROB = float(os.getenv("TIE_MAX_PROB", "0.18"))
 ALLOW_TIE_RECOMMEND = os.getenv("ALLOW_TIE_RECOMMEND", "0") == "1"
@@ -34,45 +29,32 @@ TIE_RECOMMEND_MIN = float(os.getenv("TIE_RECOMMEND_MIN", "0.165"))
 MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "6"))
 MIN_HISTORY_FOR_SIGNAL = int(os.getenv("MIN_HISTORY_FOR_SIGNAL", "4"))
 
-# Dragon / run-length memory.
-DRAGON_MEMORY_LOOKBACK = int(os.getenv("DRAGON_MEMORY_LOOKBACK", "18"))
-DRAGON_BREAK_REPEAT_MIN = int(os.getenv("DRAGON_BREAK_REPEAT_MIN", "2"))
-DRAGON_FOLLOW_MIN_LEN = int(os.getenv("DRAGON_FOLLOW_MIN_LEN", "3"))
+# Advanced road / dragon controls.
 DRAGON_MIN_LEN = int(os.getenv("DRAGON_MIN_LEN", "3"))
 DRAGON_STRONG_LEN = int(os.getenv("DRAGON_STRONG_LEN", "5"))
 DRAGON_FATIGUE_START = int(os.getenv("DRAGON_FATIGUE_START", "8"))
-DRAGON_MAX_EDGE = float(os.getenv("DRAGON_MAX_EDGE", "0.118"))
-DRAGON_BREAK_EDGE = float(os.getenv("DRAGON_BREAK_EDGE", "0.100"))
+DRAGON_MAX_EDGE = float(os.getenv("DRAGON_MAX_EDGE", "0.105"))
+DRAGON_BREAK_EDGE = float(os.getenv("DRAGON_BREAK_EDGE", "0.080"))
+RUN_CYCLE_MIN_HITS = int(os.getenv("RUN_CYCLE_MIN_HITS", "3"))
+ROAD_PATTERN_WINDOW = int(os.getenv("ROAD_PATTERN_WINDOW", "16"))
+PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "5"))
+MARKOV_ALPHA = float(os.getenv("MARKOV_ALPHA", "2.6"))
+MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "16"))
 
-# Single chop / double chop / room rhythm.
-ROAD_PATTERN_WINDOW = int(os.getenv("ROAD_PATTERN_WINDOW", "18"))
-SINGLE_CHOP_CONFIRM_WINDOW = int(os.getenv("SINGLE_CHOP_CONFIRM_WINDOW", "7"))
-SINGLE_CHOP_MIN_RATE = float(os.getenv("SINGLE_CHOP_MIN_RATE", "0.66"))
-DOUBLE_CHOP_LOOKBACK = int(os.getenv("DOUBLE_CHOP_LOOKBACK", "12"))
-DOUBLE_CHOP_MIN_HITS = int(os.getenv("DOUBLE_CHOP_MIN_HITS", "3"))
-ROOM_PATTERN_MODE = os.getenv("ROOM_PATTERN_MODE", "1") == "1"
-ONE_TWO_PATTERN_WEIGHT = float(os.getenv("ONE_TWO_PATTERN_WEIGHT", "0.22"))
-TWO_ONE_PATTERN_WEIGHT = float(os.getenv("TWO_ONE_PATTERN_WEIGHT", "0.22"))
-RUN_PATTERN_LOOKBACK = int(os.getenv("RUN_PATTERN_LOOKBACK", "12"))
-RUN_PATTERN_MIN_MATCH = int(os.getenv("RUN_PATTERN_MIN_MATCH", "3"))
-
-# Front / n-gram memory.
-PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "6"))
-FRONT_PATTERN_LOOKBACK = int(os.getenv("FRONT_PATTERN_LOOKBACK", "7"))
-FRONT_PATTERN_MIN_SAMPLE = int(os.getenv("FRONT_PATTERN_MIN_SAMPLE", "2"))
-
-# Markov smoothing.
-MARKOV_ALPHA = float(os.getenv("MARKOV_ALPHA", "2.8"))
-MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "18"))
-
-# Output limits.
-MAX_SIDE_PROB = float(os.getenv("MAX_SIDE_PROB", "0.62"))
-MIN_SIDE_PROB = float(os.getenv("MIN_SIDE_PROB", "0.38"))
+# Breakout Dragon Mode:
+# Handles shoes where a Banker/Player dragon suddenly exceeds previous run lengths.
+# It protects 1~2 hands after a true breakout so the model does not force-break too early.
+DRAGON_MEMORY_LOOKBACK = int(os.getenv("DRAGON_MEMORY_LOOKBACK", "28"))
+DRAGON_BREAK_REPEAT_MIN = int(os.getenv("DRAGON_BREAK_REPEAT_MIN", "3"))
+BREAKOUT_DRAGON_MODE = os.getenv("BREAKOUT_DRAGON_MODE", "1") == "1"
+BREAKOUT_MIN_LEN = int(os.getenv("BREAKOUT_MIN_LEN", str(DRAGON_STRONG_LEN)))
+BREAKOUT_PROTECT_STEPS = int(os.getenv("BREAKOUT_PROTECT_STEPS", "2"))
+BREAKOUT_EXTEND_STEPS = int(os.getenv("BREAKOUT_EXTEND_STEPS", "2"))
+BREAKOUT_CONT_EDGE = float(os.getenv("BREAKOUT_CONT_EDGE", "0.038"))
+BREAKOUT_NEW_HIGH_BONUS = float(os.getenv("BREAKOUT_NEW_HIGH_BONUS", "0.014"))
+BREAKOUT_OVERHEAT_PENALTY = float(os.getenv("BREAKOUT_OVERHEAT_PENALTY", "0.018"))
 
 
-# -----------------------------
-# Utility
-# -----------------------------
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -95,10 +77,6 @@ def _last_non_tie(history: List[str]) -> List[str]:
 
 def _opposite(side: str) -> str:
     return "P" if side == "B" else "B"
-
-
-def _side_name(side: str) -> str:
-    return {"B": "莊", "P": "閒", "T": "和"}.get(side, side)
 
 
 def _streak(non_tie: List[str]) -> Tuple[str, int]:
@@ -132,36 +110,10 @@ def _runs(non_tie: List[str]) -> List[Tuple[str, int]]:
 
 
 def _bp_score(side: str, prob: float) -> Tuple[float, float]:
-    prob = _clamp(prob, MIN_SIDE_PROB, MAX_SIDE_PROB)
+    prob = _clamp(prob, 0.35, 0.65)
     return (prob, 1 - prob) if side == "B" else (1 - prob, prob)
 
 
-def _edge_of(score: Dict[str, Any]) -> float:
-    return abs(float(score.get("B", 0.5)) - 0.5)
-
-
-def _score(side: str, prob: float, label: str, strength: float, action: str = "", **extra: Any) -> Dict[str, Any]:
-    b, p = _bp_score(side, prob)
-    data = {
-        "B": b,
-        "P": p,
-        "pick": side,
-        "label": label,
-        "action": action,
-        "strength": _clamp(strength, 0.0, 0.35),
-        "edge": abs(prob - 0.5),
-    }
-    data.update(extra)
-    return data
-
-
-def _neutral(label: str = "資料不足") -> Dict[str, Any]:
-    return {"B": 0.5, "P": 0.5, "pick": "", "label": label, "action": "", "strength": 0.0, "edge": 0.0}
-
-
-# -----------------------------
-# Base statistical layers
-# -----------------------------
 def _transition_prob(non_tie: List[str]) -> Dict[str, float]:
     counts = defaultdict(lambda: Counter())
     for a, b in zip(non_tie, non_tie[1:]):
@@ -179,335 +131,437 @@ def _transition_prob(non_tie: List[str]) -> Dict[str, float]:
     return {"B": b, "P": p, "sample": sample}
 
 
-def _balance_score(non_tie: List[str]) -> Dict[str, Any]:
-    if len(non_tie) < 8:
-        return _neutral("均衡資料不足")
-    b = non_tie.count("B")
-    p = non_tie.count("P")
-    diff = b - p
-    # This is intentionally small. Balance cannot override clear road states.
-    edge = min(0.040, abs(diff) / max(1, len(non_tie)) * 0.11)
-    side = "B" if diff < 0 else "P"
-    return _score(side, 0.5 + edge, "短靴均衡修正", 0.06 + min(0.05, edge * 1.5), "均衡")
-
-
-def _recent_score(non_tie: List[str]) -> Dict[str, Any]:
-    if not non_tie:
-        return _neutral("近期資料不足")
-    recent = non_tie[-10:]
-    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
-    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
-    last, n = _streak(non_tie)
-    if switch_rate >= 0.70 and len(recent) >= 7:
-        return _score(_opposite(last), 0.552, "近期單跳偏強", 0.12, "單跳")
-    if n >= DRAGON_MIN_LEN:
-        edge = 0.035 + min(0.030, (n - DRAGON_MIN_LEN) * 0.008)
-        if n >= DRAGON_FATIGUE_START:
-            edge *= 0.72
-        return _score(last, 0.5 + edge, f"近期{_side_name(last)}{n}連", 0.10 + min(0.05, edge), "跟龍")
-    b_count = recent.count("B")
-    p_count = recent.count("P")
-    if abs(b_count - p_count) >= 3:
-        side = "B" if b_count < p_count else "P"
-        return _score(side, 0.525, "近期偏態小修正", 0.07, "修正")
-    return _neutral("近期混合")
-
-
-def _streak_score(non_tie: List[str]) -> Dict[str, Any]:
-    last, n = _streak(non_tie)
-    if not last:
-        return _neutral("連段資料不足")
-    opp = _opposite(last)
-    if n == 1:
-        return _score(opp, 0.518, "單顆後反邊微修正", 0.05, "反邊")
-    if n == 2:
-        return _score(last, 0.526, "短龍2連補足", 0.07, "補足")
-    if n == 3:
-        return _score(last, 0.540, "中龍3連續龍", 0.09, "跟龍")
-    if n == 4:
-        return _score(last, 0.552, "中龍4連續龍", 0.11, "跟龍")
-    if n < DRAGON_FATIGUE_START:
-        return _score(last, min(0.585, 0.558 + (n - 4) * 0.008), f"長龍{_side_name(last)}{n}連", 0.13, "跟龍")
-    return _score(last, 0.548, f"超長龍{_side_name(last)}{n}連疲勞", 0.10, "保守跟龍")
-
-
-# -----------------------------
-# Advanced road-state router
-# -----------------------------
 def _run_follow_stats(non_tie: List[str], current_len: int) -> Dict[str, Any]:
+    """
+    Estimate whether a run tends to continue or break when it reaches current_len.
+    A completed run with length > current_len means it continued at this length.
+    A completed run with length == current_len means it broke at this length.
+    """
     completed = _runs(non_tie)[:-1]
     cont = 0
     brk = 0
+    nearby_cont = 0
+    nearby_brk = 0
     for _side, length in completed:
         if length > current_len:
             cont += 1
         elif length == current_len:
             brk += 1
-    return {"cont": cont, "break": brk, "sample": cont + brk}
+        if length > max(1, current_len - 1):
+            nearby_cont += 1
+        elif length == max(1, current_len - 1):
+            nearby_brk += 1
+    return {
+        "cont": cont,
+        "break": brk,
+        "nearby_cont": nearby_cont,
+        "nearby_break": nearby_brk,
+        "sample": cont + brk,
+        "nearby_sample": nearby_cont + nearby_brk,
+    }
 
 
-def _recent_completed_lengths(runs: List[Tuple[str, int]], n: int = DRAGON_MEMORY_LOOKBACK) -> List[int]:
-    return [length for _side, length in runs[:-1]][-n:]
+def _dragon_prior_cont_prob(n: int) -> float:
+    """
+    Conservative continuation prior.
+    Important change: fatigue now follows DRAGON_FATIGUE_START instead of hard-stopping too early.
+    This avoids forcing a break when a dragon is just starting to exceed earlier history.
+    """
+    if n <= 1:
+        return 0.500
+    if n == 2:
+        return 0.522
+    if n == 3:
+        return 0.548
+    if n == 4:
+        return 0.568
+    if n == 5:
+        return 0.586
+    if n == 6:
+        return 0.596
+    if n == 7:
+        return 0.594
+
+    # Between 8 and fatigue start, keep continuation alive with only mild decay.
+    if n < DRAGON_FATIGUE_START:
+        return max(0.570, 0.594 - max(0, n - 7) * 0.004)
+
+    # True fatigue starts only after DRAGON_FATIGUE_START.
+    return max(0.540, 0.585 - (n - DRAGON_FATIGUE_START + 1) * 0.010)
 
 
-def _length_rhythm_score(non_tie: List[str]) -> Dict[str, Any]:
-    """Detects 1-2 / 2-1 / 2-2 / 3-1 run-length rhythms and decides 補足 vs 轉邊."""
-    runs = _runs(non_tie)
-    if len(runs) < 5:
-        return _neutral("長短節奏資料不足")
+def _breakout_dragon_context(non_tie: List[str], side: str, n: int) -> Dict[str, Any]:
+    """
+    Breakout Dragon Mode.
+    If the current dragon length exceeds recent historical dragon lengths,
+    do not immediately force a break. Protect the first 1~2 hands after breakout,
+    then gradually switch to fatigue / break-risk checking.
 
-    current_side, current_len = runs[-1]
-    completed = _recent_completed_lengths(runs, RUN_PATTERN_LOOKBACK)
-    if len(completed) < 4:
-        return _neutral("長短節奏資料不足")
+    Example:
+    previous max P run = 4, current P run = 5 or 6 -> continuation protection
+    current P run = 8~10 -> reduce continuation and check fatigue
+    """
+    if not BREAKOUT_DRAGON_MODE or not side or n < BREAKOUT_MIN_LEN:
+        return {"active": False}
 
-    # Fixed cut length, e.g. 2-2-2-2 or 3-3-3-3.
-    c = Counter(completed[-8:])
-    mode_len, mode_count = c.most_common(1)[0]
-    fixed_consistency = mode_count / max(1, min(8, len(completed)))
-    if mode_count >= RUN_PATTERN_MIN_MATCH and fixed_consistency >= 0.45:
-        if current_len < mode_len:
-            side = current_side
-            prob = 0.552 + min(0.035, (fixed_consistency - 0.45) * 0.10)
-            return _score(side, prob, f"固定{mode_len}連節奏｜補足{_side_name(side)}", 0.15 + fixed_consistency * 0.08, "補足", target_len=mode_len)
-        side = _opposite(current_side)
-        prob = 0.555 + min(0.040, (fixed_consistency - 0.45) * 0.12)
-        return _score(side, prob, f"固定{mode_len}連節奏｜到點轉邊", 0.16 + fixed_consistency * 0.08, "斷龍/轉邊", target_len=mode_len)
-
-    # Alternating run rhythm, e.g. 1-2-1-2, 2-1-2-1, 1-3-1-3.
-    recent = completed[-6:]
-    if len(recent) >= 6:
-        a_hits = recent[0] == recent[2] == recent[4]
-        b_hits = recent[1] == recent[3] == recent[5]
-        if a_hits and b_hits and recent[0] != recent[1]:
-            # Current run target is usually the length two runs ago.
-            target_len = recent[-2]
-            rhythm = f"{recent[0]}-{recent[1]}"
-            if current_len < target_len:
-                side = current_side
-                prob = 0.562 if rhythm in {"1-2", "2-1"} else 0.555
-                label = f"一房兩廳/兩房一廳{rhythm}｜補足{_side_name(side)}"
-                strength = 0.19 if rhythm in {"1-2", "2-1"} else 0.17
-                return _score(side, prob, label, strength, "補足", target_len=target_len, rhythm=rhythm)
-            side = _opposite(current_side)
-            prob = 0.568 if rhythm in {"1-2", "2-1"} else 0.558
-            label = f"一房兩廳/兩房一廳{rhythm}｜到點轉邊"
-            strength = 0.20 if rhythm in {"1-2", "2-1"} else 0.18
-            return _score(side, prob, label, strength, "斷龍/轉邊", target_len=target_len, rhythm=rhythm)
-
-    # Last four may already show A-B-A pattern; predict B target.
-    if len(completed) >= 4:
-        last4 = completed[-4:]
-        if last4[0] == last4[2] and last4[1] != last4[0]:
-            target_len = last4[1]
-            if current_len < target_len:
-                return _score(current_side, 0.548, f"長短龍交替預判｜補到{target_len}連", 0.13, "補足", target_len=target_len)
-            return _score(_opposite(current_side), 0.552, f"長短龍交替預判｜{target_len}連轉邊", 0.14, "轉邊", target_len=target_len)
-
-    return _neutral("未見長短固定節奏")
-
-
-def _single_chop_score(non_tie: List[str]) -> Dict[str, Any]:
-    if len(non_tie) < 6:
-        return _neutral("單跳資料不足")
-    recent = non_tie[-ROAD_PATTERN_WINDOW:]
-    last = recent[-1]
-    opp = _opposite(last)
-    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
-    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
-
-    # exact alternating suffix length
-    alt_len = 1
-    for i in range(len(non_tie) - 1, 0, -1):
-        if non_tie[i] != non_tie[i - 1]:
-            alt_len += 1
-        else:
-            break
-
-    if alt_len >= SINGLE_CHOP_CONFIRM_WINDOW:
-        prob = 0.568 + min(0.035, (alt_len - SINGLE_CHOP_CONFIRM_WINDOW) * 0.006)
-        return _score(opp, prob, f"單跳成型｜連跳{alt_len}手", 0.20 + min(0.06, alt_len * 0.006), "單跳", alt_len=alt_len, switch_rate=round(switch_rate, 3))
-
-    if switch_rate >= SINGLE_CHOP_MIN_RATE and alt_len >= 4:
-        prob = 0.550 + min(0.030, (switch_rate - SINGLE_CHOP_MIN_RATE) * 0.10)
-        return _score(opp, prob, f"單跳偏強｜跳率{int(switch_rate * 100)}%", 0.15 + min(0.05, switch_rate - SINGLE_CHOP_MIN_RATE), "單跳", alt_len=alt_len, switch_rate=round(switch_rate, 3))
-
-    # broken chop: when it was alternating then repeats, do not keep forcing chop.
-    if len(non_tie) >= 7:
-        prev = non_tie[-7:-1]
-        prev_alt = all(prev[i] != prev[i - 1] for i in range(1, len(prev)))
-        if prev_alt and non_tie[-1] == non_tie[-2]:
-            return _score(non_tie[-1], 0.538, "單跳破壞後補同邊", 0.10, "破跳補邊")
-
-    return _neutral("非單跳")
-
-
-def _double_chop_score(non_tie: List[str]) -> Dict[str, Any]:
     runs = _runs(non_tie)
     if len(runs) < 4:
-        return _neutral("雙跳資料不足")
-    current_side, current_len = runs[-1]
-    recent_runs = runs[-DOUBLE_CHOP_LOOKBACK:]
-    recent_lengths = [n for _s, n in recent_runs]
-    two_hits = sum(1 for n in recent_lengths[-6:] if n == 2)
+        return {"active": False}
 
-    # Clear BB/PP rhythm.
-    if len(recent_lengths) >= 4 and two_hits >= DOUBLE_CHOP_MIN_HITS:
-        if current_len < 2:
-            return _score(current_side, 0.562, f"雙跳/兩房型｜補足{_side_name(current_side)}2連", 0.18, "雙跳補足", target_len=2)
-        return _score(_opposite(current_side), 0.566, "雙跳/兩房型｜2連到點轉邊", 0.19, "雙跳轉邊", target_len=2)
+    completed = runs[:-1]
+    recent = completed[-DRAGON_MEMORY_LOOKBACK:] if DRAGON_MEMORY_LOOKBACK > 0 else completed
+    same_side_lengths = [length for s, length in recent if s == side]
+    all_lengths = [length for _s, length in recent]
 
-    # 2-1-2-1 is not double chop, but a room-rhythm; still give a soft signal here.
-    if len(recent_lengths) >= 5:
-        tail = recent_lengths[-5:]
-        if tail[0] == tail[2] == tail[4] == 2 and tail[1] == tail[3] == 1:
-            if current_len >= 2:
-                return _score(_opposite(current_side), 0.554, "2-1-2-1節奏｜2連轉邊", 0.15, "轉邊", target_len=2)
-            return _score(current_side, 0.548, "2-1-2-1節奏｜補到2連", 0.14, "補足", target_len=2)
+    if not all_lengths:
+        return {"active": False}
 
-    return _neutral("非雙跳")
+    max_same = max(same_side_lengths) if same_side_lengths else 0
+    max_all = max(all_lengths)
+    baseline = max_same if max_same > 0 else max_all
 
+    # Not a breakout yet.
+    if n <= baseline:
+        return {
+            "active": False,
+            "max_same": max_same,
+            "max_all": max_all,
+            "baseline": baseline,
+        }
+
+    over = n - baseline
+    is_new_shoe_high = n > max_all
+
+    # Protect the first hands after the run breaks prior history.
+    if over <= BREAKOUT_PROTECT_STEPS:
+        cont_adjust = BREAKOUT_CONT_EDGE + (over - 1) * 0.010
+        phase = "breakout_protect"
+        label = f"突破龍{side}{n}｜突破前高續龍保護"
+        strength_bonus = 0.045
+    elif over <= BREAKOUT_PROTECT_STEPS + BREAKOUT_EXTEND_STEPS:
+        # Still can continue, but confidence should decay.
+        cont_adjust = max(0.010, BREAKOUT_CONT_EDGE * 0.55 - (over - BREAKOUT_PROTECT_STEPS - 1) * 0.006)
+        phase = "breakout_extend"
+        label = f"突破龍{side}{n}｜延伸續龍但降信心"
+        strength_bonus = 0.025
+    else:
+        # Overextended beyond the protected zone. Start allowing fatigue pressure.
+        cont_adjust = -BREAKOUT_OVERHEAT_PENALTY if n >= DRAGON_FATIGUE_START else 0.004
+        phase = "breakout_overheat" if n >= DRAGON_FATIGUE_START else "breakout_late"
+        label = f"突破龍{side}{n}｜突破過熱觀察斷點"
+        strength_bonus = 0.010
+
+    if is_new_shoe_high and phase in {"breakout_protect", "breakout_extend"}:
+        cont_adjust += BREAKOUT_NEW_HIGH_BONUS
+        label += "｜本靴新高"
+
+    # If the shoe repeatedly broke at this length before, reduce breakout protection.
+    same_cut_count = sum(1 for length in all_lengths[-min(len(all_lengths), 12):] if length == n)
+    if same_cut_count >= DRAGON_BREAK_REPEAT_MIN:
+        cont_adjust -= min(0.030, same_cut_count * 0.010)
+        label += "｜同長度斷點壓力"
+
+    return {
+        "active": True,
+        "phase": phase,
+        "side": side,
+        "length": n,
+        "over": over,
+        "max_same": max_same,
+        "max_all": max_all,
+        "baseline": baseline,
+        "is_new_shoe_high": is_new_shoe_high,
+        "cont_adjust": round(cont_adjust, 5),
+        "strength_bonus": strength_bonus,
+        "label": label,
+    }
 
 def _dragon_score(non_tie: List[str]) -> Dict[str, Any]:
-    runs = _runs(non_tie)
-    if len(non_tie) < 4 or not runs:
-        return _neutral("龍型資料不足")
-    current_side, n = runs[-1]
-    if n < 2:
-        return _neutral("未成龍")
+    if len(non_tie) < 4:
+        return {"B": 0.5, "P": 0.5, "label": "龍型資料不足", "strength": 0.0}
 
-    completed_lengths = _recent_completed_lengths(runs, DRAGON_MEMORY_LOOKBACK)
+    last, n = _streak(non_tie)
+    if not last or n < 2:
+        return {"B": 0.5, "P": 0.5, "label": "未成龍", "strength": 0.0, "streak": n}
+
     stats = _run_follow_stats(non_tie, n)
+    prior = _dragon_prior_cont_prob(n)
 
-    # base continuation curve: not blindly chase; after fatigue it starts to decline.
-    if n == 2:
-        cont_prob = 0.522
-    elif n == 3:
-        cont_prob = 0.545
-    elif n == 4:
-        cont_prob = 0.565
-    elif n == 5:
-        cont_prob = 0.582
-    elif n == 6:
-        cont_prob = 0.590
-    elif n == 7:
-        cont_prob = 0.584
-    else:
-        cont_prob = max(0.535, 0.582 - (n - 7) * 0.010)
-
-    # Current-shoe learning: did previous runs break at this exact length or continue beyond it?
+    # Current-shoe run cutoff learning, shrunk heavily when samples are low.
     sample = stats["sample"]
-    if sample > 0:
-        hist_prob = (stats["cont"] + cont_prob * 2.5) / (sample + 2.5)
-        hist_weight = min(0.65, sample / 7)
-        cont_prob = cont_prob * (1 - hist_weight) + hist_prob * hist_weight
+    hist_prob = (stats["cont"] + prior * 3.0) / (sample + 3.0) if sample else prior
+    hist_weight = min(0.62, sample / 7.0)
+    cont_prob = prior * (1 - hist_weight) + hist_prob * hist_weight
 
-    same_cut_count = sum(1 for x in completed_lengths[-10:] if x == n)
-    shorter_count = sum(1 for x in completed_lengths[-10:] if x < n)
-    longer_count = sum(1 for x in completed_lengths[-10:] if x > n)
+    completed = _runs(non_tie)[:-1]
+    recent_completed = completed[-DRAGON_MEMORY_LOOKBACK:] if DRAGON_MEMORY_LOOKBACK > 0 else completed
+    recent_lengths = [length for _s, length in recent_completed]
+    same_side_lengths = [length for s, length in recent_completed if s == last]
+    same_cut_count = sum(1 for length in recent_lengths[-12:] if length == n)
+    below_cut_count = sum(1 for length in recent_lengths[-12:] if length < n)
+    max_same = max(same_side_lengths) if same_side_lengths else 0
+    max_all = max(recent_lengths) if recent_lengths else 0
 
-    # If this shoe repeatedly cuts at the current length, switch to break mode.
+    breakout = _breakout_dragon_context(non_tie, last, n)
+    breakout_phase = breakout.get("phase", "") if breakout.get("active") else ""
+
+    # Breakout Dragon Mode: if this dragon just exceeded history, protect continuation first.
+    if breakout.get("active"):
+        cont_prob += float(breakout.get("cont_adjust", 0.0))
+
+    # If many recent runs ended exactly at this length, add break pressure.
+    # During breakout protection, reduce this penalty so the model does not break too early.
     if same_cut_count >= DRAGON_BREAK_REPEAT_MIN and n >= DRAGON_MIN_LEN:
-        cont_prob -= min(0.070, 0.024 * same_cut_count)
+        penalty = min(0.055, same_cut_count * 0.014)
+        if breakout_phase in {"breakout_protect", "breakout_extend"}:
+            penalty *= 0.35
+        cont_prob -= penalty
 
-    # If current dragon exceeds most recent completed run lengths, add fatigue.
-    if n >= DRAGON_FATIGUE_START and shorter_count >= 5 and longer_count == 0:
-        cont_prob -= 0.040
+    # If many recent runs could not reach this length, very long dragons should be chased with lower confidence.
+    # But do not punish the first breakout hands too heavily.
+    if n >= DRAGON_FATIGUE_START and below_cut_count >= 4:
+        fatigue_penalty = 0.030
+        if breakout_phase in {"breakout_protect", "breakout_extend"}:
+            fatigue_penalty *= 0.40
+        cont_prob -= fatigue_penalty
 
-    cont_prob = _clamp(cont_prob, 0.405, 0.625)
-    if cont_prob >= 0.5:
-        side = current_side
-        edge = min(DRAGON_MAX_EDGE, cont_prob - 0.5)
-        action = "跟龍" if n >= DRAGON_FOLLOW_MIN_LEN else "補足"
-    else:
-        side = _opposite(current_side)
-        edge = min(DRAGON_BREAK_EDGE, 0.5 - cont_prob)
-        action = "斷龍"
+    # If current dragon is above same-side historical max but not in protected breakout mode,
+    # avoid hard reverse: keep it near neutral instead of forcing break.
+    if max_same and n > max_same and not breakout.get("active"):
+        cont_prob = max(cont_prob, 0.515)
 
-    if n >= DRAGON_STRONG_LEN:
-        length_name = "長莊" if current_side == "B" else "長閒"
-        label = f"{length_name}{n}連｜{action}"
-        strength = 0.17 + min(0.08, (n - DRAGON_STRONG_LEN) * 0.012)
+    cont_prob = _clamp(cont_prob, 0.405, 0.642)
+    side = last if cont_prob >= 0.5 else _opposite(last)
+    prob = 0.5 + min(DRAGON_MAX_EDGE, abs(cont_prob - 0.5))
+    if cont_prob < 0.5:
+        prob = 0.5 + min(DRAGON_BREAK_EDGE, abs(cont_prob - 0.5))
+    b, p = _bp_score(side, prob)
+
+    if breakout.get("active"):
+        label = str(breakout.get("label", f"突破龍{last}{n}"))
+        strength = 0.18 + float(breakout.get("strength_bonus", 0.0))
+        if side != last:
+            label += "｜轉斷"
+    elif n >= DRAGON_STRONG_LEN:
+        label = f"長龍{last}{n}｜{'續龍' if side == last else '斷龍壓力'}"
+        strength = 0.18 + min(0.06, (n - DRAGON_STRONG_LEN) * 0.012)
     elif n >= DRAGON_MIN_LEN:
-        label = f"中龍{_side_name(current_side)}{n}連｜{action}"
+        label = f"中龍{last}{n}｜{'續龍' if side == last else '斷龍壓力'}"
         strength = 0.145
     else:
-        label = f"短龍{_side_name(current_side)}{n}連｜{action}"
+        label = f"短龍{last}{n}｜{'續龍' if side == last else '斷龍壓力'}"
         strength = 0.105
 
-    # Learning evidence boosts strength.
-    strength += min(0.045, sample * 0.006)
-    if same_cut_count >= DRAGON_BREAK_REPEAT_MIN:
-        strength += 0.025
+    strength *= 0.85 + min(0.25, sample * 0.03)
+    if breakout.get("active"):
+        strength += min(0.035, float(breakout.get("over", 0)) * 0.010)
 
-    return _score(side, 0.5 + edge, label, strength, action, streak=n, cont_prob=round(cont_prob, 4), run_stats=stats, same_cut_count=same_cut_count)
+    action = "續龍" if side == last else "斷龍/轉邊"
+    return {
+        "B": b,
+        "P": p,
+        "label": label,
+        "strength": _clamp(strength, 0.05, 0.30),
+        "streak": n,
+        "dragon_side": last,
+        "cont_prob": round(cont_prob, 4),
+        "road_action": action,
+        "breakout": breakout,
+        "run_stats": {
+            **stats,
+            "max_same": max_same,
+            "max_all": max_all,
+            "same_cut_count": same_cut_count,
+            "below_cut_count": below_cut_count,
+        },
+    }
+
+def _run_cycle_score(non_tie: List[str]) -> Dict[str, Any]:
+    runs = _runs(non_tie)
+    if len(runs) < 5:
+        return {"B": 0.5, "P": 0.5, "label": "跑法資料不足", "strength": 0.0}
+
+    current_side, current_len = runs[-1]
+    completed_lengths = [n for _s, n in runs[:-1]]
+    recent = completed_lengths[-8:]
+
+    # Fixed cut length: e.g. BB PP BB PP, or BBB PPP BBB PPP.
+    c = Counter(recent)
+    mode_len, mode_count = c.most_common(1)[0]
+    if mode_count >= RUN_CYCLE_MIN_HITS and len(recent) >= 5:
+        consistency = mode_count / len(recent)
+        if consistency >= 0.48:
+            side = _opposite(current_side) if current_len >= mode_len else current_side
+            prob = 0.545 + min(0.045, (consistency - 0.48) * 0.12)
+            b, p = _bp_score(side, prob)
+            return {
+                "B": b,
+                "P": p,
+                "label": f"固定{mode_len}連節奏｜{'轉邊' if side != current_side else '補足'}",
+                "strength": _clamp(0.12 + consistency * 0.09, 0.10, 0.21),
+                "target_len": mode_len,
+                "consistency": round(consistency, 3),
+            }
+
+    # Period-2 run rhythm: e.g. 1,2,1,2 or 2,3,2,3.
+    if len(recent) >= 6:
+        last6 = recent[-6:]
+        if last6[0] == last6[2] == last6[4] and last6[1] == last6[3] == last6[5] and last6[0] != last6[1]:
+            target = last6[-2]  # current run usually mirrors the run two positions ago.
+            side = _opposite(current_side) if current_len >= target else current_side
+            prob = 0.565
+            b, p = _bp_score(side, prob)
+            return {
+                "B": b,
+                "P": p,
+                "label": f"長短龍交替{last6[0]}-{last6[1]}｜{'轉邊' if side != current_side else '補足'}",
+                "strength": 0.18,
+                "target_len": target,
+            }
+
+    return {"B": 0.5, "P": 0.5, "label": "未見固定龍節奏", "strength": 0.0}
 
 
-def _front_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
-    if not FRONT_PATTERN_MATCH or len(non_tie) < 8:
-        return _neutral("前排回測資料不足")
+def _chop_score(non_tie: List[str]) -> Dict[str, Any]:
+    if len(non_tie) < 6:
+        return {"B": 0.5, "P": 0.5, "label": "跳路資料不足", "strength": 0.0}
+    recent = non_tie[-ROAD_PATTERN_WINDOW:]
+    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+    last = recent[-1]
+    opp = _opposite(last)
+
+    # pure chop / single jump.
+    if switch_rate >= 0.72 and len(recent) >= 7:
+        prob = 0.555 + min(0.035, (switch_rate - 0.72) * 0.12)
+        b, p = _bp_score(opp, prob)
+        return {"B": b, "P": p, "label": "跳路偏強", "strength": 0.16 + min(0.04, switch_rate - 0.72), "switch_rate": switch_rate}
+
+    # double chop / two-room pattern, detected by recent run lengths mostly 2.
+    run_lengths = [n for _s, n in _runs(recent)]
+    if len(run_lengths) >= 4 and sum(1 for n in run_lengths[-5:] if n == 2) >= 3:
+        current_side, current_len = _streak(non_tie)
+        side = _opposite(current_side) if current_len >= 2 else current_side
+        b, p = _bp_score(side, 0.56)
+        return {"B": b, "P": p, "label": "雙跳/兩房型", "strength": 0.165, "switch_rate": switch_rate}
+
+    return {"B": 0.5, "P": 0.5, "label": "非跳路", "strength": 0.0, "switch_rate": switch_rate}
+
+
+def _pattern_memory_score(non_tie: List[str]) -> Dict[str, Any]:
+    if len(non_tie) < 8:
+        return {"B": 0.5, "P": 0.5, "label": "回測資料不足", "strength": 0.0}
+
     seq = "".join(non_tie)
-    max_k = min(FRONT_PATTERN_LOOKBACK, len(seq) - 1)
-    best: Optional[Dict[str, Any]] = None
-    for k in range(max_k, 2, -1):
+    best = None
+    for k in range(PATTERN_LOOKBACK, 2, -1):
         key = seq[-k:]
         follows: List[str] = []
         for i in range(0, len(seq) - k):
             if seq[i:i + k] == key and i + k < len(seq):
                 follows.append(seq[i + k])
-        if len(follows) >= FRONT_PATTERN_MIN_SAMPLE:
+        if follows:
             c = Counter(follows)
             total = c["B"] + c["P"]
-            side = "B" if c["B"] >= c["P"] else "P"
-            raw = max(c["B"], c["P"]) / total
-            shrink = min(0.72, total / 9)
-            prob = 0.5 * (1 - shrink) + raw * shrink
-            prob = _clamp(prob, 0.525, 0.600)
-            strength = min(0.20, 0.075 + total * 0.018 + k * 0.006)
-            best = _score(side, prob, f"前排{k}碼回測｜樣本{total}", strength, "前排回測", sample=total, key=key)
+            b_raw = c["B"] / total
+            shrink = min(0.70, total / 10)
+            b = 0.5 * (1 - shrink) + b_raw * shrink
+            p = 1 - b
+            strength = min(0.18, 0.07 + total * 0.014 + k * 0.006)
+            best = {"B": b, "P": p, "label": f"{k}碼回測{key}", "strength": strength, "sample": total}
             break
-    return best or _neutral("前排無重複")
+    return best or {"B": 0.5, "P": 0.5, "label": "無回測重複", "strength": 0.0}
 
 
-def _road_state_router(non_tie: List[str]) -> Dict[str, Any]:
+def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 3:
-        return _neutral("資料不足")
+        return {"B": 0.5, "P": 0.5, "label": "資料不足", "strength": 0.0}
 
     candidates = [
-        _single_chop_score(non_tie),
-        _double_chop_score(non_tie),
-        _length_rhythm_score(non_tie),
         _dragon_score(non_tie),
-        _front_pattern_score(non_tie),
+        _run_cycle_score(non_tie),
+        _chop_score(non_tie),
+        _pattern_memory_score(non_tie),
     ]
 
-    # Minor short-window scarcity correction, low strength fallback only.
+    # Short-window balance is low priority fallback.
     recent = non_tie[-12:]
-    if len(recent) >= 10:
-        b_count = recent.count("B")
-        p_count = recent.count("P")
-        if abs(b_count - p_count) >= 5:
-            side = "B" if b_count < p_count else "P"
-            candidates.append(_score(side, 0.528, "短窗偏態小修正", 0.065, "均衡"))
+    b_count = recent.count("B")
+    p_count = recent.count("P")
+    if abs(b_count - p_count) >= 4:
+        scarce = "B" if b_count < p_count else "P"
+        b, p = _bp_score(scarce, 0.535)
+        candidates.append({"B": b, "P": p, "label": "短窗均衡修正", "strength": 0.09})
 
-    candidates = sorted(candidates, key=lambda x: (float(x.get("strength", 0)), float(x.get("edge", 0))), reverse=True)
-    best = dict(candidates[0])
-    second = candidates[1] if len(candidates) > 1 else _neutral()
-
-    # Blend compatible second signal, but do not let weak mixed signals neutralize a clear state.
-    if second.get("strength", 0) >= 0.13 and second.get("label") != best.get("label"):
+    # Choose strongest road mode, but keep second mode for reason/debug.
+    candidates = sorted(candidates, key=lambda x: float(x.get("strength", 0)), reverse=True)
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    best = dict(best)
+    if second and second.get("strength", 0) >= 0.12 and second.get("label") != best.get("label"):
         best["secondary_label"] = second.get("label")
-        same_pick = (best.get("B", 0.5) >= best.get("P", 0.5)) == (second.get("B", 0.5) >= second.get("P", 0.5))
-        blend = 0.20 if same_pick else 0.12
+        # Small blend to avoid one pattern totally dominating another valid road mode.
+        blend = 0.25
         best["B"] = best["B"] * (1 - blend) + second["B"] * blend
         best["P"] = 1 - best["B"]
-        best["strength"] = min(0.35, best.get("strength", 0) + (0.025 if same_pick else 0.0))
-
-    best["candidates"] = [
-        {"label": c.get("label"), "B": round(c.get("B", 0.5), 4), "P": round(c.get("P", 0.5), 4), "strength": round(c.get("strength", 0), 3), "action": c.get("action", "")}
-        for c in candidates[:5]
-    ]
     return best
+
+
+def _recent_score(non_tie: List[str]) -> Dict[str, float]:
+    if not non_tie:
+        return {"B": 0.5, "P": 0.5}
+    recent = non_tie[-10:]
+    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+    last, n = _streak(non_tie)
+    opp = _opposite(last) if last else "B"
+    if switch_rate > 0.68:
+        side = opp
+        edge = 0.052
+    elif n >= DRAGON_MIN_LEN:
+        # Use dragon length-sensitive continuation, but dampen after fatigue point.
+        side = last
+        edge = 0.040 + min(0.040, (n - DRAGON_MIN_LEN) * 0.010)
+        if n >= DRAGON_FATIGUE_START:
+            edge *= 0.75
+    else:
+        b_count = recent.count("B")
+        p_count = recent.count("P")
+        side = "B" if b_count < p_count else "P"
+        edge = min(0.032, abs(b_count - p_count) * 0.0055)
+    return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
+
+
+def _balance_score(non_tie: List[str]) -> Dict[str, float]:
+    if len(non_tie) < 8:
+        return {"B": 0.5, "P": 0.5}
+    b = non_tie.count("B")
+    p = non_tie.count("P")
+    diff = b - p
+    edge = min(0.050, abs(diff) / max(1, len(non_tie)) * 0.14)
+    side = "B" if diff < 0 else "P"
+    return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
+
+
+def _streak_score(non_tie: List[str]) -> Dict[str, float]:
+    last, n = _streak(non_tie)
+    if not last:
+        return {"B": 0.5, "P": 0.5}
+    opp = _opposite(last)
+    if n == 1:
+        side, edge = opp, 0.022
+    elif n == 2:
+        side, edge = last, 0.030
+    elif n == 3:
+        side, edge = last, 0.045
+    elif n == 4:
+        side, edge = last, 0.058
+    elif n < DRAGON_FATIGUE_START:
+        side, edge = last, min(0.085, 0.062 + (n - 4) * 0.008)
+    else:
+        # Very long dragon: still can continue, but do not keep increasing confidence blindly.
+        side, edge = last, 0.068
+    return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
 
 
 def _tie_score(history: List[str]) -> float:
@@ -528,78 +582,38 @@ def _tie_score(history: List[str]) -> float:
     return _clamp(pressure, 0.055, TIE_MAX_PROB)
 
 
-def _dynamic_weights(road: Dict[str, Any], history_len: int) -> Dict[str, float]:
-    weights = {
-        "markov": MARKOV_WEIGHT,
-        "road": ROAD_WEIGHT,
-        "streak": STREAK_WEIGHT,
-        "balance": BALANCE_WEIGHT,
-        "recent": RECENT_WEIGHT,
-    }
-    if not DYNAMIC_WEIGHT_MODE or history_len < 5:
-        return weights
-
-    strength = float(road.get("strength", 0))
-    action = str(road.get("action", ""))
-    label = str(road.get("label", ""))
-
-    # Clear road state: let road router dominate more.
-    if strength >= 0.18:
-        weights.update({"road": 0.46, "markov": 0.16, "streak": 0.14, "recent": 0.10, "balance": 0.05})
-    elif strength >= 0.13:
-        weights.update({"road": 0.40, "markov": 0.18, "streak": 0.15, "recent": 0.10, "balance": 0.07})
-
-    # If router detected a cut point or turn-side rhythm, avoid old streak layer over-following.
-    if any(k in action for k in ["斷", "轉邊", "單跳", "雙跳轉邊"]):
-        weights["streak"] *= 0.55
-        weights["road"] += 0.06
-        weights["recent"] += 0.03
-
-    # If following clear dragon, streak can support it.
-    if "跟龍" in action or "補足" in action:
-        weights["streak"] += 0.03
-        weights["road"] += 0.03
-        weights["balance"] *= 0.70
-
-    s = sum(weights.values())
-    return {k: v / s for k, v in weights.items()}
-
-
-def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float, road_edge: float) -> Tuple[float, str]:
+def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
-    base = gap * 3.35 + agreement * 0.18 + road_strength * 0.42 + road_edge * 0.70 + min(0.14, history_len / 90)
+    base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
     conf = _clamp(base, 0.08, 0.94)
     if history_len < MIN_HISTORY_FOR_SIGNAL:
         return min(conf, 0.35), "冷啟動"
-    if conf >= 0.70:
+    if conf >= 0.68:
         return conf, "強訊號"
-    if conf >= 0.50:
+    if conf >= 0.48:
         return conf, "中訊號"
     return conf, "弱訊號"
 
 
-# -----------------------------
-# Public prediction function
-# -----------------------------
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "") -> Dict[str, Any]:
-    history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
+    history = [x.upper() for x in history if x.upper() in {"B", "P", "T"}]
     non_tie = _last_non_tie(history)
-    run_data = _runs(non_tie)
 
     markov = _transition_prob(non_tie)
-    road = _road_state_router(non_tie) if ROAD_STATE_ROUTER else _front_pattern_score(non_tie)
+    road = _road_pattern_score(non_tie)
     recent = _recent_score(non_tie)
     balance = _balance_score(non_tie)
     streak = _streak_score(non_tie)
-    weights = _dynamic_weights(road, len(history))
+    run_data = _runs(non_tie)
 
+    total_w = MARKOV_WEIGHT + ROAD_WEIGHT + STREAK_WEIGHT + BALANCE_WEIGHT + RECENT_WEIGHT
     b_side = (
-        markov["B"] * weights["markov"]
-        + road["B"] * weights["road"]
-        + streak["B"] * weights["streak"]
-        + balance["B"] * weights["balance"]
-        + recent["B"] * weights["recent"]
-    )
+        markov["B"] * MARKOV_WEIGHT
+        + road["B"] * ROAD_WEIGHT
+        + streak["B"] * STREAK_WEIGHT
+        + balance["B"] * BALANCE_WEIGHT
+        + recent["B"] * RECENT_WEIGHT
+    ) / total_w
     p_side = 1 - b_side
 
     tie_prob = _tie_score(history)
@@ -611,11 +625,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "room": room,
         "shoe_id": shoe_id,
         "history_len": len(history),
-        "history_tail": "".join(history[-54:]),
-        "non_tie_tail": "".join(non_tie[-54:]),
-        "runs_tail": run_data[-14:],
+        "history_tail": "".join(history[-48:]),
+        "non_tie_tail": "".join(non_tie[-48:]),
+        "runs_tail": run_data[-12:],
         "current_streak": _streak(non_tie),
-        "weights": weights,
         "markov": markov,
         "road": road,
         "recent": recent,
@@ -657,19 +670,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     else:
         recommend = main_pick
 
-    conf, level = _confidence(
-        b_prob,
-        p_prob,
-        tie_prob,
-        len(history),
-        agreement,
-        float(road.get("strength", 0)),
-        float(road.get("edge", 0)),
-    )
-
+    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, float(road.get("strength", 0)))
     reason_parts = [road.get("label", "牌路"), f"模型一致{int(agreement * 100)}%"]
-    if road.get("action"):
-        reason_parts.append(f"動作:{road.get('action')}")
+    if road.get("road_action"):
+        reason_parts.append(f"動作:{road.get('road_action')}")
     if road.get("secondary_label"):
         reason_parts.append(f"副路:{road.get('secondary_label')}")
     if ai_result and ai_result.get("pattern_label"):
@@ -692,14 +696,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "confidence": round(conf, 3),
         "signal_level": level,
         "pattern_label": road.get("label", ""),
-        "road_action": road.get("action", ""),
         "reason": " / ".join(reason_parts),
         "dragon": {
             "current_streak": _streak(non_tie),
-            "runs_tail": run_data[-12:],
+            "runs_tail": run_data[-10:],
             "road_strength": round(float(road.get("strength", 0)), 3),
-            "road_edge": round(float(road.get("edge", 0)), 3),
-            "road_candidates": road.get("candidates", []),
+            "breakout": road.get("breakout"),
+            "road_action": road.get("road_action", ""),
         },
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ai_result": ai_result if os.getenv("DEBUG_AI_RESULT", "0") == "1" else None,
