@@ -47,10 +47,10 @@ _PREDICT_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PREDICT_WORKER
 
 # 開始 AI 判斷時，先用 replyToken 回「處理中」，再用 Push 補送結果。
 # 這樣可避免 predictor / DeepSeek 太慢時，LINE replyToken 過期造成使用者完全沒反應。
-PREDICT_ASYNC_PUSH = os.getenv("PREDICT_ASYNC_PUSH", "1") == "1"
+PREDICT_ASYNC_PUSH = os.getenv("PREDICT_ASYNC_PUSH", "0") == "1"
 _PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PUSH_WORKERS", "2") or "2"))
 
-app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.2.0")
+app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -445,13 +445,138 @@ def input_panel_flex(session: Dict[str, Any], notice: str = "") -> Dict[str, Any
     }
 
 
-def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
-    pred = session.get("last_prediction") or {}
+def prediction_section(pred: Dict[str, Any]) -> List[Dict[str, Any]]:
     recommend = pred.get("recommend_text") or pred.get("recommend") or "-"
+    signal = pred.get("signal_level", "")
+    reason = pred.get("reason", "")
+    pattern = pred.get("pattern_label", "")
+    ai_used = "DeepSeek 校準" if pred.get("ai_used") else "本地規律"
+
+    return [
+        {"type": "separator", "margin": "lg", "color": "#FFD000"},
+        {"type": "text", "text": "分析數據", "size": "sm", "weight": "bold", "color": "#111111", "margin": "lg"},
+        rate_line("莊", percent_text(pred.get("banker_rate", 0)), "#E60012"),
+        rate_line("閒", percent_text(pred.get("player_rate", 0)), "#0000CC"),
+        rate_line("和", percent_text(pred.get("tie_rate", 0)), "#00A000"),
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "margin": "lg",
+            "cornerRadius": "md",
+            "backgroundColor": "#FFD000",
+            "paddingAll": "10px",
+            "contents": [
+                {"type": "text", "text": "推薦", "weight": "bold", "color": "#111111", "flex": 1},
+                {"type": "text", "text": str(recommend), "weight": "bold", "align": "end", "color": "#111111", "flex": 2},
+            ],
+        },
+        {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F7F7F7",
+            "cornerRadius": "md",
+            "paddingAll": "8px",
+            "margin": "sm",
+            "contents": [
+                {"type": "text", "text": f"{signal}｜{ai_used}", "size": "xs", "color": "#333333", "wrap": True},
+                {"type": "text", "text": pattern or reason or "規律模型已完成判斷", "size": "xs", "color": "#777777", "wrap": True, "margin": "xs"},
+                {"type": "text", "text": reason, "size": "xxs", "color": "#999999", "wrap": True, "margin": "xs"} if reason else {"type": "text", "text": "", "size": "xxs", "color": "#999999"},
+            ],
+        },
+    ]
+
+
+def result_panel_flex(session: Dict[str, Any], notice: str = "AI 判斷完成") -> Dict[str, Any]:
+    """
+    結果直接整合到原本輸入面板的版型中。
+    LINE 無法修改已送出的舊 Flex，只能送一張新版面板顯示最新紀錄與預測結果。
+    """
     history = session.get("history", []) or []
+    venue = session.get("venue", "")
+    room = session.get("room", "")
+    shoe_id = session.get("shoe_id", "") or "可直接輸入靴號"
+    round_no = len(history) + 1
+    pred = session.get("last_prediction") or {}
+
+    contents: List[Dict[str, Any]] = [
+        {"type": "text", "text": "AI 規律分析", "weight": "bold", "size": "xl", "color": "#111111"},
+        {"type": "separator", "margin": "md", "color": "#FFD000"},
+        kv("遊戲館", venue_name(venue)),
+        kv("遊戲廳", room or "-"),
+        kv("靴號", shoe_id),
+        kv("目前局數", f"第 {round_no} 局"),
+    ]
+
+    if notice:
+        contents.append({
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#FFF6CC",
+            "cornerRadius": "md",
+            "paddingAll": "8px",
+            "margin": "md",
+            "contents": [{"type": "text", "text": notice, "size": "xs", "color": "#333333", "wrap": True}],
+        })
+
+    contents.extend([
+        {"type": "text", "text": f"目前紀錄｜已輸入 {len(history)} 局", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
+        {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F7F7F7",
+            "cornerRadius": "md",
+            "paddingAll": "10px",
+            "margin": "sm",
+            "contents": [
+                {"type": "text", "text": result_chip_text(history), "size": "sm", "wrap": True, "color": "#333333"},
+                {"type": "text", "text": compact_history(history), "size": "xs", "wrap": True, "color": "#888888", "margin": "sm"},
+            ],
+        },
+    ])
+
+    if pred:
+        contents.extend(prediction_section(pred))
+
+    contents.extend([
+        {"type": "text", "text": "輸入莊 / 閒 / 和", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "margin": "sm",
+            "contents": [
+                button("莊 B", {"action": "add_round", "result": "B"}, "#E60012"),
+                button("閒 P", {"action": "add_round", "result": "P"}, "#0B46D9"),
+                button("和 T", {"action": "add_round", "result": "T"}, "#00A040"),
+            ],
+        },
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "margin": "sm",
+            "contents": [
+                button("上一步", {"action": "undo_round"}, "#222222"),
+                button("查看紀錄", {"action": "view_panel"}, "#222222"),
+            ],
+        },
+        {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "margin": "md",
+            "contents": [
+                button("繼續分析", {"action": "predict"}, "#FFD000"),
+                button("清除本靴", {"action": "reset_session"}, "#555555"),
+                button("結束分析", {"action": "end_session"}, "#111111"),
+            ],
+        },
+        {"type": "text", "text": "提示：LINE 不能修改舊面板；系統會送出新版面板，直接包含最新預測結果。", "size": "xs", "color": "#888888", "margin": "lg", "wrap": True},
+    ])
+
     return {
         "type": "flex",
-        "altText": f"分析結果：推薦 {recommend}",
+        "altText": f"分析結果：推薦 {pred.get('recommend_text') or pred.get('recommend') or '-'}",
         "contents": {
             "type": "bubble",
             "size": "mega",
@@ -459,45 +584,15 @@ def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
                 "type": "box",
                 "layout": "vertical",
                 "backgroundColor": "#FFFFFF",
-                "contents": [
-                    {"type": "text", "text": "分析數據", "weight": "bold", "size": "lg", "align": "center", "color": "#111111"},
-                    {"type": "separator", "margin": "md", "color": "#FFD000"},
-                    kv("遊戲館", venue_name(session.get("venue", ""))),
-                    kv("遊戲廳", session.get("room", "-")),
-                    kv("靴號", session.get("shoe_id", "-")),
-                    kv("已輸入", f"{len(history)} 局"),
-                    kv("遊戲狀態", session.get("status", "可押注")),
-                    rate_line("莊", percent_text(pred.get("banker_rate", 0)), "#E60012"),
-                    rate_line("閒", percent_text(pred.get("player_rate", 0)), "#0000CC"),
-                    rate_line("和", percent_text(pred.get("tie_rate", 0)), "#00A000"),
-                    {
-                        "type": "box",
-                        "layout": "horizontal",
-                        "margin": "lg",
-                        "cornerRadius": "md",
-                        "backgroundColor": "#FFD000",
-                        "paddingAll": "10px",
-                        "contents": [
-                            {"type": "text", "text": "推薦", "weight": "bold", "color": "#111111", "flex": 1},
-                            {"type": "text", "text": str(recommend), "weight": "bold", "align": "end", "color": "#111111", "flex": 2},
-                        ],
-                    },
-                    {"type": "text", "text": f"{pred.get('signal_level', '')}｜{pred.get('reason', '')}", "size": "xs", "color": "#777777", "margin": "md", "wrap": True},
-                ],
-            },
-            "footer": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "sm",
-                "contents": [
-                    button("繼續輸入", {"action": "view_panel"}, "#FFD000"),
-                    button("重新選館", {"action": "open_venue"}, "#222222"),
-                    button("結束分析", {"action": "end_session"}, "#111111"),
-                ],
+                "paddingAll": "16px",
+                "contents": contents,
             },
         },
     }
 
+
+def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
+    return result_panel_flex(session, "AI 判斷完成，結果已更新在面板內")
 
 def end_flex(session: Dict[str, Any]) -> Dict[str, Any]:
     total = len(session.get("history", []) or [])
@@ -628,12 +723,12 @@ def push_predict_result(user_id: str) -> None:
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.2.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.0"}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.2.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.0"}
 
 
 @app.get("/ping")
@@ -751,7 +846,8 @@ async def callback(request: Request) -> JSONResponse:
 
             if text in ["AI", "開始AI判斷", "判斷", "預測"]:
                 if PREDICT_ASYNC_PUSH:
-                    line_reply(reply_token, [text_msg("AI 規律模型判斷中，請稍候 3～15 秒。結果會自動跳出。")])
+                    session = get_session_or_create(user_id)
+                    line_reply(reply_token, [input_panel_flex(session, "AI 規律模型判斷中，請稍候 3～15 秒；結果會以新版面板跳出。")])
                     _PUSH_EXECUTOR.submit(push_predict_result, user_id)
                 else:
                     try:
@@ -844,7 +940,8 @@ async def callback(request: Request) -> JSONResponse:
 
                 elif action == "predict":
                     if PREDICT_ASYNC_PUSH:
-                        line_reply(reply_token, [text_msg("AI 規律模型判斷中，請稍候 3～15 秒。結果會自動跳出。")])
+                        session = get_session_or_create(user_id)
+                        line_reply(reply_token, [input_panel_flex(session, "AI 規律模型判斷中，請稍候 3～15 秒；結果會以新版面板跳出。")])
                         _PUSH_EXECUTOR.submit(push_predict_result, user_id)
                     else:
                         session, used_fallback, note = predict_and_save(user_id)
