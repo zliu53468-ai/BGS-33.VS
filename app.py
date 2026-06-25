@@ -50,7 +50,12 @@ _PREDICT_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PREDICT_WORKER
 PREDICT_ASYNC_PUSH = os.getenv("PREDICT_ASYNC_PUSH", "0") == "1"
 _PUSH_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PUSH_WORKERS", "2") or "2"))
 
-app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.3.0")
+# 按鈕回饋：點擊 Postback 按鈕時顯示 LINE 官方 Loading Animation。
+# 只支援一對一聊天室；群組/多人聊天室會自動略過。
+BUTTON_FEEDBACK_LOADING = os.getenv("BUTTON_FEEDBACK_LOADING", "1") == "1"
+BUTTON_FEEDBACK_SECONDS = int(os.getenv("BUTTON_FEEDBACK_SECONDS", "5") or "5")
+
+app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -169,6 +174,44 @@ def line_push(to: str, messages: List[Dict[str, Any]]) -> bool:
         print("LINE push failed", r.status_code, r.text)
         return False
     return True
+
+
+def get_loading_chat_id(event: Dict[str, Any]) -> str:
+    """
+    LINE loading animation only supports 1-on-1 user chats.
+    If the event comes from a group/room, return empty string to avoid API errors.
+    """
+    source = event.get("source") or {}
+    if source.get("type") == "user":
+        return source.get("userId", "")
+    return ""
+
+
+def line_loading(chat_id: str, seconds: int = 5) -> None:
+    """
+    Show LINE official loading animation as button-click feedback.
+    This does not send a chat message and will not wash the conversation.
+    """
+    if not BUTTON_FEEDBACK_LOADING:
+        return
+    if not CHANNEL_ACCESS_TOKEN or not chat_id:
+        return
+
+    loading_seconds = max(5, min(60, int(seconds or 5)))
+    try:
+        r = requests.post(
+            "https://api.line.me/v2/bot/chat/loading/start",
+            headers={
+                "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"chatId": chat_id, "loadingSeconds": loading_seconds},
+            timeout=5,
+        )
+        if r.status_code >= 300:
+            print("LINE loading failed", r.status_code, r.text)
+    except Exception as exc:
+        print("LINE loading exception", repr(exc))
 
 
 def text_msg(text: str) -> Dict[str, Any]:
@@ -723,12 +766,12 @@ def push_predict_result(user_id: str) -> None:
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.1"}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.1"}
 
 
 @app.get("/ping")
@@ -884,6 +927,10 @@ async def callback(request: Request) -> JSONResponse:
                 line_reply(reply_token, [start_menu_flex("尚未開始分析", "請點擊「開始分析」選擇遊戲館。")])
 
         elif event_type == "postback":
+            loading_chat_id = get_loading_chat_id(event)
+            if loading_chat_id:
+                line_loading(loading_chat_id, BUTTON_FEEDBACK_SECONDS)
+
             raw_data = event.get("postback", {}).get("data", "")
             data = {k: v[0] for k, v in urllib.parse.parse_qs(raw_data).items()}
             action = data.get("action", "")
