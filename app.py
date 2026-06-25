@@ -3,9 +3,11 @@ import hashlib
 import hmac
 import json
 import os
+import traceback
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -32,13 +34,18 @@ DEFAULT_ROOMS = os.getenv(
     "百家樂-中文廳,百家樂-亞洲廳,百家樂-極速廳,百家樂-保險廳,百家樂-VIP廳",
 )
 
-# postback 輸入模式：
-# silent = 莊/閒/和只記錄，不回聊天室訊息，最省訊息量
-# panel  = 每次輸入都回覆新版面板，測試時可用，但會洗版
-ROUND_INPUT_REPLY_MODE = os.getenv("ROUND_INPUT_REPLY_MODE", "silent").strip().lower()
+# panel  = 每次點莊/閒/和後，回覆新版面板，會立即看到「目前紀錄」
+# silent = 只背景記錄，不洗版；需要按「查看紀錄」才更新面板
+# compact = 每次只回覆一則很短的文字確認
+ROUND_INPUT_REPLY_MODE = os.getenv("ROUND_INPUT_REPLY_MODE", "panel").strip().lower()
 ACK_EVERY_N_ROUNDS = int(os.getenv("ACK_EVERY_N_ROUNDS", "0") or "0")
 
-app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.0.0")
+# 防止「開始AI判斷」因 DeepSeek 或外部 API 等太久而看起來卡住。
+# 超時會回本地簡易備援預測，predictor.py 本身仍保留使用。
+PREDICT_TIMEOUT_SEC = float(os.getenv("PREDICT_TIMEOUT_SEC", "14"))
+_PREDICT_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PREDICT_WORKERS", "2") or "2"))
+
+app = FastAPI(title="Baccarat LINE Postback AI Bot", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,7 +103,10 @@ def venue_name(venue_code: str) -> str:
 
 
 def build_liff_url(venue_code: str = "") -> str:
-    """保留 LIFF API 相容用。主流程已改成 postback，不會再主動跳網頁。"""
+    """
+    保留舊 LIFF API 相容用。
+    主流程已改成 Postback，不會主動用這個網址導頁。
+    """
     query = urllib.parse.urlencode({"venue": venue_code}) if venue_code else ""
     if LIFF_ID:
         url = f"https://liff.line.me/{LIFF_ID}"
@@ -135,11 +145,11 @@ def line_reply(reply_token: str, messages: List[Dict[str, Any]]) -> None:
 
 
 def text_msg(text: str) -> Dict[str, Any]:
-    return {"type": "text", "text": text}
+    return {"type": "text", "text": text[:5000]}
 
 
 def postback_action(label: str, data: Dict[str, str]) -> Dict[str, Any]:
-    # 不放 displayText，避免使用者每點一次按鈕，聊天室就多一則文字。
+    # 不放 displayText，避免使用者每點一次按鈕，聊天室就多一則使用者文字。
     return {
         "type": "postback",
         "label": label[:20],
@@ -147,7 +157,12 @@ def postback_action(label: str, data: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
-def button(label: str, data: Dict[str, str], color: str = "#FFD000", style: str = "primary") -> Dict[str, Any]:
+def button(
+    label: str,
+    data: Dict[str, str],
+    color: str = "#FFD000",
+    style: str = "primary",
+) -> Dict[str, Any]:
     return {
         "type": "button",
         "style": style,
@@ -169,18 +184,28 @@ def get_session_or_create(user_id: str) -> Dict[str, Any]:
     return session
 
 
-def history_text(history: List[str], limit: int = 28) -> str:
+def result_name(code: str) -> str:
+    return {"B": "莊", "P": "閒", "T": "和"}.get(str(code).upper(), str(code))
+
+
+def result_chip_text(history: List[str], limit: int = 32) -> str:
     if not history:
         return "尚未輸入"
-    display = history[-limit:]
+    display = [result_name(x) for x in history[-limit:]]
     text = " ".join(display)
     if len(history) > limit:
         text = "… " + text
     return text
 
 
-def result_name(code: str) -> str:
-    return {"B": "莊", "P": "閒", "T": "和"}.get(code, code)
+def compact_history(history: List[str], limit: int = 18) -> str:
+    if not history:
+        return "尚未輸入"
+    display = [str(x).upper() for x in history[-limit:]]
+    text = " ".join(display)
+    if len(history) > limit:
+        text = "… " + text
+    return text
 
 
 def percent_text(value: Any) -> str:
@@ -217,10 +242,40 @@ def rate_line(label: str, value: str, color: str) -> Dict[str, Any]:
     }
 
 
+def start_menu_flex(title: str = "AI 百家樂規律分析", subtitle: str = "點擊下方按鈕開始選擇遊戲館。") -> Dict[str, Any]:
+    return {
+        "type": "flex",
+        "altText": "開始分析",
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#111111",
+                "paddingAll": "18px",
+                "contents": [
+                    {"type": "text", "text": title, "weight": "bold", "size": "xl", "color": "#FFD000", "wrap": True},
+                    {"type": "text", "text": subtitle, "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
+                    {"type": "separator", "margin": "lg", "color": "#FFD000"},
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "spacing": "md",
+                        "margin": "lg",
+                        "contents": [
+                            button("開始分析", {"action": "open_venue"}, "#FFD000"),
+                        ],
+                    },
+                    {"type": "text", "text": "全流程採聊天室按鈕操作，不會導到 LIFF 網頁。", "size": "xs", "color": "#AAAAAA", "margin": "lg", "wrap": True},
+                ],
+            },
+        },
+    }
+
+
 def venue_flex() -> Dict[str, Any]:
-    buttons = []
-    for v in parse_venues():
-        buttons.append(button(v["name"], {"action": "select_venue", "venue": v["code"]}))
+    buttons = [button(v["name"], {"action": "select_venue", "venue": v["code"]}) for v in parse_venues()]
     return {
         "type": "flex",
         "altText": "請選擇遊戲館",
@@ -234,10 +289,9 @@ def venue_flex() -> Dict[str, Any]:
                 "paddingAll": "18px",
                 "contents": [
                     {"type": "text", "text": "AI 規律模型", "weight": "bold", "size": "xl", "color": "#FFD000"},
-                    {"type": "text", "text": "請選擇遊戲館，接著會在聊天室內操作，不會跳網頁。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
+                    {"type": "text", "text": "請選擇遊戲館，接著會在聊天室內操作。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
                     {"type": "separator", "margin": "lg", "color": "#FFD000"},
                     {"type": "box", "layout": "vertical", "spacing": "md", "margin": "lg", "contents": buttons},
-                    {"type": "text", "text": "按鈕採用 Postback，不會把點擊文字洗在聊天室。", "size": "xs", "color": "#AAAAAA", "margin": "lg", "wrap": True},
                 ],
             },
         },
@@ -245,10 +299,7 @@ def venue_flex() -> Dict[str, Any]:
 
 
 def room_flex(venue_code: str) -> Dict[str, Any]:
-    buttons = [
-        button(room, {"action": "select_room", "venue": venue_code, "room": room})
-        for room in parse_rooms()
-    ]
+    buttons = [button(room, {"action": "select_room", "venue": venue_code, "room": room}) for room in parse_rooms()]
     return {
         "type": "flex",
         "altText": "請選擇遊戲廳",
@@ -261,30 +312,94 @@ def room_flex(venue_code: str) -> Dict[str, Any]:
                 "backgroundColor": "#111111",
                 "paddingAll": "18px",
                 "contents": [
-                    {"type": "text", "text": venue_name(venue_code), "weight": "bold", "size": "xl", "color": "#FFD000"},
-                    {"type": "text", "text": "請選擇遊戲廳，選完後即可在聊天室內輸入莊 / 閒 / 和。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
+                    {"type": "text", "text": venue_name(venue_code), "weight": "bold", "size": "xl", "color": "#FFD000", "wrap": True},
+                    {"type": "text", "text": "請選擇遊戲廳，選完後即可輸入莊 / 閒 / 和。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
                     {"type": "separator", "margin": "lg", "color": "#FFD000"},
                     {"type": "box", "layout": "vertical", "spacing": "md", "margin": "lg", "contents": buttons},
                     {"type": "separator", "margin": "lg", "color": "#333333"},
-                    {
-                        "type": "button",
-                        "style": "secondary",
-                        "height": "sm",
-                        "margin": "md",
-                        "action": postback_action("重新選館", {"action": "open_venue"}),
-                    },
+                    {"type": "button", "style": "secondary", "height": "sm", "margin": "md", "action": postback_action("重新選館", {"action": "open_venue"})},
                 ],
             },
         },
     }
 
 
-def input_panel_flex(session: Dict[str, Any]) -> Dict[str, Any]:
+def input_panel_flex(session: Dict[str, Any], notice: str = "") -> Dict[str, Any]:
     history = session.get("history", []) or []
     venue = session.get("venue", "")
     room = session.get("room", "")
     shoe_id = session.get("shoe_id", "") or "可直接輸入靴號"
     round_no = len(history) + 1
+
+    contents: List[Dict[str, Any]] = [
+        {"type": "text", "text": "AI 規律分析", "weight": "bold", "size": "xl", "color": "#111111"},
+        {"type": "separator", "margin": "md", "color": "#FFD000"},
+        kv("遊戲館", venue_name(venue)),
+        kv("遊戲廳", room or "-"),
+        kv("靴號", shoe_id),
+        kv("目前局數", f"第 {round_no} 局"),
+    ]
+
+    if notice:
+        contents.append({
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#FFF6CC",
+            "cornerRadius": "md",
+            "paddingAll": "8px",
+            "margin": "md",
+            "contents": [{"type": "text", "text": notice, "size": "xs", "color": "#333333", "wrap": True}],
+        })
+
+    contents.extend([
+        {"type": "text", "text": f"目前紀錄｜已輸入 {len(history)} 局", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
+        {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F7F7F7",
+            "cornerRadius": "md",
+            "paddingAll": "10px",
+            "margin": "sm",
+            "contents": [
+                {"type": "text", "text": result_chip_text(history), "size": "sm", "wrap": True, "color": "#333333"},
+                {"type": "text", "text": compact_history(history), "size": "xs", "wrap": True, "color": "#888888", "margin": "sm"},
+            ],
+        },
+        {"type": "text", "text": "輸入莊 / 閒 / 和", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "margin": "sm",
+            "contents": [
+                button("莊 B", {"action": "add_round", "result": "B"}, "#E60012"),
+                button("閒 P", {"action": "add_round", "result": "P"}, "#0B46D9"),
+                button("和 T", {"action": "add_round", "result": "T"}, "#00A040"),
+            ],
+        },
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "margin": "sm",
+            "contents": [
+                button("上一步", {"action": "undo_round"}, "#222222"),
+                button("查看紀錄", {"action": "view_panel"}, "#222222"),
+            ],
+        },
+        {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "margin": "md",
+            "contents": [
+                button("開始AI判斷", {"action": "predict"}, "#FFD000"),
+                button("清除本靴", {"action": "reset_session"}, "#555555"),
+                button("結束分析", {"action": "end_session"}, "#111111"),
+            ],
+        },
+        {"type": "text", "text": "提示：LINE 不能修改已送出的舊 Flex 訊息。新版面板會以新訊息顯示最新紀錄。", "size": "xs", "color": "#888888", "margin": "lg", "wrap": True},
+    ])
 
     return {
         "type": "flex",
@@ -297,60 +412,7 @@ def input_panel_flex(session: Dict[str, Any]) -> Dict[str, Any]:
                 "layout": "vertical",
                 "backgroundColor": "#FFFFFF",
                 "paddingAll": "16px",
-                "contents": [
-                    {"type": "text", "text": "AI 規律分析", "weight": "bold", "size": "xl", "color": "#111111"},
-                    {"type": "separator", "margin": "md", "color": "#FFD000"},
-                    kv("遊戲館", venue_name(venue)),
-                    kv("遊戲廳", room or "-"),
-                    kv("靴號", shoe_id),
-                    kv("目前局數", f"第 {round_no} 局"),
-                    {"type": "text", "text": "目前紀錄", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
-                    {
-                        "type": "box",
-                        "layout": "vertical",
-                        "backgroundColor": "#F7F7F7",
-                        "cornerRadius": "md",
-                        "paddingAll": "10px",
-                        "margin": "sm",
-                        "contents": [
-                            {"type": "text", "text": history_text(history), "size": "sm", "wrap": True, "color": "#333333"}
-                        ],
-                    },
-                    {"type": "text", "text": "輸入莊 / 閒 / 和", "size": "sm", "color": "#111111", "weight": "bold", "margin": "lg"},
-                    {
-                        "type": "box",
-                        "layout": "horizontal",
-                        "spacing": "sm",
-                        "margin": "sm",
-                        "contents": [
-                            button("莊 B", {"action": "add_round", "result": "B"}, "#FFE3E3"),
-                            button("閒 P", {"action": "add_round", "result": "P"}, "#E3EAFF"),
-                            button("和 T", {"action": "add_round", "result": "T"}, "#E3FFE7"),
-                        ],
-                    },
-                    {
-                        "type": "box",
-                        "layout": "horizontal",
-                        "spacing": "sm",
-                        "margin": "sm",
-                        "contents": [
-                            button("上一步", {"action": "undo_round"}, "#222222"),
-                            button("查看紀錄", {"action": "view_panel"}, "#222222"),
-                        ],
-                    },
-                    {
-                        "type": "box",
-                        "layout": "vertical",
-                        "spacing": "sm",
-                        "margin": "md",
-                        "contents": [
-                            button("開始AI判斷", {"action": "predict"}, "#FFD000"),
-                            button("清除本靴", {"action": "reset_session"}, "#555555"),
-                            button("結束分析", {"action": "end_session"}, "#111111"),
-                        ],
-                    },
-                    {"type": "text", "text": "提示：點莊/閒/和只會背景記錄，不會每次跳訊息。按「查看紀錄」才更新面板。", "size": "xs", "color": "#888888", "margin": "lg", "wrap": True},
-                ],
+                "contents": contents,
             },
         },
     }
@@ -359,6 +421,7 @@ def input_panel_flex(session: Dict[str, Any]) -> Dict[str, Any]:
 def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
     pred = session.get("last_prediction") or {}
     recommend = pred.get("recommend_text") or pred.get("recommend") or "-"
+    history = session.get("history", []) or []
     return {
         "type": "flex",
         "altText": f"分析結果：推薦 {recommend}",
@@ -375,7 +438,7 @@ def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
                     kv("遊戲館", venue_name(session.get("venue", ""))),
                     kv("遊戲廳", session.get("room", "-")),
                     kv("靴號", session.get("shoe_id", "-")),
-                    kv("局數", f"第 {len(session.get('history', []) or []) + 1} 局"),
+                    kv("已輸入", f"{len(history)} 局"),
                     kv("遊戲狀態", session.get("status", "可押注")),
                     rate_line("莊", percent_text(pred.get("banker_rate", 0)), "#E60012"),
                     rate_line("閒", percent_text(pred.get("player_rate", 0)), "#0000CC"),
@@ -402,33 +465,124 @@ def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
                 "contents": [
                     button("繼續輸入", {"action": "view_panel"}, "#FFD000"),
                     button("重新選館", {"action": "open_venue"}, "#222222"),
+                    button("結束分析", {"action": "end_session"}, "#111111"),
                 ],
             },
         },
     }
 
 
-def predict_and_save(user_id: str) -> Dict[str, Any]:
+def end_flex(session: Dict[str, Any]) -> Dict[str, Any]:
+    total = len(session.get("history", []) or [])
+    return start_menu_flex(
+        title="本靴分析已結束",
+        subtitle=f"總局數：{total} 局。需要下一靴時，點下方「開始分析」。",
+    )
+
+
+def _fallback_predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", reason: str = "本地備援") -> Dict[str, Any]:
+    h = [x for x in history if str(x).upper() in {"B", "P", "T"}]
+    bp = [str(x).upper() for x in h if str(x).upper() in {"B", "P"}]
+    if not bp:
+        b, p, t = 45.9, 44.6, 9.5
+        pick = "B"
+        pattern = "冷啟動"
+    else:
+        last = bp[-1]
+        streak = 1
+        for x in reversed(bp[:-1]):
+            if x == last:
+                streak += 1
+            else:
+                break
+        switches = sum(1 for a, b0 in zip(bp[-10:], bp[-9:]) if a != b0)
+        switch_rate = switches / max(1, min(len(bp[-10:]) - 1, 9))
+        if streak >= 3:
+            pick = last
+            pattern = f"{'莊' if last == 'B' else '閒'}{streak}連，備援偏續龍"
+        elif switch_rate >= 0.65:
+            pick = "P" if last == "B" else "B"
+            pattern = "跳路備援"
+        else:
+            pick = "B" if bp.count("B") <= bp.count("P") else "P"
+            pattern = "均衡備援"
+        edge = 3.0 + min(4.0, streak * 0.7)
+        if pick == "B":
+            b, p = 45.9 + edge, 44.6 - edge
+        else:
+            b, p = 45.9 - edge, 44.6 + edge
+        t = 9.5
+        s = b + p + t
+        b, p, t = b / s * 100, p / s * 100, t / s * 100
+
+    return {
+        "ok": True,
+        "venue": venue,
+        "room": room,
+        "shoe_id": shoe_id,
+        "round_no": len(h) + 1,
+        "history_len": len(h),
+        "banker_rate": round(b, 1),
+        "player_rate": round(p, 1),
+        "tie_rate": round(t, 1),
+        "recommend": pick,
+        "recommend_text": {"B": "莊", "P": "閒"}[pick],
+        "confidence": 0.36,
+        "signal_level": "備援訊號",
+        "pattern_label": pattern,
+        "reason": f"{pattern} / {reason}",
+        "ai_used": False,
+        "ai_result": None,
+    }
+
+
+def predict_and_save(user_id: str) -> Tuple[Dict[str, Any], bool, str]:
     session = store.get_session(user_id)
     if not session:
         raise ValueError("請先輸入「開始分析」並選擇遊戲館。")
-    pred = predict(
-        history=session.get("history", []),
-        venue=session.get("venue", ""),
-        room=session.get("room", ""),
-        shoe_id=session.get("shoe_id", ""),
-    )
-    return store.upsert_session(user_id, {**session, "last_prediction": pred, "status": "可押注"})
+
+    history = session.get("history", []) or []
+    venue = session.get("venue", "")
+    room = session.get("room", "")
+    shoe_id = session.get("shoe_id", "")
+
+    if len(history) < 1:
+        raise ValueError("目前尚未輸入莊閒和紀錄，請至少輸入 1 局再開始判斷。")
+
+    try:
+        future = _PREDICT_EXECUTOR.submit(
+            predict,
+            history=history,
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+        )
+        pred = future.result(timeout=PREDICT_TIMEOUT_SEC)
+        used_fallback = False
+        note = ""
+    except TimeoutError:
+        pred = _fallback_predict(history, venue, room, shoe_id, reason=f"AI判斷超過 {PREDICT_TIMEOUT_SEC:.0f} 秒，已先回本地備援")
+        used_fallback = True
+        note = "AI判斷逾時，已先回本地備援。"
+    except Exception as exc:
+        print("predict failed:", repr(exc))
+        traceback.print_exc()
+        pred = _fallback_predict(history, venue, room, shoe_id, reason=f"predictor錯誤：{exc}")
+        used_fallback = True
+        note = f"predictor 錯誤，已回本地備援：{exc}"
+
+    saved = store.upsert_session(user_id, {**session, "last_prediction": pred, "status": "可押注"})
+    return saved, used_fallback, note
 
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.0.0"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.1.0"}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot"}
+    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.1.0"}
 
 
 @app.get("/ping")
@@ -438,7 +592,7 @@ def ping() -> PlainTextResponse:
 
 @app.get("/liff")
 def liff_page() -> Any:
-    # 保留舊 LIFF 頁面相容，但主流程已改為聊天室 postback 操作。
+    # 保留舊 LIFF 頁面相容；正式主流程為 LINE 聊天室 Postback。
     html_path = STATIC_DIR / "liff.html"
     if not html_path.exists():
         return JSONResponse({"ok": False, "detail": "static/liff.html not found. 主流程可直接用 LINE Postback，不需 LIFF。"}, status_code=404)
@@ -499,10 +653,16 @@ def api_end(body: UserIn) -> Dict[str, Any]:
 @app.post("/api/predict")
 def api_predict(body: PredictIn) -> Dict[str, Any]:
     try:
-        session = predict_and_save(body.user_id)
+        session, used_fallback, note = predict_and_save(body.user_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    return {"ok": True, "session": session, "prediction": session.get("last_prediction")}
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "session": session,
+        "prediction": session.get("last_prediction"),
+        "used_fallback": used_fallback,
+        "note": note,
+    }
 
 
 @app.post("/callback")
@@ -522,7 +682,7 @@ async def callback(request: Request) -> JSONResponse:
         user_id = get_source_user_id(event)
 
         if event_type == "follow":
-            line_reply(reply_token, [venue_flex()])
+            line_reply(reply_token, [start_menu_flex("歡迎使用 AI 規律分析", "點擊「開始分析」選擇遊戲館。")])
             continue
 
         if event_type == "message" and event.get("message", {}).get("type") == "text":
@@ -540,15 +700,18 @@ async def callback(request: Request) -> JSONResponse:
 
             if text in ["AI", "開始AI判斷", "判斷", "預測"]:
                 try:
-                    session = predict_and_save(user_id)
-                    line_reply(reply_token, [result_flex(session)])
+                    session, used_fallback, note = predict_and_save(user_id)
+                    msgs = [result_flex(session)]
+                    if used_fallback and note:
+                        msgs.append(text_msg(note))
+                    line_reply(reply_token, msgs)
                 except Exception as exc:
                     line_reply(reply_token, [text_msg(str(exc))])
                 continue
 
             if text in ["結束", "結束分析"]:
                 session = store.end_session(user_id)
-                line_reply(reply_token, [text_msg(f"已結束本靴分析。總局數：{len(session.get('history', []) or [])} 局")])
+                line_reply(reply_token, [end_flex(session)])
                 continue
 
             mapping = {"莊": "B", "庄": "B", "b": "B", "B": "B", "閒": "P", "闲": "P", "p": "P", "P": "P", "和": "T", "t": "T", "T": "T"}
@@ -556,7 +719,7 @@ async def callback(request: Request) -> JSONResponse:
                 result = mapping.get(text) or mapping.get(lower_text)
                 try:
                     session = store.add_round(user_id, result)
-                    line_reply(reply_token, [input_panel_flex(session)])
+                    line_reply(reply_token, [input_panel_flex(session, f"已新增：{result_name(result)}")])
                 except Exception as exc:
                     line_reply(reply_token, [text_msg(f"輸入失敗：{exc}")])
                 continue
@@ -565,9 +728,9 @@ async def callback(request: Request) -> JSONResponse:
             session = get_session_or_create(user_id)
             if session.get("venue") or session.get("room"):
                 session = store.upsert_session(user_id, {**session, "shoe_id": text})
-                line_reply(reply_token, [input_panel_flex(session)])
+                line_reply(reply_token, [input_panel_flex(session, "已更新靴號 / 桌號備註")])
             else:
-                line_reply(reply_token, [text_msg("請輸入「開始分析」開啟遊戲館選擇。")])
+                line_reply(reply_token, [start_menu_flex("尚未開始分析", "請點擊「開始分析」選擇遊戲館。")])
 
         elif event_type == "postback":
             raw_data = event.get("postback", {}).get("data", "")
@@ -588,7 +751,7 @@ async def callback(request: Request) -> JSONResponse:
                     venue = data.get("venue", "")
                     room = data.get("room", "")
                     session = store.new_session(user_id, venue, room, "")
-                    line_reply(reply_token, [input_panel_flex(session)])
+                    line_reply(reply_token, [input_panel_flex(session, "已建立新靴，請開始輸入莊 / 閒 / 和")])
 
                 elif action == "view_panel":
                     session = get_session_or_create(user_id)
@@ -598,33 +761,45 @@ async def callback(request: Request) -> JSONResponse:
                     result = data.get("result", "")
                     session = store.add_round(user_id, result)
                     history_len = len(session.get("history", []) or [])
-                    should_reply = ROUND_INPUT_REPLY_MODE == "panel" or (
-                        ACK_EVERY_N_ROUNDS > 0 and history_len % ACK_EVERY_N_ROUNDS == 0
+                    notice = f"已新增：{result_name(result)}｜目前 {history_len} 局"
+
+                    should_reply = (
+                        ROUND_INPUT_REPLY_MODE == "panel"
+                        or ROUND_INPUT_REPLY_MODE == "compact"
+                        or (ACK_EVERY_N_ROUNDS > 0 and history_len % ACK_EVERY_N_ROUNDS == 0)
                     )
-                    if should_reply:
-                        line_reply(reply_token, [input_panel_flex(session)])
-                    # silent 模式不回覆，避免每點一次莊/閒/和就洗版。
+
+                    if ROUND_INPUT_REPLY_MODE == "compact":
+                        line_reply(reply_token, [text_msg(f"{notice}\n紀錄：{compact_history(session.get('history', []), 24)}")])
+                    elif should_reply:
+                        line_reply(reply_token, [input_panel_flex(session, notice)])
+                    # silent 模式不回覆；需要更新時可按「查看紀錄」。
 
                 elif action == "undo_round":
                     session = store.undo_round(user_id)
-                    line_reply(reply_token, [input_panel_flex(session)])
+                    line_reply(reply_token, [input_panel_flex(session, "已刪除上一局")])
 
                 elif action == "reset_session":
                     session = store.clear_history(user_id)
-                    line_reply(reply_token, [input_panel_flex(session)])
+                    line_reply(reply_token, [input_panel_flex(session, "已清除本靴紀錄")])
 
                 elif action == "end_session":
                     session = store.end_session(user_id)
-                    line_reply(reply_token, [text_msg(f"已結束本靴分析。總局數：{len(session.get('history', []) or [])} 局")])
+                    line_reply(reply_token, [end_flex(session)])
 
                 elif action == "predict":
-                    session = predict_and_save(user_id)
-                    line_reply(reply_token, [result_flex(session)])
+                    session, used_fallback, note = predict_and_save(user_id)
+                    msgs = [result_flex(session)]
+                    if used_fallback and note:
+                        msgs.append(text_msg(note))
+                    line_reply(reply_token, msgs)
 
                 else:
-                    line_reply(reply_token, [venue_flex()])
+                    line_reply(reply_token, [start_menu_flex("尚未選擇動作", "請點擊「開始分析」重新開始。")])
 
             except Exception as exc:
+                print("postback failed:", repr(exc))
+                traceback.print_exc()
                 line_reply(reply_token, [text_msg(f"操作失敗：{exc}")])
 
     return JSONResponse({"ok": True})
