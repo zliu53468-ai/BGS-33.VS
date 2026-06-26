@@ -1,5 +1,12 @@
 import math
 import os
+
+# Render / CPU 環境穩定設定：避免 TensorFlow 佔用過多執行緒
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
 import json
 import numpy as np
 from collections import Counter, defaultdict
@@ -7,16 +14,39 @@ from typing import Any, Dict, List, Tuple, Optional
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
 import logging
+
+# 保留 LSTM：有安裝 tensorflow-cpu 時會啟用；若環境還沒裝好，不會讓整個服務直接掛掉
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+    from tensorflow.keras.optimizers import Adam
+
+    TF_AVAILABLE = True
+    TF_IMPORT_ERROR = ""
+except Exception as e:
+    tf = None
+    Sequential = None
+    LSTM = Dense = Dropout = Input = None
+    Adam = None
+    TF_AVAILABLE = False
+    TF_IMPORT_ERROR = str(e)
 
 from deepseek_client import DeepSeekClient
 
 # 設置日誌
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+if not TF_AVAILABLE:
+    logger.warning(f"TensorFlow 未啟用，LSTM 會暫時回傳 0.5。原因：{TF_IMPORT_ERROR}")
+else:
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+    except Exception:
+        pass
 
 # ============ 環境變數 ============
 B_PRIOR = float(os.getenv("B_PRIOR", "0.4586"))
@@ -43,9 +73,10 @@ MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "6"))
 MIN_HISTORY_FOR_SIGNAL = int(os.getenv("MIN_HISTORY_FOR_SIGNAL", "4"))
 
 # LSTM參數
-LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "20"))
-LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "30"))
-LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "16"))
+LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "12"))
+LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "8"))
+LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
+ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
@@ -82,18 +113,24 @@ class MLModels:
         self.is_trained = False
         self.training_samples = 0
         self.last_training_history = []
+        self.last_training_key = ""
         
         # LSTM模型（延遲初始化）
         self._build_lstm()
     
     def _build_lstm(self):
-        """建立LSTM模型架構（權重需訓練）"""
+        """建立 LSTM 模型架構（權重需訓練）"""
+        if not TF_AVAILABLE:
+            self.lstm = None
+            return None
+
         self.lstm = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(LSTM_SEQUENCE_LENGTH, 1)),
-            Dropout(0.2),
-            LSTM(32, return_sequences=False),
-            Dropout(0.2),
-            Dense(16, activation='relu'),
+            Input(shape=(LSTM_SEQUENCE_LENGTH, 1)),
+            LSTM(48, return_sequences=True),
+            Dropout(0.20),
+            LSTM(24, return_sequences=False),
+            Dropout(0.20),
+            Dense(12, activation='relu'),
             Dense(1, activation='sigmoid')
         ])
         self.lstm.compile(
@@ -101,7 +138,8 @@ class MLModels:
             loss='binary_crossentropy',
             metrics=['accuracy']
         )
-    
+        return self.lstm
+
     def _encode_sequence(self, non_tie: List[str]) -> np.ndarray:
         """編碼牌路序列為數值"""
         mapping = {'B': 1, 'P': 0}
@@ -192,68 +230,82 @@ class MLModels:
         
         return np.array(X).reshape(-1, LSTM_SEQUENCE_LENGTH, 1), np.array(y)
     
-    def train(self, non_tie: List[str]) -> Dict[str, Any]:
-        """訓練所有ML模型"""
+    def train(self, non_tie: List[str], training_key: str = "") -> Dict[str, Any]:
+        """訓練所有 ML 模型：LR + RF + LSTM（有 TensorFlow 才啟用）"""
         if len(non_tie) < 30:
             return {
                 "status": "error",
                 "message": f"需要至少30局歷史資料，目前{len(non_tie)}局"
             }
-        
+
         try:
-            # 1. 提取特徵（滾動窗口，無資料洩漏）
+            # 1. 提取特徵（滾動窗口，避免拿未來資料訓練）
             X_features = []
             y_labels = []
-            
+
             for i in range(12, len(non_tie)):
                 features = self._extract_features(non_tie[:i])
                 X_features.append(features[0])
                 y_labels.append(1 if non_tie[i] == 'B' else 0)
-            
+
             X_features = np.array(X_features)
             y_labels = np.array(y_labels)
-            
+
             if len(X_features) < 10:
                 return {"status": "error", "message": "有效訓練樣本不足"}
-            
-            # 正規化
+
+            if len(set(y_labels.tolist())) < 2:
+                return {"status": "error", "message": "訓練資料只有單一類別，暫不訓練 ML"}
+
+            # 2. 正規化 + 訓練 Logistic Regression / Random Forest
             X_scaled = self.scaler.fit_transform(X_features)
-            
-            # 2. 訓練 Logistic Regression
             self.lr.fit(X_scaled, y_labels)
-            
-            # 3. 訓練 Random Forest
             self.rf.fit(X_scaled, y_labels)
-            
-            # 4. 訓練 LSTM
-            X_lstm, y_lstm = self._prepare_lstm_data(non_tie)
-            if len(X_lstm) > 10:
-                self._build_lstm()  # 重置LSTM
-                self.lstm.fit(
-                    X_lstm, y_lstm,
-                    epochs=LSTM_EPOCHS,
-                    batch_size=LSTM_BATCH_SIZE,
-                    verbose=0,
-                    validation_split=0.2,
-                    callbacks=[tf.keras.callbacks.EarlyStopping(
-                        patience=5, restore_best_weights=True
-                    )] if 'tf' in dir() else []
-                )
-            
+
+            # 3. 訓練 LSTM（保留，但避免 TensorFlow 未安裝時讓服務掛掉）
+            lstm_status = "disabled"
+            if TF_AVAILABLE:
+                X_lstm, y_lstm = self._prepare_lstm_data(non_tie)
+                if len(X_lstm) > 10 and len(set(y_lstm.tolist())) >= 2:
+                    self._build_lstm()  # 每次重訓時重置 LSTM
+                    callbacks = [
+                        tf.keras.callbacks.EarlyStopping(
+                            patience=3,
+                            restore_best_weights=True
+                        )
+                    ]
+                    self.lstm.fit(
+                        X_lstm,
+                        y_lstm,
+                        epochs=LSTM_EPOCHS,
+                        batch_size=LSTM_BATCH_SIZE,
+                        verbose=0,
+                        validation_split=0.2,
+                        callbacks=callbacks
+                    )
+                    lstm_status = "trained"
+                else:
+                    lstm_status = "not_enough_sequence"
+            else:
+                self.lstm = None
+                lstm_status = f"tensorflow_unavailable: {TF_IMPORT_ERROR}"
+
             self.is_trained = True
             self.training_samples = len(X_features)
-            self.last_training_history = non_tie
-            
+            self.last_training_history = list(non_tie)
+            self.last_training_key = training_key
+
             return {
                 "status": "success",
                 "samples": self.training_samples,
+                "lstm_status": lstm_status,
                 "message": "ML模型訓練完成"
             }
-            
+
         except Exception as e:
             logger.error(f"ML訓練錯誤: {e}")
             return {"status": "error", "message": str(e)}
-    
+
     def predict(self, non_tie: List[str]) -> Dict[str, float]:
         """使用ML模型預測"""
         default_result = {
@@ -554,6 +606,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "balance": balance,
         "streak": streak,
         "ml_predictions": ml_pred,
+        "tf_available": TF_AVAILABLE,
+        "training_key": training_key,
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
     }
     
@@ -630,6 +684,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ml_trained": ml_models.is_trained,
         "ml_samples": ml_models.training_samples,
+        "tf_available": TF_AVAILABLE,
         "ml_predictions": {
             "lr": round(ml_pred.get('lr', 0.5), 4),
             "rf": round(ml_pred.get('rf', 0.5), 4),
