@@ -577,21 +577,33 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     p_prob = p_side * (1 - tie_prob)
     
     # ============ 2. ML模型預測 ============
+    # 每個場館 / 房間 / 靴號建立獨立 key，避免不同桌互相污染
+    training_key = f"{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else "global"
+
+    # 資料足夠才訓練；換桌/換靴或新增資料達門檻才重訓，避免每局都重訓拖慢 Render
+    should_train = (
+        len(non_tie) >= 30
+        and (
+            not ml_models.is_trained
+            or getattr(ml_models, "last_training_key", "") != training_key
+            or len(non_tie) - len(getattr(ml_models, "last_training_history", [])) >= ML_RETRAIN_INTERVAL
+        )
+    )
+
+    if should_train:
+        train_result = ml_models.train(non_tie, training_key=training_key)
+        logger.info(f"ML訓練結果: {train_result}")
+
+    # 訓練後再預測，避免剛訓練完還拿到舊的 0.5
     ml_pred = ml_models.predict(non_tie)
     ml_b_prob = ml_pred.get('ensemble', 0.5)
-    
-    # 訓練ML模型（如果有足夠資料且尚未訓練，或資料已更新）
-    if len(non_tie) >= 30 and not ml_models.is_trained:
-        train_result = ml_models.train(non_tie)
-        logger.info(f"ML訓練結果: {train_result}")
-    
-    # 如果ML模型已訓練，使用ML預測修正
+
+    # 如果 ML 模型已訓練，使用 ML 預測做小幅修正；避免 ML 過度壓過牌路模型
     if ml_models.is_trained:
         ml_weight = ML_WEIGHT * (0.5 + 0.5 * min(1.0, ml_models.training_samples / 50))
-        # 融合：規律模型 + ML模型
         b_prob = b_prob * (1 - ml_weight) + ml_b_prob * ml_weight
         p_prob = p_prob * (1 - ml_weight) + (1 - ml_b_prob) * ml_weight
-    
+
     # ============ 3. DeepSeek校準 ============
     feature_payload = {
         "venue": venue,
