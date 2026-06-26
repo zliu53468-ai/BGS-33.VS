@@ -7,9 +7,10 @@ from typing import Any, Dict, List, Tuple
 from deepseek_client import DeepSeekClient
 
 # ============================================================
-# V16 Classic / Lite
-# 目標：回到百家樂核心牌路判斷。
+# V17 Classic / Lite + Sequence Pattern
+# 目標：回到百家樂核心牌路判斷，並補強莊閒排列順序捕捉。
 # 主判斷保留 Road / Room / Foot / Chop / Dragon / After-Tie。
+# 新增 Sequence Pattern Layer：只輕量加權，不硬翻方向。
 # AI、全靴前中後、全局反轉、多數邊、Chaos 預設只做輕量保護或關閉硬覆蓋。
 # ============================================================
 
@@ -340,6 +341,25 @@ AFTER_TIE_SAFE_MODE = os.getenv("AFTER_TIE_SAFE_MODE", "1") == "1"
 AFTER_TIE_NO_ENTRY_WINDOW = int(os.getenv("AFTER_TIE_NO_ENTRY_WINDOW", "3"))
 AFTER_TIE_FORCE_MINBET = os.getenv("AFTER_TIE_FORCE_MINBET", "1") == "1"
 AFTER_TIE_CONF_CAP = float(os.getenv("AFTER_TIE_CONF_CAP", "0.36"))
+
+
+# V17 Sequence Pattern Layer / 莊閒排列順序層:
+# Captures direct B/P ordering rhythms such as BPBP, BBPP, BPPBPP, BBPBBP,
+# and short N-gram tails. This layer is intentionally light-weight: it can
+# nudge the B/P probability, but by default it never hard-overrides the pick.
+SEQUENCE_PATTERN_MODE = os.getenv("SEQUENCE_PATTERN_MODE", "1") == "1"
+SEQUENCE_LOOKBACK = int(os.getenv("SEQUENCE_LOOKBACK", "14"))
+SEQUENCE_MIN_HISTORY = int(os.getenv("SEQUENCE_MIN_HISTORY", "8"))
+SEQUENCE_NGRAM_MIN = int(os.getenv("SEQUENCE_NGRAM_MIN", "3"))
+SEQUENCE_NGRAM_MAX = int(os.getenv("SEQUENCE_NGRAM_MAX", "5"))
+SEQUENCE_MIN_SAMPLE = int(os.getenv("SEQUENCE_MIN_SAMPLE", "2"))
+SEQUENCE_EDGE = float(os.getenv("SEQUENCE_EDGE", "0.038"))
+SEQUENCE_MAX_EDGE = float(os.getenv("SEQUENCE_MAX_EDGE", "0.060"))
+SEQUENCE_WEIGHT = float(os.getenv("SEQUENCE_WEIGHT", "0.16"))
+SEQUENCE_FINAL_OVERRIDE = os.getenv("SEQUENCE_FINAL_OVERRIDE", "0") == "1"
+SEQUENCE_CONF_CAP = float(os.getenv("SEQUENCE_CONF_CAP", "0.50"))
+SEQUENCE_CHAOS_FACTOR = float(os.getenv("SEQUENCE_CHAOS_FACTOR", "0.70"))
+SEQUENCE_STRONG_LOCAL_GAP = float(os.getenv("SEQUENCE_STRONG_LOCAL_GAP", "0.050"))
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -1962,6 +1982,149 @@ def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
         }
     return weights
 
+def _sequence_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    V17 Sequence Pattern Layer / 莊閒排列順序層.
+
+    Purpose:
+    - Read the B/P ordering itself, not cross-shoe global history.
+    - Catch repeated sequence rhythms like BPBP, BBPP, BPPBPP, BBPBBP.
+    - Use current-shoe N-gram tails such as BPB -> P, BPP -> B.
+
+    Design rule:
+    - This layer only provides a light B/P probability nudge.
+    - It does not hard-overwrite the final recommendation unless
+      SEQUENCE_FINAL_OVERRIDE=1, which is not recommended by default.
+    """
+    if not SEQUENCE_PATTERN_MODE:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "排列層關閉", "strength": 0.0}
+
+    n_total = len(non_tie)
+    if n_total < SEQUENCE_MIN_HISTORY:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "排列資料不足", "strength": 0.0}
+
+    candidates: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------
+    # 1) Current-shoe N-gram tail lookup.
+    #    Example: if the tail is BPB, search earlier BPB occurrences
+    #    and learn whether the next hand tended to be B or P.
+    # ------------------------------------------------------------
+    n_min = max(2, SEQUENCE_NGRAM_MIN)
+    n_max = max(n_min, SEQUENCE_NGRAM_MAX)
+    for k in range(min(n_max, n_total - 1), n_min - 1, -1):
+        key = tuple(non_tie[-k:])
+        b_score = 0.0
+        p_score = 0.0
+        sample = 0
+        last_match_pos = -1
+
+        # range stops at n_total-k because current tail has no known next hand.
+        for i in range(0, n_total - k):
+            if tuple(non_tie[i:i + k]) != key:
+                continue
+            nxt = non_tie[i + k]
+            # Recent matches in the same shoe get slightly more weight, but not too much.
+            recency = 0.70 + 0.30 * _safe_div(i + k, max(1, n_total), 0.0)
+            if nxt == "B":
+                b_score += recency
+            elif nxt == "P":
+                p_score += recency
+            sample += 1
+            last_match_pos = i
+
+        if sample < SEQUENCE_MIN_SAMPLE:
+            continue
+
+        total = b_score + p_score
+        if total <= 0:
+            continue
+        b_rate = b_score / total
+        target = "B" if b_rate >= 0.5 else "P"
+        dominance = abs(b_rate - 0.5) * 2.0
+        sample_factor = min(1.0, sample / max(2.0, SEQUENCE_MIN_SAMPLE + 2.0))
+        k_factor = 0.88 + min(0.18, (k - n_min) * 0.045)
+        edge = SEQUENCE_EDGE * (0.72 + dominance * 0.38) * (0.72 + sample_factor * 0.28) * k_factor
+        edge = min(SEQUENCE_MAX_EDGE, max(0.018, edge))
+        strength = _clamp(0.110 + dominance * 0.090 + sample_factor * 0.060 + (k - n_min) * 0.012, 0.08, 0.30)
+        b, p = _bp_score(target, 0.5 + edge)
+        candidates.append({
+            "active": True,
+            "mode": "ngram",
+            "B": b,
+            "P": p,
+            "label": f"排列尾段{k}碼｜{''.join(key)}→{target}({sample})",
+            "strength": strength,
+            "target_side": target,
+            "edge": round(edge, 5),
+            "sample": sample,
+            "b_rate": round(b_rate, 4),
+            "key": "".join(key),
+            "last_match_pos": last_match_pos,
+        })
+
+    # ------------------------------------------------------------
+    # 2) Fixed rhythm detector using the recent 6~14 hands.
+    #    Examples:
+    #    - BPBPBP       period 2 -> next B/P alternating
+    #    - BBPPBBPP     period 4 -> next B
+    #    - BPPBPP       period 3 -> next B
+    #    - BBPBBP       period 3 -> next B
+    # ------------------------------------------------------------
+    lookback = max(6, SEQUENCE_LOOKBACK)
+    tail = non_tie[-min(n_total, lookback):]
+    tail_len = len(tail)
+    for period_len in (2, 3, 4, 5):
+        if tail_len < period_len * 2:
+            continue
+        period = tail[-period_len:]
+        start = tail_len - period_len
+        matches = 0
+        total = 0
+        for idx, val in enumerate(tail):
+            expected = period[(idx - start) % period_len]
+            if val == expected:
+                matches += 1
+            total += 1
+        consistency = matches / max(1, total)
+        if consistency < 0.72:
+            continue
+
+        # Avoid treating a pure same-side long dragon as a sequence rhythm.
+        if len(set(period)) == 1:
+            continue
+
+        target = period[0]
+        edge = SEQUENCE_EDGE + min(0.024, (consistency - 0.72) * 0.070) + min(0.010, (tail_len / max(1, lookback)) * 0.010)
+        edge = min(SEQUENCE_MAX_EDGE, max(0.026, edge))
+        strength = _clamp(0.180 + (consistency - 0.72) * 0.35 + min(0.050, period_len * 0.008), 0.13, 0.34)
+        b, p = _bp_score(target, 0.5 + edge)
+        candidates.append({
+            "active": True,
+            "mode": "rhythm",
+            "B": b,
+            "P": p,
+            "label": f"固定排列{''.join(period)}｜一致{int(consistency * 100)}%→{target}",
+            "strength": strength,
+            "target_side": target,
+            "edge": round(edge, 5),
+            "period": "".join(period),
+            "period_len": period_len,
+            "consistency": round(consistency, 4),
+            "tail": "".join(tail),
+        })
+
+    if not candidates:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "未見莊閒排列節奏", "strength": 0.0}
+
+    candidates.sort(key=lambda x: (float(x.get("strength", 0)), float(x.get("edge", 0))), reverse=True)
+    best = dict(candidates[0])
+    if len(candidates) > 1 and candidates[1].get("target_side") == best.get("target_side"):
+        best["secondary_label"] = candidates[1].get("label")
+        best["strength"] = _clamp(float(best.get("strength", 0)) + 0.015, 0.0, 0.34)
+    best["candidates"] = candidates[:3]
+    return best
+
 def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 3:
         return {"B": 0.5, "P": 0.5, "label": "資料不足", "strength": 0.0}
@@ -1971,6 +2134,7 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
         _run_cycle_score(non_tie),
         _room_pattern_score(non_tie),
         _foot_alignment_score(non_tie),
+        _sequence_pattern_score(non_tie),
         _mirror_run_score(non_tie),
         _chop_score(non_tie),
         _chop_to_dragon_score(non_tie),
@@ -1999,6 +2163,8 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
         best["room_pattern"] = dict(best)
     if best.get("active") and best.get("foot_alignment"):
         best["foot_alignment"] = dict(best)
+    if best.get("active") and str(best.get("mode", "")) in {"ngram", "rhythm"}:
+        best["sequence_pattern"] = dict(best)
     if second and second.get("strength", 0) >= 0.12 and second.get("label") != best.get("label"):
         best["secondary_label"] = second.get("label")
         # Small blend to avoid one pattern totally dominating another valid road mode.
@@ -3294,6 +3460,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     markov = _transition_prob(non_tie)
     road = _road_pattern_score(non_tie)
+    sequence = _sequence_pattern_score(non_tie)
     recent = _recent_score(non_tie)
     balance = _balance_score(non_tie)
     streak = _streak_score(non_tie)
@@ -3332,6 +3499,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "current_streak": _streak(non_tie),
         "markov": markov,
         "road": road,
+        "sequence": sequence,
         "recent": recent,
         "balance": balance,
         "streak": streak,
@@ -3366,6 +3534,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "break_rate": FOOT_ALIGN_BREAK_RATE,
             "over_rate": FOOT_ALIGN_OVER_RATE,
             "final_override": FOOT_ALIGN_FINAL_OVERRIDE,
+        },
+        "sequence_pattern_config": {
+            "enabled": SEQUENCE_PATTERN_MODE,
+            "lookback": SEQUENCE_LOOKBACK,
+            "ngram_min": SEQUENCE_NGRAM_MIN,
+            "ngram_max": SEQUENCE_NGRAM_MAX,
+            "min_sample": SEQUENCE_MIN_SAMPLE,
+            "weight": SEQUENCE_WEIGHT,
+            "final_override": SEQUENCE_FINAL_OVERRIDE,
         },
         "v14_context_config": {
             "global_shoe_context_mode": GLOBAL_SHOE_CONTEXT_MODE,
@@ -3538,6 +3715,46 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         foot_alignment_final_override = True
 
+    # ----- V17 Sequence Pattern Layer -----
+    # Lightly nudge the B/P side based on direct Banker/Player ordering.
+    # It does not hard flip the recommendation unless SEQUENCE_FINAL_OVERRIDE=1.
+    sequence_adjusted = False
+    if isinstance(sequence, dict) and sequence.get("active"):
+        seq_b_side = float(sequence.get("B", 0.5))
+        bp_total = max(0.001, 1 - tie_prob)
+        cur_b_side = _clamp(b_prob / bp_total, 0.001, 0.999)
+        local_gap = abs(cur_b_side - 0.5) * 2.0
+        seq_strength = _clamp(float(sequence.get("strength", 0.0)), 0.0, 0.30)
+        blend = SEQUENCE_WEIGHT * (0.70 + min(0.30, seq_strength))
+        if chaos.get("active"):
+            blend *= SEQUENCE_CHAOS_FACTOR
+        # If the current local road is already very clear and sequence points the other way,
+        # keep the sequence layer as a small correction only.
+        seq_pick = "B" if seq_b_side >= 0.5 else "P"
+        cur_pick = "B" if cur_b_side >= 0.5 else "P"
+        if seq_pick != cur_pick and local_gap >= SEQUENCE_STRONG_LOCAL_GAP and not SEQUENCE_FINAL_OVERRIDE:
+            blend *= 0.45
+        blend = _clamp(blend, 0.0, 0.22)
+
+        new_b_side = cur_b_side * (1 - blend) + seq_b_side * blend
+
+        if SEQUENCE_FINAL_OVERRIDE and seq_pick in {"B", "P"}:
+            raw_edge = min(SEQUENCE_MAX_EDGE, max(SEQUENCE_EDGE, float(sequence.get("edge", SEQUENCE_EDGE))))
+            if seq_pick == "B":
+                new_b_side = 0.5 + raw_edge
+            else:
+                new_b_side = 0.5 - raw_edge
+
+        b_prob = new_b_side * bp_total
+        p_prob = (1 - new_b_side) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        sequence["adjusted"] = True
+        sequence["blend"] = round(blend, 5)
+        sequence["local_gap_before"] = round(local_gap, 5)
+        sequence_adjusted = True
+    else:
+        sequence_adjusted = False
+
     # ----- V14 specialized guards -----
     # These layers are applied after the original road overrides and before the
     # majority/global reversal layers so they can correct known weak spots:
@@ -3599,6 +3816,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if early_dragon_guard.get("B", 0.5) >= early_dragon_guard.get("P", 0.5) else "P")
     if 'room_break_to_chop' in locals() and isinstance(room_break_to_chop, dict) and room_break_to_chop.get("active"):
         votes.append("B" if room_break_to_chop.get("B", 0.5) >= room_break_to_chop.get("P", 0.5) else "P")
+    if isinstance(sequence, dict) and sequence.get("active"):
+        votes.append("B" if sequence.get("B", 0.5) >= sequence.get("P", 0.5) else "P")
     if 'road_room_pattern' in locals() and isinstance(road_room_pattern, dict) and road_room_pattern.get("active"):
         votes.append("B" if road_room_pattern.get("B", 0.5) >= road_room_pattern.get("P", 0.5) else "P")
     if 'road_foot_alignment' in locals() and isinstance(road_foot_alignment, dict) and road_foot_alignment.get("active"):
@@ -3675,6 +3894,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{room_break_to_chop.get('label')}({int(float(room_break_to_chop.get('score', 0))*100)}%)")
         if room_break_to_chop.get("adjusted"):
             reason_parts.append("房型斷點轉單跳")
+    if isinstance(sequence, dict) and sequence.get("active"):
+        reason_parts.insert(0, f"{sequence.get('label')}({int(float(sequence.get('strength', 0))*100)}%)")
+        if sequence.get("adjusted"):
+            reason_parts.append("莊閒排列順序校準")
     if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
         reason_parts.insert(0, f"{after_tie_safe.get('label')}({int(float(after_tie_safe.get('score', 0))*100)}%)")
         if AFTER_TIE_FORCE_MINBET:
@@ -3691,6 +3914,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.append("房型規律校準")
     if 'foot_alignment_final_override' in locals() and foot_alignment_final_override:
         reason_parts.append("對應齊腳校準")
+    if isinstance(sequence, dict) and sequence.get("active") and SEQUENCE_FINAL_OVERRIDE:
+        reason_parts.append("排列順序硬覆蓋")
     if road.get("secondary_label"):
         reason_parts.append(f"副路:{road.get('secondary_label')}")
     if ai_result and ai_result.get("pattern_label"):
@@ -3700,7 +3925,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     return {
         "ok": True,
-        "model_version": "V16 Classic Lite",
+        "model_version": "V17 Classic Lite + Sequence",
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -3737,9 +3962,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "mirror_run": road.get("mirror_run"),
             "room_pattern": road.get("room_pattern"),
             "foot_alignment": road.get("foot_alignment"),
+            "sequence_pattern": road.get("sequence_pattern"),
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
+        "sequence_pattern": sequence,
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
         "global_shoe_context": global_shoe_context if 'global_shoe_context' in locals() else None,
