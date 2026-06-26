@@ -3,6 +3,7 @@ import os
 
 # Render / CPU 環境穩定設定：避免 TensorFlow 佔用過多執行緒
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
@@ -99,7 +100,7 @@ class MLModels:
             n_estimators=100,
             max_depth=10,
             random_state=42,
-            n_jobs=-1
+            n_jobs=1
         )
         self.lr = LogisticRegression(
             max_iter=300,
@@ -115,8 +116,10 @@ class MLModels:
         self.last_training_history = []
         self.last_training_key = ""
         
-        # LSTM模型（延遲初始化）
-        self._build_lstm()
+        # Render 啟動穩定版：
+        # 不在服務啟動/import predictor.py 時建立 LSTM，避免 uvicorn 卡住導致 Render 偵測不到 port。
+        # LSTM 會在資料足夠並進入 train() 時才建立與訓練。
+        # self._build_lstm()
     
     def _build_lstm(self):
         """建立 LSTM 模型架構（權重需訓練）"""
