@@ -61,6 +61,27 @@ PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "4"))
 MARKOV_ALPHA = float(os.getenv("MARKOV_ALPHA", "2.6"))
 MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "16"))
 
+# V18 Full Markov Layer / 完整馬可夫層:
+# Adds multi-order Markov transitions (1~5 order by default) plus optional
+# run-length state Markov. This is still a light calibration layer; by default
+# it does not hard-override Road / Room / Foot / Dragon.
+FULL_MARKOV_MODE = os.getenv("FULL_MARKOV_MODE", "1") == "1"
+FULL_MARKOV_WEIGHT = float(os.getenv("FULL_MARKOV_WEIGHT", "0.18"))
+FULL_MARKOV_ORDER_MIN = int(os.getenv("FULL_MARKOV_ORDER_MIN", "1"))
+FULL_MARKOV_ORDER_MAX = int(os.getenv("FULL_MARKOV_ORDER_MAX", "5"))
+FULL_MARKOV_MIN_HISTORY = int(os.getenv("FULL_MARKOV_MIN_HISTORY", "10"))
+FULL_MARKOV_MIN_SAMPLE = int(os.getenv("FULL_MARKOV_MIN_SAMPLE", "2"))
+FULL_MARKOV_ALPHA = float(os.getenv("FULL_MARKOV_ALPHA", "1.4"))
+FULL_MARKOV_EDGE = float(os.getenv("FULL_MARKOV_EDGE", "0.040"))
+FULL_MARKOV_MAX_EDGE = float(os.getenv("FULL_MARKOV_MAX_EDGE", "0.065"))
+FULL_MARKOV_DECAY = float(os.getenv("FULL_MARKOV_DECAY", "0.960"))
+FULL_MARKOV_RUN_STATE_MODE = os.getenv("FULL_MARKOV_RUN_STATE_MODE", "1") == "1"
+FULL_MARKOV_RUN_WEIGHT = float(os.getenv("FULL_MARKOV_RUN_WEIGHT", "0.45"))
+FULL_MARKOV_FINAL_OVERRIDE = os.getenv("FULL_MARKOV_FINAL_OVERRIDE", "0") == "1"
+FULL_MARKOV_CONF_CAP = float(os.getenv("FULL_MARKOV_CONF_CAP", "0.50"))
+FULL_MARKOV_STRONG_LOCAL_GAP = float(os.getenv("FULL_MARKOV_STRONG_LOCAL_GAP", "0.055"))
+FULL_MARKOV_CHAOS_FACTOR = float(os.getenv("FULL_MARKOV_CHAOS_FACTOR", "0.70"))
+
 # Breakout Dragon Mode:
 # Handles shoes where a Banker/Player dragon suddenly exceeds previous run lengths.
 # It protects 1~2 hands after a true breakout so the model does not force-break too early.
@@ -1982,6 +2003,176 @@ def _effective_weights(chaos: Dict[str, Any]) -> Dict[str, float]:
         }
     return weights
 
+def _markov_run_bucket(n: int) -> int:
+    """Bucket run length for run-state Markov, keeping the state space small."""
+    if n <= 1:
+        return 1
+    if n == 2:
+        return 2
+    if n == 3:
+        return 3
+    if n == 4:
+        return 4
+    if n == 5:
+        return 5
+    return 6
+
+
+def _full_markov_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    V18 Full Markov Layer / 完整馬可夫層.
+
+    What it adds beyond the old first-order Markov:
+    1) Multi-order Markov: checks suffix states of length 1~5 by default.
+       Example: BPB -> next, BBPP -> next, BPPB -> next.
+    2) Recency decay: newer repeated states in the same shoe count slightly more.
+    3) Run-state Markov: current side + current run length bucket, e.g. B2/P3.
+
+    Safety rule:
+    - It only nudges B/P probability unless FULL_MARKOV_FINAL_OVERRIDE=1.
+    - Default is no hard override, so Road / Room / Foot / Dragon keep the road feel.
+    """
+    if not FULL_MARKOV_MODE:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "完整馬可夫關閉", "strength": 0.0}
+
+    n_total = len(non_tie)
+    if n_total < FULL_MARKOV_MIN_HISTORY:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "完整馬可夫資料不足", "strength": 0.0}
+
+    candidates: List[Dict[str, Any]] = []
+    order_min = max(1, FULL_MARKOV_ORDER_MIN)
+    order_max = max(order_min, FULL_MARKOV_ORDER_MAX)
+    alpha = max(0.01, FULL_MARKOV_ALPHA)
+    decay = _clamp(FULL_MARKOV_DECAY, 0.80, 1.00)
+
+    # 1) Multi-order suffix Markov.
+    for k in range(min(order_max, n_total - 1), order_min - 1, -1):
+        key = tuple(non_tie[-k:])
+        b_score = 0.0
+        p_score = 0.0
+        sample = 0
+        last_match_pos = -1
+
+        # Current tail has no known next hand, so stop before it.
+        for i in range(0, n_total - k):
+            if tuple(non_tie[i:i + k]) != key:
+                continue
+            nxt = non_tie[i + k]
+            # More recent observations in the same shoe get more influence.
+            age = max(0, n_total - (i + k))
+            w = decay ** age
+            if nxt == "B":
+                b_score += w
+            elif nxt == "P":
+                p_score += w
+            sample += 1
+            last_match_pos = i
+
+        if sample < FULL_MARKOV_MIN_SAMPLE:
+            continue
+
+        weighted_total = b_score + p_score
+        if weighted_total <= 0:
+            continue
+
+        b_rate = (b_score + alpha) / (weighted_total + 2.0 * alpha)
+        target = "B" if b_rate >= 0.5 else "P"
+        dominance = abs(b_rate - 0.5) * 2.0
+        sample_factor = min(1.0, sample / max(2.0, FULL_MARKOV_MIN_SAMPLE + 3.0))
+        order_factor = 0.84 + min(0.22, (k - order_min) * 0.045)
+        edge = FULL_MARKOV_EDGE * (0.68 + dominance * 0.42) * (0.70 + sample_factor * 0.30) * order_factor
+        edge = min(FULL_MARKOV_MAX_EDGE, max(0.016, edge))
+        strength = _clamp(0.105 + dominance * 0.105 + sample_factor * 0.070 + (k - order_min) * 0.012, 0.07, 0.32)
+        b, p = _bp_score(target, 0.5 + edge)
+        candidates.append({
+            "active": True,
+            "mode": "multi_order",
+            "order": k,
+            "B": b,
+            "P": p,
+            "label": f"完整馬可夫{k}階｜{''.join(key)}→{target}({sample})",
+            "strength": strength,
+            "target_side": target,
+            "edge": round(edge, 5),
+            "sample": sample,
+            "weighted_sample": round(weighted_total, 4),
+            "b_rate": round(b_rate, 4),
+            "key": "".join(key),
+            "last_match_pos": last_match_pos,
+        })
+
+    # 2) Run-state Markov: current side + current run length bucket.
+    if FULL_MARKOV_RUN_STATE_MODE:
+        current_side, current_len = _streak(non_tie)
+        if current_side and current_len >= 1:
+            current_bucket = _markov_run_bucket(current_len)
+            b_score = 0.0
+            p_score = 0.0
+            sample = 0
+            # j is the prefix length; non_tie[j] is the known next hand.
+            for j in range(1, n_total):
+                prefix = non_tie[:j]
+                s, ln = _streak(prefix)
+                if not s:
+                    continue
+                if s != current_side or _markov_run_bucket(ln) != current_bucket:
+                    continue
+                nxt = non_tie[j]
+                age = max(0, n_total - j)
+                w = decay ** age
+                if nxt == "B":
+                    b_score += w
+                elif nxt == "P":
+                    p_score += w
+                sample += 1
+
+            if sample >= FULL_MARKOV_MIN_SAMPLE:
+                weighted_total = b_score + p_score
+                if weighted_total > 0:
+                    b_rate = (b_score + alpha) / (weighted_total + 2.0 * alpha)
+                    target = "B" if b_rate >= 0.5 else "P"
+                    dominance = abs(b_rate - 0.5) * 2.0
+                    sample_factor = min(1.0, sample / max(2.0, FULL_MARKOV_MIN_SAMPLE + 3.0))
+                    edge = FULL_MARKOV_EDGE * (0.66 + dominance * 0.40) * (0.70 + sample_factor * 0.30) * FULL_MARKOV_RUN_WEIGHT
+                    edge = min(FULL_MARKOV_MAX_EDGE, max(0.014, edge))
+                    strength = _clamp(0.090 + dominance * 0.090 + sample_factor * 0.060, 0.06, 0.26)
+                    b, p = _bp_score(target, 0.5 + edge)
+                    candidates.append({
+                        "active": True,
+                        "mode": "run_state",
+                        "B": b,
+                        "P": p,
+                        "label": f"跑長馬可夫｜{current_side}{current_bucket}→{target}({sample})",
+                        "strength": strength,
+                        "target_side": target,
+                        "edge": round(edge, 5),
+                        "sample": sample,
+                        "weighted_sample": round(weighted_total, 4),
+                        "b_rate": round(b_rate, 4),
+                        "current_side": current_side,
+                        "current_len": current_len,
+                        "bucket": current_bucket,
+                    })
+
+    if not candidates:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "完整馬可夫未找到相同狀態", "strength": 0.0}
+
+    candidates.sort(key=lambda x: (float(x.get("strength", 0)), float(x.get("edge", 0))), reverse=True)
+    best = dict(candidates[0])
+
+    # If the top candidates agree, slightly strengthen the signal.
+    agree = [c for c in candidates[:4] if c.get("target_side") == best.get("target_side")]
+    if len(agree) >= 2:
+        best["secondary_label"] = agree[1].get("label")
+        best["strength"] = _clamp(float(best.get("strength", 0)) + 0.015 * min(2, len(agree) - 1), 0.0, 0.34)
+        best["edge"] = round(min(FULL_MARKOV_MAX_EDGE, float(best.get("edge", 0)) + 0.004 * min(2, len(agree) - 1)), 5)
+        b, p = _bp_score(str(best.get("target_side", "B")), 0.5 + float(best.get("edge", FULL_MARKOV_EDGE)))
+        best["B"], best["P"] = b, p
+
+    best["candidates"] = candidates[:4]
+    return best
+
+
 def _sequence_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     V17 Sequence Pattern Layer / 莊閒排列順序層.
@@ -3459,6 +3650,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     non_tie = _last_non_tie(history)
 
     markov = _transition_prob(non_tie)
+    full_markov = _full_markov_score(non_tie)
     road = _road_pattern_score(non_tie)
     sequence = _sequence_pattern_score(non_tie)
     recent = _recent_score(non_tie)
@@ -3498,6 +3690,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "runs_tail": run_data[-min(len(run_data), AI_RUNS_TAIL_LIMIT):] if AI_RUNS_TAIL_LIMIT > 0 else run_data,
         "current_streak": _streak(non_tie),
         "markov": markov,
+        "full_markov": full_markov,
         "road": road,
         "sequence": sequence,
         "recent": recent,
@@ -3534,6 +3727,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "break_rate": FOOT_ALIGN_BREAK_RATE,
             "over_rate": FOOT_ALIGN_OVER_RATE,
             "final_override": FOOT_ALIGN_FINAL_OVERRIDE,
+        },
+        "full_markov_config": {
+            "enabled": FULL_MARKOV_MODE,
+            "weight": FULL_MARKOV_WEIGHT,
+            "order_min": FULL_MARKOV_ORDER_MIN,
+            "order_max": FULL_MARKOV_ORDER_MAX,
+            "min_sample": FULL_MARKOV_MIN_SAMPLE,
+            "run_state_mode": FULL_MARKOV_RUN_STATE_MODE,
+            "final_override": FULL_MARKOV_FINAL_OVERRIDE,
         },
         "sequence_pattern_config": {
             "enabled": SEQUENCE_PATTERN_MODE,
@@ -3573,6 +3775,43 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 pass
 
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
+    # ----- V18 Full Markov Layer -----
+    # Multi-order Markov and run-state Markov only nudge B/P by default.
+    full_markov_adjusted = False
+    if isinstance(full_markov, dict) and full_markov.get("active"):
+        fm_b_side = float(full_markov.get("B", 0.5))
+        bp_total = max(0.001, 1 - tie_prob)
+        cur_b_side = _clamp(b_prob / bp_total, 0.001, 0.999)
+        local_gap = abs(cur_b_side - 0.5) * 2.0
+        fm_strength = _clamp(float(full_markov.get("strength", 0.0)), 0.0, 0.34)
+        blend = FULL_MARKOV_WEIGHT * (0.68 + min(0.32, fm_strength))
+        if chaos.get("active"):
+            blend *= FULL_MARKOV_CHAOS_FACTOR
+
+        fm_pick = "B" if fm_b_side >= 0.5 else "P"
+        cur_pick = "B" if cur_b_side >= 0.5 else "P"
+        if fm_pick != cur_pick and local_gap >= FULL_MARKOV_STRONG_LOCAL_GAP and not FULL_MARKOV_FINAL_OVERRIDE:
+            blend *= 0.50
+        blend = _clamp(blend, 0.0, 0.24)
+
+        new_b_side = cur_b_side * (1 - blend) + fm_b_side * blend
+        if FULL_MARKOV_FINAL_OVERRIDE and fm_pick in {"B", "P"}:
+            raw_edge = min(FULL_MARKOV_MAX_EDGE, max(FULL_MARKOV_EDGE, float(full_markov.get("edge", FULL_MARKOV_EDGE))))
+            if fm_pick == "B":
+                new_b_side = 0.5 + raw_edge
+            else:
+                new_b_side = 0.5 - raw_edge
+
+        b_prob = new_b_side * bp_total
+        p_prob = (1 - new_b_side) * bp_total
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+        full_markov["adjusted"] = True
+        full_markov["blend"] = round(blend, 5)
+        full_markov["local_gap_before"] = round(local_gap, 5)
+        full_markov_adjusted = True
+    else:
+        full_markov_adjusted = False
 
     # ----- 強龍保護：當明顯有效長龍時，避免規律層 override 干擾 -----
     current_side, current_len = _streak(non_tie)
@@ -3816,6 +4055,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if early_dragon_guard.get("B", 0.5) >= early_dragon_guard.get("P", 0.5) else "P")
     if 'room_break_to_chop' in locals() and isinstance(room_break_to_chop, dict) and room_break_to_chop.get("active"):
         votes.append("B" if room_break_to_chop.get("B", 0.5) >= room_break_to_chop.get("P", 0.5) else "P")
+    if isinstance(full_markov, dict) and full_markov.get("active"):
+        votes.append("B" if full_markov.get("B", 0.5) >= full_markov.get("P", 0.5) else "P")
     if isinstance(sequence, dict) and sequence.get("active"):
         votes.append("B" if sequence.get("B", 0.5) >= sequence.get("P", 0.5) else "P")
     if 'road_room_pattern' in locals() and isinstance(road_room_pattern, dict) and road_room_pattern.get("active"):
@@ -3862,6 +4103,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, ROOM_BREAK_CONF_CAP)
         if not chaos.get("active"):
             level = "房型斷點警戒"
+    if isinstance(full_markov, dict) and full_markov.get("active") and full_markov.get("adjusted"):
+        conf = min(conf, FULL_MARKOV_CONF_CAP)
+        if not chaos.get("active"):
+            level = "完整馬可夫校準"
     if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
         conf = min(conf, AFTER_TIE_CONF_CAP)
         level = "和局後安全觀察"
@@ -3894,6 +4139,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{room_break_to_chop.get('label')}({int(float(room_break_to_chop.get('score', 0))*100)}%)")
         if room_break_to_chop.get("adjusted"):
             reason_parts.append("房型斷點轉單跳")
+    if isinstance(full_markov, dict) and full_markov.get("active"):
+        reason_parts.insert(0, f"{full_markov.get('label')}({int(float(full_markov.get('strength', 0))*100)}%)")
+        if full_markov.get("adjusted"):
+            reason_parts.append("完整馬可夫校準")
+        if full_markov.get("secondary_label"):
+            reason_parts.append(f"馬可夫副訊號:{full_markov.get('secondary_label')}")
     if isinstance(sequence, dict) and sequence.get("active"):
         reason_parts.insert(0, f"{sequence.get('label')}({int(float(sequence.get('strength', 0))*100)}%)")
         if sequence.get("adjusted"):
@@ -3914,6 +4165,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.append("房型規律校準")
     if 'foot_alignment_final_override' in locals() and foot_alignment_final_override:
         reason_parts.append("對應齊腳校準")
+    if isinstance(full_markov, dict) and full_markov.get("active") and FULL_MARKOV_FINAL_OVERRIDE:
+        reason_parts.append("完整馬可夫硬覆蓋")
     if isinstance(sequence, dict) and sequence.get("active") and SEQUENCE_FINAL_OVERRIDE:
         reason_parts.append("排列順序硬覆蓋")
     if road.get("secondary_label"):
@@ -3925,7 +4178,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     return {
         "ok": True,
-        "model_version": "V17 Classic Lite + Sequence",
+        "model_version": "V18 Classic Lite + Full Markov + Sequence",
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -3966,6 +4219,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "road_action": road.get("road_action", ""),
         },
         "chaos": chaos,
+        "full_markov": full_markov,
         "sequence_pattern": sequence,
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
