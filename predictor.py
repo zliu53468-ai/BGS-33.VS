@@ -7,10 +7,10 @@ from typing import Any, Dict, List, Tuple
 from deepseek_client import DeepSeekClient
 
 # ============================================================
-# V17 Classic / Lite + Sequence Pattern
+# V19 Classic / Lite + Full Markov + Regime/Dynamic/Bayes
 # 目標：回到百家樂核心牌路判斷，並補強莊閒排列順序捕捉。
 # 主判斷保留 Road / Room / Foot / Chop / Dragon / After-Tie。
-# 新增 Sequence Pattern Layer：只輕量加權，不硬翻方向。
+# 新增 Sequence Pattern Layer、Full Markov、Regime Switch、Dynamic Weight、Bayesian Calibration。
 # AI、全靴前中後、全局反轉、多數邊、Chaos 預設只做輕量保護或關閉硬覆蓋。
 # ============================================================
 
@@ -20,11 +20,11 @@ P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
 # Main ensemble weights.
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.16"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.46"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.08"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.05"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.12"))
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.14"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.30"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.06"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.06"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.09"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.02"))
 AI_BLEND = float(os.getenv("AI_BLEND", "0.06"))
 
@@ -66,17 +66,17 @@ MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "16"))
 # run-length state Markov. This is still a light calibration layer; by default
 # it does not hard-override Road / Room / Foot / Dragon.
 FULL_MARKOV_MODE = os.getenv("FULL_MARKOV_MODE", "1") == "1"
-FULL_MARKOV_WEIGHT = float(os.getenv("FULL_MARKOV_WEIGHT", "0.18"))
+FULL_MARKOV_WEIGHT = float(os.getenv("FULL_MARKOV_WEIGHT", "0.25"))
 FULL_MARKOV_ORDER_MIN = int(os.getenv("FULL_MARKOV_ORDER_MIN", "1"))
 FULL_MARKOV_ORDER_MAX = int(os.getenv("FULL_MARKOV_ORDER_MAX", "5"))
 FULL_MARKOV_MIN_HISTORY = int(os.getenv("FULL_MARKOV_MIN_HISTORY", "10"))
 FULL_MARKOV_MIN_SAMPLE = int(os.getenv("FULL_MARKOV_MIN_SAMPLE", "2"))
 FULL_MARKOV_ALPHA = float(os.getenv("FULL_MARKOV_ALPHA", "1.4"))
-FULL_MARKOV_EDGE = float(os.getenv("FULL_MARKOV_EDGE", "0.040"))
-FULL_MARKOV_MAX_EDGE = float(os.getenv("FULL_MARKOV_MAX_EDGE", "0.065"))
-FULL_MARKOV_DECAY = float(os.getenv("FULL_MARKOV_DECAY", "0.960"))
+FULL_MARKOV_EDGE = float(os.getenv("FULL_MARKOV_EDGE", "0.042"))
+FULL_MARKOV_MAX_EDGE = float(os.getenv("FULL_MARKOV_MAX_EDGE", "0.074"))
+FULL_MARKOV_DECAY = float(os.getenv("FULL_MARKOV_DECAY", "0.965"))
 FULL_MARKOV_RUN_STATE_MODE = os.getenv("FULL_MARKOV_RUN_STATE_MODE", "1") == "1"
-FULL_MARKOV_RUN_WEIGHT = float(os.getenv("FULL_MARKOV_RUN_WEIGHT", "0.45"))
+FULL_MARKOV_RUN_WEIGHT = float(os.getenv("FULL_MARKOV_RUN_WEIGHT", "0.42"))
 FULL_MARKOV_FINAL_OVERRIDE = os.getenv("FULL_MARKOV_FINAL_OVERRIDE", "0") == "1"
 FULL_MARKOV_CONF_CAP = float(os.getenv("FULL_MARKOV_CONF_CAP", "0.50"))
 FULL_MARKOV_STRONG_LOCAL_GAP = float(os.getenv("FULL_MARKOV_STRONG_LOCAL_GAP", "0.055"))
@@ -315,14 +315,14 @@ AFTER_TIE_SCORE_BONUS = float(os.getenv("AFTER_TIE_SCORE_BONUS", "0.080"))
 # Full-shoe controller for 60~70-round baccarat tables. It compares early/mid/recent
 # shoe phases and prevents local short-window signals from overpowering the shoe's
 # dominant road structure too easily.
-GLOBAL_SHOE_CONTEXT_MODE = os.getenv("GLOBAL_SHOE_CONTEXT_MODE", "0") == "1"
+GLOBAL_SHOE_CONTEXT_MODE = os.getenv("GLOBAL_SHOE_CONTEXT_MODE", "1") == "1"
 GLOBAL_SHOE_MIN_HISTORY = int(os.getenv("GLOBAL_SHOE_MIN_HISTORY", "18"))
 GLOBAL_SHOE_WINDOW = int(os.getenv("GLOBAL_SHOE_WINDOW", "24"))
 GLOBAL_SHOE_CONTEXT_TRIGGER = float(os.getenv("GLOBAL_SHOE_CONTEXT_TRIGGER", "0.58"))
 GLOBAL_SHOE_STRONG_TRIGGER = float(os.getenv("GLOBAL_SHOE_STRONG_TRIGGER", "0.74"))
-GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.020"))
-GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.034"))
-GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.08"))
+GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.022"))
+GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.036"))
+GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.10"))
 GLOBAL_SHOE_CONF_CAP = float(os.getenv("GLOBAL_SHOE_CONF_CAP", "0.50"))
 GLOBAL_SHOE_STRONG_CONF_CAP = float(os.getenv("GLOBAL_SHOE_STRONG_CONF_CAP", "0.42"))
 GLOBAL_SHOE_PHASE_SPLIT = int(os.getenv("GLOBAL_SHOE_PHASE_SPLIT", "3"))
@@ -381,6 +381,39 @@ SEQUENCE_FINAL_OVERRIDE = os.getenv("SEQUENCE_FINAL_OVERRIDE", "0") == "1"
 SEQUENCE_CONF_CAP = float(os.getenv("SEQUENCE_CONF_CAP", "0.50"))
 SEQUENCE_CHAOS_FACTOR = float(os.getenv("SEQUENCE_CHAOS_FACTOR", "0.70"))
 SEQUENCE_STRONG_LOCAL_GAP = float(os.getenv("SEQUENCE_STRONG_LOCAL_GAP", "0.050"))
+
+
+# V19 Regime Switch Model / 路型狀態切換模型:
+# Detects the current shoe regime first, then lightly shifts which model should speak louder.
+# It keeps Final Override off; it only changes weights/blends so the model keeps baccarat road feel.
+REGIME_SWITCH_MODE = os.getenv("REGIME_SWITCH_MODE", "1") == "1"
+REGIME_WINDOW = int(os.getenv("REGIME_WINDOW", "18"))
+REGIME_MIN_CONFIDENCE = float(os.getenv("REGIME_MIN_CONFIDENCE", "0.58"))
+REGIME_WEIGHT = float(os.getenv("REGIME_WEIGHT", "0.18"))
+REGIME_MAX_SHIFT = float(os.getenv("REGIME_MAX_SHIFT", "0.12"))
+REGIME_FINAL_OVERRIDE = os.getenv("REGIME_FINAL_OVERRIDE", "0") == "1"
+REGIME_CHAOS_RELIEF = float(os.getenv("REGIME_CHAOS_RELIEF", "0.70"))
+
+# V19 Bayesian Calibration / 貝葉斯校準模型:
+# Shrinks low-sample Markov/sequence signals back toward 50/50 so short coincidences do not dominate.
+BAYES_CALIBRATION_MODE = os.getenv("BAYES_CALIBRATION_MODE", "1") == "1"
+BAYES_ALPHA = float(os.getenv("BAYES_ALPHA", "2.0"))
+BAYES_MIN_SAMPLE = int(os.getenv("BAYES_MIN_SAMPLE", "3"))
+BAYES_SHRINK = float(os.getenv("BAYES_SHRINK", "0.62"))
+BAYES_MAX_EDGE = float(os.getenv("BAYES_MAX_EDGE", "0.042"))
+BAYES_APPLY_FULL_MARKOV = os.getenv("BAYES_APPLY_FULL_MARKOV", "1") == "1"
+BAYES_APPLY_SEQUENCE = os.getenv("BAYES_APPLY_SEQUENCE", "1") == "1"
+
+# V19 Dynamic Ensemble Weight / 動態權重模型:
+# Backtests recent in-shoe component picks and nudges weights toward the components that are currently fitting.
+DYNAMIC_WEIGHT_MODE = os.getenv("DYNAMIC_WEIGHT_MODE", "1") == "1"
+DYNAMIC_WEIGHT_WINDOW = int(os.getenv("DYNAMIC_WEIGHT_WINDOW", "14"))
+DYNAMIC_WEIGHT_MIN_SAMPLE = int(os.getenv("DYNAMIC_WEIGHT_MIN_SAMPLE", "6"))
+DYNAMIC_WEIGHT_MAX_SHIFT = float(os.getenv("DYNAMIC_WEIGHT_MAX_SHIFT", "0.08"))
+DYNAMIC_WEIGHT_DECAY = float(os.getenv("DYNAMIC_WEIGHT_DECAY", "0.92"))
+DYNAMIC_WEIGHT_STEP = float(os.getenv("DYNAMIC_WEIGHT_STEP", "0.025"))
+DYNAMIC_WEIGHT_APPLY_FULL_MARKOV = os.getenv("DYNAMIC_WEIGHT_APPLY_FULL_MARKOV", "1") == "1"
+DYNAMIC_WEIGHT_APPLY_SEQUENCE = os.getenv("DYNAMIC_WEIGHT_APPLY_SEQUENCE", "1") == "1"
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -3507,6 +3540,292 @@ def _after_tie_safe_guard(history: List[str], b_prob: float, p_prob: float, tie_
     })
     return base
 
+
+def _regime_pattern_consistency(lengths: List[int], pattern: List[int]) -> float:
+    if not lengths or not pattern:
+        return 0.0
+    best = 0.0
+    max_eval = min(len(lengths), max(4, REGIME_WINDOW))
+    tail = lengths[-max_eval:]
+    for offset in range(len(pattern)):
+        score = 0.0
+        for i, val in enumerate(tail):
+            exp = pattern[(i + offset) % len(pattern)]
+            if val == exp:
+                score += 1.0
+            elif abs(val - exp) == 1 and val <= 3:
+                score += 0.38
+        best = max(best, score / max(1, len(tail)))
+    return best
+
+
+def _regime_switch_context(non_tie: List[str], road: Dict[str, Any], sequence: Dict[str, Any], full_markov: Dict[str, Any], chaos: Dict[str, Any]) -> Dict[str, Any]:
+    """V19 Regime Switch: identify the current road state before choosing which model to trust."""
+    if not REGIME_SWITCH_MODE or len(non_tie) < max(8, REGIME_WINDOW // 2):
+        return {"active": False, "regime": "insufficient", "confidence": 0.0, "weight_factors": {}, "module_factors": {}, "label": "路型狀態資料不足"}
+
+    window = max(8, REGIME_WINDOW)
+    recent = non_tie[-min(len(non_tie), window):]
+    switch_rate = _window_switch_rate(recent)
+    runs = _runs(recent)
+    run_lengths = [n for _s, n in runs]
+    current_side, current_len = _streak(non_tie)
+    b_rate = recent.count("B") / len(recent) if recent else 0.5
+    side_rate = max(b_rate, 1.0 - b_rate)
+    room_12 = _regime_pattern_consistency(run_lengths, [1, 2])
+    room_21 = _regime_pattern_consistency(run_lengths, [2, 1])
+    double_chop_rate = _safe_div(sum(1 for n in run_lengths[-6:] if n == 2), min(6, len(run_lengths)), 0.0)
+
+    regime = "neutral"
+    conf = 0.50
+    weight_factors = {"markov": 1.00, "road": 1.00, "streak": 1.00, "balance": 1.00, "recent": 1.00}
+    module_factors = {"full_markov": 1.00, "sequence": 1.00, "global_shoe": 1.00, "room": 1.00, "foot": 1.00, "dragon": 1.00}
+    reasons: List[str] = []
+
+    if chaos.get("strong"):
+        regime = "chaos"
+        conf = max(conf, 0.66)
+        reasons.append("強亂路")
+        weight_factors.update({"markov": 0.92, "road": 0.82, "streak": 0.82, "balance": 1.08, "recent": 1.12})
+        module_factors.update({"full_markov": 0.82, "sequence": 0.86, "global_shoe": 0.80})
+    elif switch_rate >= 0.74:
+        regime = "single_chop"
+        conf = max(conf, min(0.84, 0.55 + (switch_rate - 0.70) * 1.35))
+        reasons.append("單跳路")
+        weight_factors.update({"markov": 1.06, "road": 1.06, "streak": 0.86, "balance": 0.96, "recent": 1.00})
+        module_factors.update({"full_markov": 1.08, "sequence": 1.22, "global_shoe": 0.90})
+    elif double_chop_rate >= 0.50:
+        regime = "double_chop"
+        conf = max(conf, 0.60 + min(0.18, (double_chop_rate - 0.50) * 0.45))
+        reasons.append("雙跳路")
+        weight_factors.update({"markov": 1.02, "road": 1.12, "streak": 0.88, "balance": 0.96, "recent": 0.96})
+        module_factors.update({"full_markov": 1.00, "sequence": 1.16, "room": 1.24, "foot": 1.08})
+    elif max(room_12, room_21) >= 0.62:
+        regime = "room_12" if room_12 >= room_21 else "room_21"
+        conf = max(conf, max(room_12, room_21))
+        reasons.append("房型節奏")
+        weight_factors.update({"markov": 0.96, "road": 1.14, "streak": 0.90, "balance": 0.96, "recent": 0.94})
+        module_factors.update({"full_markov": 0.98, "sequence": 1.12, "room": 1.28, "foot": 1.15, "global_shoe": 0.96})
+    elif current_len >= DRAGON_STRONG_LEN:
+        regime = "dragon"
+        conf = max(conf, min(0.82, 0.58 + (current_len - DRAGON_STRONG_LEN) * 0.055))
+        reasons.append(f"{current_side}{current_len}龍路")
+        weight_factors.update({"markov": 1.00, "road": 1.15, "streak": 1.06, "balance": 0.92, "recent": 0.94})
+        module_factors.update({"full_markov": 1.06, "sequence": 0.88, "dragon": 1.22, "global_shoe": 0.98})
+    elif side_rate >= 0.64:
+        regime = "side_dominance"
+        conf = max(conf, min(0.78, 0.55 + (side_rate - 0.60) * 0.90))
+        reasons.append("單邊偏重")
+        weight_factors.update({"markov": 0.94, "road": 0.96, "streak": 0.88, "balance": 1.20, "recent": 0.90})
+        module_factors.update({"full_markov": 0.86, "sequence": 0.92, "global_shoe": 0.82})
+    else:
+        reasons.append("中性路型")
+        conf = max(conf, 0.52)
+
+    # Keep regime switching light. It changes weight, not the final pick.
+    if conf < REGIME_MIN_CONFIDENCE:
+        weight_factors = {k: 1.0 for k in weight_factors}
+        module_factors = {k: 1.0 for k in module_factors}
+
+    max_shift = max(0.0, REGIME_MAX_SHIFT)
+    scale = max(0.0, REGIME_WEIGHT) / 0.18 if REGIME_WEIGHT > 0 else 0.0
+    if chaos.get("active"):
+        scale *= REGIME_CHAOS_RELIEF
+
+    def _limit_factor(v: float) -> float:
+        return _clamp(1.0 + (v - 1.0) * scale, 1.0 - max_shift, 1.0 + max_shift)
+
+    weight_factors = {k: _limit_factor(v) for k, v in weight_factors.items()}
+    module_factors = {k: _limit_factor(v) for k, v in module_factors.items()}
+
+    return {
+        "active": conf >= REGIME_MIN_CONFIDENCE,
+        "regime": regime,
+        "confidence": round(conf, 3),
+        "score": round(conf, 3),
+        "label": "路型切換｜" + "+".join(reasons[:2]),
+        "switch_rate": round(switch_rate, 3),
+        "side_rate": round(side_rate, 3),
+        "current_streak": (current_side, current_len),
+        "room_12": round(room_12, 3),
+        "room_21": round(room_21, 3),
+        "double_chop_rate": round(double_chop_rate, 3),
+        "weight_factors": weight_factors,
+        "module_factors": module_factors,
+    }
+
+
+def _bayes_signal_sample(signal: Dict[str, Any]) -> float:
+    vals: List[float] = []
+    for key in ("sample", "weighted_sample"):
+        try:
+            vals.append(float(signal.get(key, 0)))
+        except Exception:
+            pass
+    for c in signal.get("candidates", []) or []:
+        if isinstance(c, dict):
+            for key in ("sample", "weighted_sample"):
+                try:
+                    vals.append(float(c.get(key, 0)))
+                except Exception:
+                    pass
+    return max(vals) if vals else 0.0
+
+
+def _bayes_calibrate_signal(signal: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """V19 Bayesian Calibration: shrink low-sample directional edges toward neutral."""
+    if not BAYES_CALIBRATION_MODE or not isinstance(signal, dict) or not signal.get("active"):
+        return signal
+    if name == "full_markov" and not BAYES_APPLY_FULL_MARKOV:
+        return signal
+    if name == "sequence" and not BAYES_APPLY_SEQUENCE:
+        return signal
+
+    sample = _bayes_signal_sample(signal)
+    if sample <= 0:
+        return signal
+
+    b_side = _clamp(float(signal.get("B", 0.5)), 0.001, 0.999)
+    sign = 1.0 if b_side >= 0.5 else -1.0
+    raw_edge = abs(b_side - 0.5)
+    alpha = max(0.01, BAYES_ALPHA)
+    evidence = sample / (sample + 2.0 * alpha)
+    if sample < BAYES_MIN_SAMPLE:
+        evidence *= max(0.20, sample / max(1.0, float(BAYES_MIN_SAMPLE)))
+
+    shrink = _clamp(BAYES_SHRINK, 0.0, 0.95) * (1.0 - evidence)
+    new_edge = min(BAYES_MAX_EDGE, raw_edge * (1.0 - shrink))
+    new_b = 0.5 + sign * new_edge
+    new_b = _clamp(new_b, 0.001, 0.999)
+    out = dict(signal)
+    out["B"] = new_b
+    out["P"] = 1.0 - new_b
+    out["bayes_calibrated"] = True
+    out["bayes_sample"] = round(sample, 3)
+    out["bayes_evidence"] = round(evidence, 3)
+    out["bayes_edge_before"] = round(raw_edge, 5)
+    out["bayes_edge_after"] = round(new_edge, 5)
+    out["strength"] = _clamp(float(out.get("strength", 0.0)) * (0.86 + 0.14 * evidence), 0.0, 0.34)
+    if out.get("label"):
+        out["label"] = str(out.get("label")) + "｜貝葉斯校準"
+    return out
+
+
+def _dynamic_pick_accuracy(non_tie: List[str], model_name: str, start_i: int, decay: float) -> Dict[str, Any]:
+    total = 0.0
+    hit = 0.0
+    sample = 0
+    details: List[str] = []
+    n = len(non_tie)
+    for i in range(max(2, start_i), n):
+        prefix = non_tie[:i]
+        actual = non_tie[i]
+        pred = None
+        active = True
+        try:
+            if model_name == "markov":
+                s = _transition_prob(prefix)
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+            elif model_name == "road":
+                s = _road_pattern_score(prefix)
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+            elif model_name == "streak":
+                s = _streak_score(prefix)
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+            elif model_name == "recent":
+                s = _recent_score(prefix)
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+            elif model_name == "full_markov":
+                s = _full_markov_score(prefix)
+                active = bool(s.get("active"))
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+            elif model_name == "sequence":
+                s = _sequence_pattern_score(prefix)
+                active = bool(s.get("active"))
+                pred = "B" if s.get("B", 0.5) >= s.get("P", 0.5) else "P"
+        except Exception:
+            active = False
+        if pred not in {"B", "P"} or not active:
+            continue
+        age = max(0, n - 1 - i)
+        w = decay ** age
+        total += w
+        hit += w if pred == actual else 0.0
+        sample += 1
+        if len(details) < 3:
+            details.append(f"{pred}{'✓' if pred == actual else '×'}{actual}")
+    acc = hit / total if total > 0 else 0.5
+    return {"sample": sample, "weighted_sample": round(total, 3), "accuracy": round(acc, 3), "details": details}
+
+
+def _dynamic_ensemble_weight_context(non_tie: List[str]) -> Dict[str, Any]:
+    """V19 Dynamic Ensemble Weight: recent in-shoe backtest based model weighting."""
+    if not DYNAMIC_WEIGHT_MODE or len(non_tie) < max(10, DYNAMIC_WEIGHT_MIN_SAMPLE + 3):
+        return {"active": False, "label": "動態權重資料不足", "weight_factors": {}, "module_factors": {}, "scores": {}}
+
+    window = max(DYNAMIC_WEIGHT_MIN_SAMPLE, DYNAMIC_WEIGHT_WINDOW)
+    start_i = max(2, len(non_tie) - window)
+    decay = _clamp(DYNAMIC_WEIGHT_DECAY, 0.75, 1.0)
+    model_names = ["markov", "road", "streak", "recent", "full_markov", "sequence"]
+    scores = {m: _dynamic_pick_accuracy(non_tie, m, start_i, decay) for m in model_names}
+    max_shift = max(0.0, DYNAMIC_WEIGHT_MAX_SHIFT)
+
+    def factor_for(m: str) -> float:
+        sc = scores.get(m, {})
+        if int(sc.get("sample", 0)) < DYNAMIC_WEIGHT_MIN_SAMPLE:
+            return 1.0
+        acc = float(sc.get("accuracy", 0.5))
+        # Convert recent fit into a small multiplier. Step is a sensitivity knob.
+        raw_shift = (acc - 0.5) * (DYNAMIC_WEIGHT_STEP / 0.025) * 0.36
+        return _clamp(1.0 + raw_shift, 1.0 - max_shift, 1.0 + max_shift)
+
+    weight_factors = {
+        "markov": factor_for("markov"),
+        "road": factor_for("road"),
+        "streak": factor_for("streak"),
+        "recent": factor_for("recent"),
+        "balance": 1.0,
+    }
+    module_factors = {
+        "full_markov": factor_for("full_markov") if DYNAMIC_WEIGHT_APPLY_FULL_MARKOV else 1.0,
+        "sequence": factor_for("sequence") if DYNAMIC_WEIGHT_APPLY_SEQUENCE else 1.0,
+    }
+    active = any(abs(v - 1.0) >= 0.012 for v in list(weight_factors.values()) + list(module_factors.values()))
+    best_name = max(scores.keys(), key=lambda k: (float(scores[k].get("accuracy", 0.5)), int(scores[k].get("sample", 0))))
+    return {
+        "active": active,
+        "label": f"動態權重｜近期較適合:{best_name}",
+        "score": round(float(scores[best_name].get("accuracy", 0.5)), 3),
+        "best_model": best_name,
+        "weight_factors": weight_factors,
+        "module_factors": module_factors,
+        "scores": scores,
+    }
+
+
+def _apply_v19_weight_contexts(weights: Dict[str, float], regime: Dict[str, Any], dynamic: Dict[str, Any]) -> Dict[str, float]:
+    out = dict(weights)
+    for ctx in (regime, dynamic):
+        factors = ctx.get("weight_factors", {}) if isinstance(ctx, dict) else {}
+        for k, f in factors.items():
+            if k in out:
+                out[k] *= _clamp(float(f), 0.70, 1.30)
+    # Avoid zero / degenerate sums.
+    for k in list(out.keys()):
+        out[k] = max(0.001, float(out[k]))
+    return out
+
+
+def _module_factor(regime: Dict[str, Any], dynamic: Dict[str, Any], key: str) -> float:
+    f = 1.0
+    for ctx in (regime, dynamic):
+        factors = ctx.get("module_factors", {}) if isinstance(ctx, dict) else {}
+        try:
+            f *= float(factors.get(key, 1.0))
+        except Exception:
+            pass
+    return _clamp(f, 0.70, 1.30)
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
@@ -3658,7 +3977,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     streak = _streak_score(non_tie)
     run_data = _runs(non_tie)
     chaos = _chaos_regime_score(non_tie, history)
+
+    # ----- V19 Bayesian / Regime / Dynamic contexts -----
+    full_markov = _bayes_calibrate_signal(full_markov, "full_markov")
+    sequence = _bayes_calibrate_signal(sequence, "sequence")
+    regime_context = _regime_switch_context(non_tie, road, sequence, full_markov, chaos)
+    dynamic_weight_context = _dynamic_ensemble_weight_context(non_tie)
+
     weights = _effective_weights(chaos)
+    weights = _apply_v19_weight_contexts(weights, regime_context, dynamic_weight_context)
 
     total_w = weights["markov"] + weights["road"] + weights["streak"] + weights["balance"] + weights["recent"]
     b_side = (
@@ -3697,6 +4024,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "balance": balance,
         "streak": streak,
         "chaos": chaos,
+        "regime_switch": regime_context,
+        "dynamic_weight": dynamic_weight_context,
         "effective_weights": {k: round(v, 5) for k, v in weights.items()},
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
         "ai_full_history_payload": _ai_full_history_payload(history, non_tie, run_data) if AI_FULL_HISTORY_MODE else {},
@@ -3746,6 +4075,17 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "weight": SEQUENCE_WEIGHT,
             "final_override": SEQUENCE_FINAL_OVERRIDE,
         },
+        "v19_regime_dynamic_bayes_config": {
+            "regime_switch_mode": REGIME_SWITCH_MODE,
+            "regime_window": REGIME_WINDOW,
+            "regime_weight": REGIME_WEIGHT,
+            "bayes_calibration_mode": BAYES_CALIBRATION_MODE,
+            "bayes_alpha": BAYES_ALPHA,
+            "bayes_shrink": BAYES_SHRINK,
+            "dynamic_weight_mode": DYNAMIC_WEIGHT_MODE,
+            "dynamic_weight_window": DYNAMIC_WEIGHT_WINDOW,
+            "dynamic_weight_max_shift": DYNAMIC_WEIGHT_MAX_SHIFT,
+        },
         "v14_context_config": {
             "global_shoe_context_mode": GLOBAL_SHOE_CONTEXT_MODE,
             "global_shoe_window": GLOBAL_SHOE_WINDOW,
@@ -3786,6 +4126,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         local_gap = abs(cur_b_side - 0.5) * 2.0
         fm_strength = _clamp(float(full_markov.get("strength", 0.0)), 0.0, 0.34)
         blend = FULL_MARKOV_WEIGHT * (0.68 + min(0.32, fm_strength))
+        fm_module_factor = _module_factor(regime_context, dynamic_weight_context, "full_markov")
+        blend *= fm_module_factor
         if chaos.get("active"):
             blend *= FULL_MARKOV_CHAOS_FACTOR
 
@@ -3808,6 +4150,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         full_markov["adjusted"] = True
         full_markov["blend"] = round(blend, 5)
+        full_markov["module_factor"] = round(fm_module_factor, 5)
         full_markov["local_gap_before"] = round(local_gap, 5)
         full_markov_adjusted = True
     else:
@@ -3965,6 +4308,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         local_gap = abs(cur_b_side - 0.5) * 2.0
         seq_strength = _clamp(float(sequence.get("strength", 0.0)), 0.0, 0.30)
         blend = SEQUENCE_WEIGHT * (0.70 + min(0.30, seq_strength))
+        seq_module_factor = _module_factor(regime_context, dynamic_weight_context, "sequence")
+        blend *= seq_module_factor
         if chaos.get("active"):
             blend *= SEQUENCE_CHAOS_FACTOR
         # If the current local road is already very clear and sequence points the other way,
@@ -3989,6 +4334,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         sequence["adjusted"] = True
         sequence["blend"] = round(blend, 5)
+        sequence["module_factor"] = round(seq_module_factor, 5)
         sequence["local_gap_before"] = round(local_gap, 5)
         sequence_adjusted = True
     else:
@@ -4115,6 +4461,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{chaos.get('label')}({int(float(chaos.get('score', 0))*100)}%)")
         if LOW_CONFIDENCE_MINBET:
             reason_parts.append("建議最小注")
+    if isinstance(regime_context, dict) and regime_context.get("active"):
+        reason_parts.insert(0, f"{regime_context.get('label')}({int(float(regime_context.get('score', 0))*100)}%)")
+        reason_parts.append(f"路型:{regime_context.get('regime')}")
+    if isinstance(dynamic_weight_context, dict) and dynamic_weight_context.get("active"):
+        reason_parts.append(f"動態權重:{dynamic_weight_context.get('best_model')}")
     if majority_guard.get("active") and majority_guard.get("adjusted"):
         reason_parts.insert(0, f"{majority_guard.get('label')}({int(float(majority_guard.get('score', 0))*100)}%)")
         if majority_guard.get("forced"):
@@ -4143,12 +4494,16 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{full_markov.get('label')}({int(float(full_markov.get('strength', 0))*100)}%)")
         if full_markov.get("adjusted"):
             reason_parts.append("完整馬可夫校準")
+        if full_markov.get("bayes_calibrated"):
+            reason_parts.append("馬可夫貝葉斯收斂")
         if full_markov.get("secondary_label"):
             reason_parts.append(f"馬可夫副訊號:{full_markov.get('secondary_label')}")
     if isinstance(sequence, dict) and sequence.get("active"):
         reason_parts.insert(0, f"{sequence.get('label')}({int(float(sequence.get('strength', 0))*100)}%)")
         if sequence.get("adjusted"):
             reason_parts.append("莊閒排列順序校準")
+        if sequence.get("bayes_calibrated"):
+            reason_parts.append("排列貝葉斯收斂")
     if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
         reason_parts.insert(0, f"{after_tie_safe.get('label')}({int(float(after_tie_safe.get('score', 0))*100)}%)")
         if AFTER_TIE_FORCE_MINBET:
@@ -4178,7 +4533,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     return {
         "ok": True,
-        "model_version": "V18 Classic Lite + Full Markov + Sequence",
+        "model_version": "V19 Full Markov + Global Shoe + Regime Switch + Dynamic Weight + Bayes",
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -4191,6 +4546,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recommend_text": {"B": "莊", "P": "閒", "T": "和"}[recommend],
         "confidence": round(conf, 3),
         "signal_level": level,
+        "regime": regime_context.get("regime") if isinstance(regime_context, dict) else "",
+        "dynamic_best_model": dynamic_weight_context.get("best_model") if isinstance(dynamic_weight_context, dict) else "",
         "bet_mode": "最小注" if (
             (chaos.get("active") and LOW_CONFIDENCE_MINBET)
             or (majority_guard.get("active") and majority_guard.get("adjusted"))
