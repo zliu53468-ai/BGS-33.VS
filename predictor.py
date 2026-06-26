@@ -282,6 +282,59 @@ AFTER_TIE_REVERSAL_EDGE = float(os.getenv("AFTER_TIE_REVERSAL_EDGE", "0.026"))
 AFTER_TIE_SCORE_BONUS = float(os.getenv("AFTER_TIE_SCORE_BONUS", "0.080"))
 
 
+# V14 Global Shoe Context Mode:
+# Full-shoe controller for 60~70-round baccarat tables. It compares early/mid/recent
+# shoe phases and prevents local short-window signals from overpowering the shoe's
+# dominant road structure too easily.
+GLOBAL_SHOE_CONTEXT_MODE = os.getenv("GLOBAL_SHOE_CONTEXT_MODE", "1") == "1"
+GLOBAL_SHOE_MIN_HISTORY = int(os.getenv("GLOBAL_SHOE_MIN_HISTORY", "18"))
+GLOBAL_SHOE_WINDOW = int(os.getenv("GLOBAL_SHOE_WINDOW", "24"))
+GLOBAL_SHOE_CONTEXT_TRIGGER = float(os.getenv("GLOBAL_SHOE_CONTEXT_TRIGGER", "0.50"))
+GLOBAL_SHOE_STRONG_TRIGGER = float(os.getenv("GLOBAL_SHOE_STRONG_TRIGGER", "0.66"))
+GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.036"))
+GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.058"))
+GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.18"))
+GLOBAL_SHOE_CONF_CAP = float(os.getenv("GLOBAL_SHOE_CONF_CAP", "0.50"))
+GLOBAL_SHOE_STRONG_CONF_CAP = float(os.getenv("GLOBAL_SHOE_STRONG_CONF_CAP", "0.42"))
+GLOBAL_SHOE_PHASE_SPLIT = int(os.getenv("GLOBAL_SHOE_PHASE_SPLIT", "3"))
+GLOBAL_SHOE_ALLOW_RECENT_SHIFT = os.getenv("GLOBAL_SHOE_ALLOW_RECENT_SHIFT", "1") == "1"
+
+# V14 Early Dragon Guard:
+# Prevents blindly following very early 2~4 hand dragons unless there is room/foot/mirror
+# support or strong full-shoe evidence. This is separate from long-dragon reversal.
+EARLY_DRAGON_GUARD = os.getenv("EARLY_DRAGON_GUARD", "1") == "1"
+EARLY_DRAGON_WARN_LEN = int(os.getenv("EARLY_DRAGON_WARN_LEN", "2"))
+EARLY_DRAGON_ALERT_LEN = int(os.getenv("EARLY_DRAGON_ALERT_LEN", "3"))
+EARLY_DRAGON_MAX_LEN = int(os.getenv("EARLY_DRAGON_MAX_LEN", "4"))
+EARLY_DRAGON_TRIGGER = float(os.getenv("EARLY_DRAGON_TRIGGER", "0.42"))
+EARLY_DRAGON_STRONG_TRIGGER = float(os.getenv("EARLY_DRAGON_STRONG_TRIGGER", "0.62"))
+EARLY_DRAGON_FOLLOW_CAP = float(os.getenv("EARLY_DRAGON_FOLLOW_CAP", "0.535"))
+EARLY_DRAGON_BREAK_EDGE = float(os.getenv("EARLY_DRAGON_BREAK_EDGE", "0.052"))
+EARLY_DRAGON_REQUIRE_ROOM_SUPPORT = os.getenv("EARLY_DRAGON_REQUIRE_ROOM_SUPPORT", "1") == "1"
+EARLY_DRAGON_CONF_CAP = float(os.getenv("EARLY_DRAGON_CONF_CAP", "0.44"))
+EARLY_DRAGON_STRONG_CONF_CAP = float(os.getenv("EARLY_DRAGON_STRONG_CONF_CAP", "0.36"))
+
+# V14 Room Break To Chop Mode:
+# Detects when one-room-two-halls / two-room-one-hall / double-chop rhythm has repeated
+# 3~4 cycles and then starts breaking into single chop or a new short rhythm.
+ROOM_BREAK_TO_CHOP_MODE = os.getenv("ROOM_BREAK_TO_CHOP_MODE", "1") == "1"
+ROOM_BREAK_REPEAT_MIN = int(os.getenv("ROOM_BREAK_REPEAT_MIN", "3"))
+ROOM_BREAK_LOOKBACK = int(os.getenv("ROOM_BREAK_LOOKBACK", "8"))
+ROOM_BREAK_CONSISTENCY = float(os.getenv("ROOM_BREAK_CONSISTENCY", "0.68"))
+ROOM_BREAK_TO_CHOP_EDGE = float(os.getenv("ROOM_BREAK_TO_CHOP_EDGE", "0.056"))
+ROOM_BREAK_DAMPEN_ROOM = float(os.getenv("ROOM_BREAK_DAMPEN_ROOM", "0.055"))
+ROOM_BREAK_FINAL_OVERRIDE = os.getenv("ROOM_BREAK_FINAL_OVERRIDE", "1") == "1"
+ROOM_BREAK_CONF_CAP = float(os.getenv("ROOM_BREAK_CONF_CAP", "0.46"))
+
+# V14 After Tie Safe Mode:
+# When a tie appears, the next N hands are treated as low-confidence / min-bet zone.
+# Direction can still be shown, but strong-entry confidence is capped.
+AFTER_TIE_SAFE_MODE = os.getenv("AFTER_TIE_SAFE_MODE", "1") == "1"
+AFTER_TIE_NO_ENTRY_WINDOW = int(os.getenv("AFTER_TIE_NO_ENTRY_WINDOW", "3"))
+AFTER_TIE_FORCE_MINBET = os.getenv("AFTER_TIE_FORCE_MINBET", "1") == "1"
+AFTER_TIE_CONF_CAP = float(os.getenv("AFTER_TIE_CONF_CAP", "0.36"))
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -2493,6 +2546,603 @@ def _global_reversal_guard(
         "bet_mode_hint": "反轉小注" if forced else "最小注/觀察",
     }
 
+
+def _side_probs_from_total(target_side: str, edge: float, tie_prob: float) -> Tuple[float, float, float]:
+    """Build normalized B/P/T probabilities from a target side and B/P edge."""
+    edge = _clamp(edge, 0.0, 0.145)
+    bp_total = max(0.001, 1 - tie_prob)
+    if target_side == "B":
+        b_prob = (0.5 + edge) * bp_total
+        p_prob = (0.5 - edge) * bp_total
+    else:
+        b_prob = (0.5 - edge) * bp_total
+        p_prob = (0.5 + edge) * bp_total
+    return _normalize_three(b_prob, p_prob, tie_prob)
+
+
+def _road_type_profile(seq: List[str]) -> Dict[str, Any]:
+    """Compact road-state profile used by V14 global shoe context."""
+    if len(seq) < 4:
+        return {"type": "unknown", "strength": 0.0, "switch_rate": 0.5, "runs": []}
+    runs = _runs(seq)
+    lengths = [n for _s, n in runs]
+    sides = [s for s, _n in runs]
+    switch_rate = _window_switch_rate(seq)
+    current_side, current_len = _streak(seq)
+
+    # Single chop / alternating road.
+    if switch_rate >= 0.74:
+        return {
+            "type": "single_chop",
+            "strength": _clamp(0.50 + (switch_rate - 0.74) * 1.15, 0.0, 0.92),
+            "switch_rate": round(switch_rate, 3),
+            "runs": lengths[-10:],
+            "current": (current_side, current_len),
+        }
+
+    # Run-length rhythm detection.
+    tail = lengths[-min(len(lengths), 8):]
+    best_name = "mixed"
+    best_score = 0.0
+    best_pattern: List[int] = []
+    patterns = [
+        ("double_chop", [2, 2]),
+        ("one_two", [1, 2]),
+        ("two_one", [2, 1]),
+    ]
+    if len(tail) >= 3:
+        for name, pat in patterns:
+            for offset in range(len(pat)):
+                score = 0.0
+                for i, obs in enumerate(tail):
+                    exp = pat[(i + offset) % len(pat)]
+                    if obs == exp:
+                        score += 1.0
+                    elif abs(obs - exp) == 1 and obs <= 3:
+                        score += 0.35
+                consistency = score / max(1, len(tail))
+                if consistency > best_score:
+                    best_score = consistency
+                    best_name = name
+                    best_pattern = pat
+
+    if best_score >= 0.66:
+        return {
+            "type": best_name,
+            "strength": round(best_score, 3),
+            "pattern": best_pattern,
+            "switch_rate": round(switch_rate, 3),
+            "runs": lengths[-10:],
+            "current": (current_side, current_len),
+        }
+
+    # Dragon / connected road.
+    if current_len >= 3 or switch_rate <= 0.42:
+        long_rate = _safe_div(sum(1 for n in lengths if n >= 3), len(lengths), 0.0)
+        return {
+            "type": "dragon",
+            "strength": _clamp(0.42 + current_len * 0.055 + long_rate * 0.18, 0.0, 0.82),
+            "switch_rate": round(switch_rate, 3),
+            "runs": lengths[-10:],
+            "current": (current_side, current_len),
+        }
+
+    return {
+        "type": "mixed",
+        "strength": _clamp(0.25 + abs(switch_rate - 0.50) * 0.40, 0.0, 0.55),
+        "switch_rate": round(switch_rate, 3),
+        "runs": lengths[-10:],
+        "current": (current_side, current_len),
+    }
+
+
+def _room_target_from_pattern(non_tie: List[str], pattern: List[int]) -> str:
+    """Infer the next side for a [1,2], [2,1], or [2,2] room rhythm."""
+    runs = _runs(non_tie)
+    if not runs or not pattern:
+        return ""
+    current_side, current_len = runs[-1]
+    lengths = [n for _s, n in runs]
+    best_offset = 0
+    best_score = -1.0
+    tail = lengths[-min(len(lengths), 8):]
+    for offset in range(len(pattern)):
+        score = 0.0
+        for i, obs in enumerate(tail):
+            exp = pattern[(i + offset) % len(pattern)]
+            if obs == exp:
+                score += 1.0
+            elif i == len(tail) - 1 and obs < exp:
+                score += 0.75
+            elif abs(obs - exp) == 1 and obs <= 3:
+                score += 0.25
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+    current_expected = pattern[(len(tail) - 1 + best_offset) % len(pattern)] if tail else pattern[0]
+    return current_side if current_len < current_expected else _opposite(current_side)
+
+
+def _target_side_for_road_type(non_tie: List[str], road_type: str, road: Dict[str, Any]) -> str:
+    if not non_tie:
+        return ""
+    current_side, current_len = _streak(non_tie)
+    if current_side not in {"B", "P"}:
+        return ""
+
+    # If specialized road models are already active, prefer their target.
+    for key in ("room_pattern", "foot_alignment", "mirror_run", "chop_to_dragon"):
+        obj = road.get(key) if isinstance(road, dict) else None
+        if isinstance(obj, dict) and obj.get("active") and obj.get("target_side") in {"B", "P"}:
+            return str(obj.get("target_side"))
+
+    if road_type == "single_chop":
+        return _opposite(current_side)
+    if road_type == "double_chop":
+        return _room_target_from_pattern(non_tie, [2, 2])
+    if road_type == "one_two":
+        return _room_target_from_pattern(non_tie, [1, 2])
+    if road_type == "two_one":
+        return _room_target_from_pattern(non_tie, [2, 1])
+    if road_type == "dragon":
+        # Do not over-follow early dragons; use road/reversal if available.
+        reversal = road.get("reversal") if isinstance(road, dict) else None
+        if isinstance(reversal, dict) and reversal.get("active") and reversal.get("target_side") in {"B", "P"}:
+            return str(reversal.get("target_side"))
+        return current_side
+    return ""
+
+
+def _global_shoe_context_guard(
+    non_tie: List[str],
+    history: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    road: Dict[str, Any],
+    chaos: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    V14 full-shoe context controller.
+
+    It is designed for 60~70-round tables. It splits the current shoe into phases
+    and compares early/mid/recent structure so the model can recognize whether the
+    latest signal continues the shoe's main road or is only a local fake move.
+    """
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "全靴總控未啟動",
+        "score": 0.0,
+        "target_side": "",
+        "reasons": [],
+        "profiles": {},
+    }
+    if not GLOBAL_SHOE_CONTEXT_MODE or len(non_tie) < GLOBAL_SHOE_MIN_HISTORY:
+        return base
+
+    bp_total = max(0.001, 1 - tie_prob)
+    pred_side = "B" if b_prob >= p_prob else "P"
+    n = len(non_tie)
+    split = max(2, GLOBAL_SHOE_PHASE_SPLIT)
+    chunk_size = max(1, math.ceil(n / split))
+    phases: List[List[str]] = []
+    for i in range(split):
+        start = i * chunk_size
+        end = min(n, (i + 1) * chunk_size)
+        if start < n:
+            phases.append(non_tie[start:end])
+    recent = non_tie[-min(n, max(8, GLOBAL_SHOE_WINDOW)):]
+
+    phase_profiles = [_road_type_profile(x) for x in phases if len(x) >= 4]
+    recent_profile = _road_type_profile(recent)
+    type_counts = Counter(p["type"] for p in phase_profiles if p.get("type") not in {"unknown", "mixed"})
+    main_type = type_counts.most_common(1)[0][0] if type_counts else recent_profile.get("type", "mixed")
+    main_count = type_counts[main_type] if main_type in type_counts else 0
+    recent_type = str(recent_profile.get("type", "mixed"))
+
+    target_type = recent_type if GLOBAL_SHOE_ALLOW_RECENT_SHIFT and recent_profile.get("strength", 0) >= 0.72 else main_type
+    target_side = _target_side_for_road_type(non_tie, target_type, road)
+    if target_side not in {"B", "P"}:
+        base.update({
+            "label": "全靴總控無明確方向",
+            "profiles": {"phases": phase_profiles, "recent": recent_profile, "main_type": main_type, "recent_type": recent_type},
+        })
+        return base
+
+    score = 0.0
+    reasons: List[str] = []
+    if main_count >= 2:
+        score += 0.18 + min(0.12, (main_count - 2) * 0.05)
+        reasons.append(f"前中段主路:{main_type}")
+    if recent_type == main_type:
+        score += 0.20
+        reasons.append("近端延續全靴主路")
+    elif GLOBAL_SHOE_ALLOW_RECENT_SHIFT and recent_profile.get("strength", 0) >= 0.72:
+        score += 0.16
+        reasons.append(f"近端換路:{recent_type}")
+    score += min(0.20, float(recent_profile.get("strength", 0.0)) * 0.20)
+
+    if chaos.get("strong"):
+        score *= 0.76
+        reasons.append("強混亂降低全靴強制")
+    elif chaos.get("active"):
+        score *= 0.88
+        reasons.append("破路中保守套用全靴")
+
+    score = _clamp(score, 0.0, 1.0)
+    base_profiles = {
+        "phases": phase_profiles,
+        "recent": recent_profile,
+        "main_type": main_type,
+        "recent_type": recent_type,
+        "target_type": target_type,
+    }
+
+    if target_side == pred_side:
+        base.update({
+            "active": score >= GLOBAL_SHOE_CONTEXT_TRIGGER,
+            "adjusted": False,
+            "forced": False,
+            "score": round(score, 3),
+            "target_side": target_side,
+            "label": f"全靴總控同向｜{target_type}",
+            "reasons": reasons,
+            "profiles": base_profiles,
+        })
+        return base
+
+    if score < GLOBAL_SHOE_CONTEXT_TRIGGER:
+        base.update({
+            "active": False,
+            "adjusted": False,
+            "score": round(score, 3),
+            "target_side": target_side,
+            "label": "全靴總控未達門檻",
+            "reasons": reasons,
+            "profiles": base_profiles,
+        })
+        return base
+
+    forced = score >= GLOBAL_SHOE_STRONG_TRIGGER
+    edge = GLOBAL_SHOE_CONTEXT_EDGE + max(0.0, score - GLOBAL_SHOE_CONTEXT_TRIGGER) * GLOBAL_SHOE_CONTEXT_WEIGHT
+    edge = min(GLOBAL_SHOE_OVERRIDE_EDGE, max(0.020, edge))
+    if not forced:
+        # Soft mode: pull close to neutral / slight target rather than hard flip.
+        old_side_prob = b_prob / bp_total if pred_side == "B" else p_prob / bp_total
+        soft_edge = min(edge * 0.70, max(0.018, old_side_prob - 0.50 + edge * 0.35))
+        if target_side == "B":
+            b_side = max(0.5 + edge * 0.25, 0.5 + soft_edge * 0.35)
+            p_side = 1 - b_side
+        else:
+            p_side = max(0.5 + edge * 0.25, 0.5 + soft_edge * 0.35)
+            b_side = 1 - p_side
+        new_b, new_p, new_t = _normalize_three(b_side * bp_total, p_side * bp_total, tie_prob)
+    else:
+        new_b, new_p, new_t = _side_probs_from_total(target_side, edge, tie_prob)
+
+    return {
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": new_b,
+        "P": new_p,
+        "T": new_t,
+        "target_side": target_side,
+        "from_side": pred_side,
+        "score": round(score, 3),
+        "label": f"全靴總控校準｜{target_type}→{target_side}",
+        "reasons": reasons,
+        "profiles": base_profiles,
+        "edge": round(edge, 5),
+        "bet_mode_hint": "全靴小注" if not forced else "全靴校準注",
+    }
+
+
+def _early_dragon_guard(
+    non_tie: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    road: Dict[str, Any],
+) -> Dict[str, Any]:
+    """V14 guard for 2~4 hand dragons so the model does not blindly chase every early dragon."""
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "早期龍保護未啟動",
+        "score": 0.0,
+        "target_side": "",
+        "reasons": [],
+    }
+    if not EARLY_DRAGON_GUARD or len(non_tie) < 4:
+        return base
+    current_side, current_len = _streak(non_tie)
+    if current_side not in {"B", "P"} or current_len < EARLY_DRAGON_WARN_LEN or current_len > EARLY_DRAGON_MAX_LEN:
+        return base
+
+    bp_total = max(0.001, 1 - tie_prob)
+    pred_side = "B" if b_prob >= p_prob else "P"
+    side_prob = b_prob / bp_total if current_side == "B" else p_prob / bp_total
+    opp_side = _opposite(current_side)
+
+    support = False
+    support_labels: List[str] = []
+    for key, label in (("room_pattern", "房型"), ("foot_alignment", "齊腳"), ("mirror_run", "對稱"), ("chop_to_dragon", "單跳轉龍")):
+        obj = road.get(key) if isinstance(road, dict) else None
+        if isinstance(obj, dict) and obj.get("active") and obj.get("target_side") == current_side:
+            support = True
+            support_labels.append(label)
+
+    completed = _runs(non_tie)[:-1]
+    recent_lengths = [n for _s, n in completed[-10:]]
+    cut_near = sum(1 for n in recent_lengths if n <= current_len)
+    exact_cut = sum(1 for n in recent_lengths if n == current_len)
+    short_cut_rate = _safe_div(cut_near, len(recent_lengths), 0.0)
+
+    score = 0.18
+    reasons = [f"{current_side}{current_len}早期龍"]
+    if current_len >= EARLY_DRAGON_ALERT_LEN:
+        score += 0.16
+        reasons.append("達警戒長度")
+    if EARLY_DRAGON_REQUIRE_ROOM_SUPPORT and not support:
+        score += 0.20
+        reasons.append("無房型/齊腳支撐")
+    elif support:
+        score -= 0.12
+        reasons.append("有" + "+".join(support_labels) + "支撐")
+    if exact_cut >= 1:
+        score += 0.14
+        reasons.append("同長度曾斷")
+    if short_cut_rate >= 0.62 and recent_lengths:
+        score += 0.10
+        reasons.append("近期短切率高")
+    if pred_side == current_side and side_prob > EARLY_DRAGON_FOLLOW_CAP:
+        score += min(0.12, (side_prob - EARLY_DRAGON_FOLLOW_CAP) * 0.8)
+        reasons.append("續龍機率過高")
+
+    score = _clamp(score, 0.0, 1.0)
+    if score < EARLY_DRAGON_TRIGGER or pred_side != current_side:
+        base.update({
+            "active": score >= EARLY_DRAGON_TRIGGER,
+            "adjusted": False,
+            "score": round(score, 3),
+            "target_side": opp_side,
+            "label": "早期龍觀察",
+            "reasons": reasons,
+            "support": support,
+        })
+        return base
+
+    forced = score >= EARLY_DRAGON_STRONG_TRIGGER
+    if forced:
+        edge = min(EARLY_DRAGON_BREAK_EDGE, max(0.020, EARLY_DRAGON_BREAK_EDGE * (0.75 + score * 0.35)))
+        new_b, new_p, new_t = _side_probs_from_total(opp_side, edge, tie_prob)
+        label = f"早期龍防傻跟｜{current_side}{current_len}轉看{opp_side}"
+    else:
+        # Cap the follow side rather than immediately flipping.
+        capped_side = min(side_prob, EARLY_DRAGON_FOLLOW_CAP)
+        if current_side == "B":
+            new_b = capped_side * bp_total
+            new_p = (1 - capped_side) * bp_total
+        else:
+            new_b = (1 - capped_side) * bp_total
+            new_p = capped_side * bp_total
+        new_b, new_p, new_t = _normalize_three(new_b, new_p, tie_prob)
+        label = f"早期龍降追擊｜{current_side}{current_len}"
+
+    return {
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": new_b,
+        "P": new_p,
+        "T": new_t,
+        "target_side": opp_side,
+        "from_side": current_side,
+        "score": round(score, 3),
+        "label": label,
+        "reasons": reasons,
+        "support": support,
+        "side_prob_before": round(side_prob, 4),
+        "bet_mode_hint": "早期龍小注" if not forced else "早期龍反轉小注",
+    }
+
+
+def _best_completed_room_pattern(lengths: List[int]) -> Dict[str, Any]:
+    patterns = [
+        ("double_chop", "雙跳", [2, 2]),
+        ("one_two", "一房兩廳", [1, 2]),
+        ("two_one", "兩房一廳", [2, 1]),
+    ]
+    best = {"active": False, "consistency": 0.0, "name": "", "pattern": [], "offset": 0}
+    if len(lengths) < ROOM_BREAK_REPEAT_MIN:
+        return best
+    tail = lengths[-min(len(lengths), ROOM_BREAK_LOOKBACK):]
+    for key, name, pattern in patterns:
+        for offset in range(len(pattern)):
+            score = 0.0
+            for i, obs in enumerate(tail):
+                exp = pattern[(i + offset) % len(pattern)]
+                if obs == exp:
+                    score += 1.0
+                elif abs(obs - exp) == 1 and obs <= 3:
+                    score += 0.30
+            consistency = score / max(1, len(tail))
+            if consistency > best["consistency"]:
+                best = {
+                    "active": consistency >= ROOM_BREAK_CONSISTENCY,
+                    "consistency": consistency,
+                    "key": key,
+                    "name": name,
+                    "pattern": pattern,
+                    "offset": offset,
+                    "tail": tail,
+                }
+    return best
+
+
+def _room_break_to_chop_guard(
+    non_tie: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    road: Dict[str, Any],
+) -> Dict[str, Any]:
+    """V14 detector for room rhythm break into single chop / short reversal."""
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "房型斷點未啟動",
+        "score": 0.0,
+        "target_side": "",
+        "reasons": [],
+    }
+    if not ROOM_BREAK_TO_CHOP_MODE or len(non_tie) < 8:
+        return base
+    runs = _runs(non_tie)
+    if len(runs) < 5:
+        return base
+    current_side, current_len = runs[-1]
+    lengths = [n for _s, n in runs]
+    completed_lengths = lengths[:-1]
+    best = _best_completed_room_pattern(completed_lengths)
+    if not best.get("active"):
+        return base
+
+    pattern = best.get("pattern", [])
+    offset = int(best.get("offset", 0))
+    expected_current = pattern[(len(best.get("tail", [])) + offset) % len(pattern)] if pattern else 1
+    recent = non_tie[-min(len(non_tie), 8):]
+    recent_switch = _window_switch_rate(recent)
+    pred_side = "B" if b_prob >= p_prob else "P"
+    target_side = _opposite(current_side)
+
+    score = 0.0
+    reasons: List[str] = [f"{best.get('name')}重複後檢查斷點"]
+    if current_len > expected_current:
+        score += 0.30
+        reasons.append(f"當前{current_side}{current_len}超過預期{expected_current}")
+    if recent_switch >= 0.68:
+        score += 0.18
+        reasons.append("尾段轉單跳")
+        target_side = _opposite(current_side)
+    if current_len == 1 and expected_current == 2:
+        score += 0.14
+        reasons.append("補房未完成先觀察反切")
+    room_obj = road.get("room_pattern") if isinstance(road, dict) else None
+    if isinstance(room_obj, dict) and room_obj.get("active") and room_obj.get("phase") == "turn":
+        score += 0.10
+        target_side = str(room_obj.get("target_side", target_side)) if room_obj.get("target_side") in {"B", "P"} else target_side
+        reasons.append("房型轉邊同步")
+    if best.get("consistency", 0.0) >= 0.82 and current_len <= expected_current:
+        score *= 0.72
+        reasons.append("房型仍穩定不強制破")
+
+    score = _clamp(score, 0.0, 1.0)
+    if score < ROOM_BREAK_CONSISTENCY - 0.12:
+        base.update({
+            "active": False,
+            "score": round(score, 3),
+            "label": "房型斷點證據不足",
+            "target_side": target_side,
+            "reasons": reasons,
+            "pattern": best,
+            "expected_current": expected_current,
+            "recent_switch": round(recent_switch, 3),
+        })
+        return base
+
+    # If target equals current prediction, treat as confirmation rather than adjustment.
+    if target_side == pred_side:
+        base.update({
+            "active": True,
+            "adjusted": False,
+            "score": round(score, 3),
+            "label": f"房型斷點同向｜{best.get('name')}",
+            "target_side": target_side,
+            "reasons": reasons,
+            "pattern": best,
+            "expected_current": expected_current,
+        })
+        return base
+
+    forced = ROOM_BREAK_FINAL_OVERRIDE and score >= ROOM_BREAK_CONSISTENCY
+    edge = min(ROOM_BREAK_TO_CHOP_EDGE, max(0.022, ROOM_BREAK_TO_CHOP_EDGE * (0.75 + score * 0.35)))
+    if forced:
+        new_b, new_p, new_t = _side_probs_from_total(target_side, edge, tie_prob)
+    else:
+        bp_total = max(0.001, 1 - tie_prob)
+        if pred_side == "B":
+            b_side = max(0.5 - edge * 0.15, (b_prob / bp_total) - ROOM_BREAK_DAMPEN_ROOM)
+            p_side = 1 - b_side
+        else:
+            p_side = max(0.5 - edge * 0.15, (p_prob / bp_total) - ROOM_BREAK_DAMPEN_ROOM)
+            b_side = 1 - p_side
+        new_b, new_p, new_t = _normalize_three(b_side * bp_total, p_side * bp_total, tie_prob)
+
+    return {
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": new_b,
+        "P": new_p,
+        "T": new_t,
+        "target_side": target_side,
+        "from_side": pred_side,
+        "score": round(score, 3),
+        "label": f"房型斷點轉單跳｜{best.get('name')}",
+        "reasons": reasons,
+        "pattern": best,
+        "expected_current": expected_current,
+        "recent_switch": round(recent_switch, 3),
+        "edge": round(edge, 5),
+        "bet_mode_hint": "房型斷點小注",
+    }
+
+
+def _after_tie_safe_guard(history: List[str], b_prob: float, p_prob: float, tie_prob: float) -> Dict[str, Any]:
+    base = {
+        "active": False,
+        "adjusted": False,
+        "forced": False,
+        "B": b_prob,
+        "P": p_prob,
+        "T": tie_prob,
+        "label": "和局後安全模式未啟動",
+        "score": 0.0,
+        "tie_gap": _last_tie_gap(history),
+    }
+    if not AFTER_TIE_SAFE_MODE:
+        return base
+    tie_gap = _last_tie_gap(history)
+    if tie_gap > AFTER_TIE_NO_ENTRY_WINDOW:
+        return base
+    score = _clamp(1.0 - tie_gap / max(1, AFTER_TIE_NO_ENTRY_WINDOW + 1), 0.20, 1.0)
+    base.update({
+        "active": True,
+        "adjusted": False,
+        "forced": AFTER_TIE_FORCE_MINBET,
+        "label": f"和局後{tie_gap}手安全模式",
+        "score": round(score, 3),
+        "tie_gap": tie_gap,
+        "conf_cap": AFTER_TIE_CONF_CAP,
+        "bet_mode_hint": "最小注/觀望" if AFTER_TIE_FORCE_MINBET else "低信心",
+    })
+    return base
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
@@ -2710,6 +3360,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "over_rate": FOOT_ALIGN_OVER_RATE,
             "final_override": FOOT_ALIGN_FINAL_OVERRIDE,
         },
+        "v14_context_config": {
+            "global_shoe_context_mode": GLOBAL_SHOE_CONTEXT_MODE,
+            "global_shoe_window": GLOBAL_SHOE_WINDOW,
+            "early_dragon_guard": EARLY_DRAGON_GUARD,
+            "room_break_to_chop_mode": ROOM_BREAK_TO_CHOP_MODE,
+            "after_tie_safe_mode": AFTER_TIE_SAFE_MODE,
+            "after_tie_no_entry_window": AFTER_TIE_NO_ENTRY_WINDOW,
+        },
     }
 
     ai_result = None
@@ -2732,17 +3390,17 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
-    # ----- 強龍保護與反轉優先 -----
+    # ----- 強龍保護：當明顯有效長龍時，避免規律層 override 干擾 -----
     current_side, current_len = _streak(non_tie)
     is_strong_dragon = (
         current_len >= DRAGON_STRONG_LEN
         and road.get("road_action") == "續龍"
         and not road.get("reversal", {}).get("active")
     )
-    reversal_override_applied = False  # 一旦反轉生效，後續 override 全部讓位
 
     # If the dragon reversal detector is strong, allow it to actually flip the final
-    # recommendation.
+    # recommendation. Without this guard, Markov/Streak often keep following the old
+    # dragon even when the road layer has already detected a turning zone.
     reversal_final_override = False
     road_reversal = road.get("reversal") if isinstance(road, dict) else None
     if (
@@ -2764,7 +3422,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             p_prob = (0.5 + edge) * bp_total
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         reversal_final_override = True
-        reversal_override_applied = True
 
     chop_to_dragon_final_override = False
     road_chop_to_dragon = road.get("chop_to_dragon") if isinstance(road, dict) else None
@@ -2774,8 +3431,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_chop_to_dragon.get("active")
         and road_chop_to_dragon.get("target_side") in {"B", "P"}
         and road_chop_to_dragon.get("phase") in {"confirmed", "early"}
-        and not is_strong_dragon
-        and not reversal_override_applied   # 反轉已生效則不執行
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_chop_to_dragon.get("target_side"))
         raw_edge = float(road_chop_to_dragon.get("edge", CHOP_TO_DRAGON_EDGE))
@@ -2799,8 +3455,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_mirror_run.get("active")
         and road_mirror_run.get("target_side") in {"B", "P"}
         and road_mirror_run.get("phase") in {"fill", "complete_reversal"}
-        and not is_strong_dragon
-        and not reversal_override_applied
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_mirror_run.get("target_side"))
         raw_edge = float(road_mirror_run.get("edge", MIRROR_RUN_EDGE))
@@ -2824,8 +3479,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_room_pattern.get("active")
         and road_room_pattern.get("target_side") in {"B", "P"}
         and road_room_pattern.get("phase") in {"fill", "turn"}
-        and not is_strong_dragon
-        and not reversal_override_applied
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_room_pattern.get("target_side"))
         raw_edge = float(road_room_pattern.get("edge", ROOM_PATTERN_EDGE))
@@ -2849,8 +3503,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_foot_alignment.get("active")
         and road_foot_alignment.get("target_side") in {"B", "P"}
         and road_foot_alignment.get("phase") in {"fill_to_foot", "aligned_break", "aligned_over", "aligned_room", "aligned_default_break", "overfoot_continue"}
-        and not is_strong_dragon
-        and not reversal_override_applied
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_foot_alignment.get("target_side"))
         raw_edge = float(road_foot_alignment.get("edge", FOOT_ALIGN_EDGE))
@@ -2878,6 +3531,26 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         foot_alignment_final_override = True
 
+    # ----- V14 specialized guards -----
+    # These layers are applied after the original road overrides and before the
+    # majority/global reversal layers so they can correct known weak spots:
+    # full-shoe context, early 2~4 hand dragon over-following, room-rhythm breaks,
+    # and after-tie safe mode.
+    room_break_to_chop = _room_break_to_chop_guard(non_tie, b_prob, p_prob, tie_prob, road)
+    if room_break_to_chop.get("active") and room_break_to_chop.get("adjusted"):
+        b_prob = float(room_break_to_chop.get("B", b_prob))
+        p_prob = float(room_break_to_chop.get("P", p_prob))
+        tie_prob = float(room_break_to_chop.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
+    early_dragon_guard = _early_dragon_guard(non_tie, b_prob, p_prob, tie_prob, road)
+    if early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"):
+        b_prob = float(early_dragon_guard.get("B", b_prob))
+        p_prob = float(early_dragon_guard.get("P", p_prob))
+        tie_prob = float(early_dragon_guard.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
+    after_tie_safe = _after_tie_safe_guard(history, b_prob, p_prob, tie_prob)
 
     majority_guard = _majority_chase_guard(non_tie, b_prob, p_prob, tie_prob, road, chaos)
     if majority_guard.get("active") and majority_guard.get("adjusted"):
@@ -2893,6 +3566,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         tie_prob = float(global_reversal.get("T", tie_prob))
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    global_shoe_context = _global_shoe_context_guard(non_tie, history, b_prob, p_prob, tie_prob, road, chaos)
+    if global_shoe_context.get("active") and global_shoe_context.get("adjusted"):
+        b_prob = float(global_shoe_context.get("B", b_prob))
+        p_prob = float(global_shoe_context.get("P", p_prob))
+        tie_prob = float(global_shoe_context.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -2906,6 +3586,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if majority_guard.get("B", 0.5) >= majority_guard.get("P", 0.5) else "P")
     if global_reversal.get("active") and global_reversal.get("adjusted"):
         votes.append("B" if global_reversal.get("B", 0.5) >= global_reversal.get("P", 0.5) else "P")
+    if 'global_shoe_context' in locals() and isinstance(global_shoe_context, dict) and global_shoe_context.get("active"):
+        votes.append("B" if global_shoe_context.get("B", 0.5) >= global_shoe_context.get("P", 0.5) else "P")
+    if 'early_dragon_guard' in locals() and isinstance(early_dragon_guard, dict) and early_dragon_guard.get("active"):
+        votes.append("B" if early_dragon_guard.get("B", 0.5) >= early_dragon_guard.get("P", 0.5) else "P")
+    if 'room_break_to_chop' in locals() and isinstance(room_break_to_chop, dict) and room_break_to_chop.get("active"):
+        votes.append("B" if room_break_to_chop.get("B", 0.5) >= room_break_to_chop.get("P", 0.5) else "P")
     if 'road_room_pattern' in locals() and isinstance(road_room_pattern, dict) and road_room_pattern.get("active"):
         votes.append("B" if road_room_pattern.get("B", 0.5) >= road_room_pattern.get("P", 0.5) else "P")
     if 'road_foot_alignment' in locals() and isinstance(road_foot_alignment, dict) and road_foot_alignment.get("active"):
@@ -2936,6 +3622,23 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, cap)
         if not chaos.get("active") and not (majority_guard.get("active") and majority_guard.get("adjusted")):
             level = "全局反轉警戒" if global_reversal.get("forced") else "反轉觀察弱訊號"
+    if 'global_shoe_context' in locals() and global_shoe_context.get("active") and global_shoe_context.get("adjusted"):
+        cap = GLOBAL_SHOE_STRONG_CONF_CAP if global_shoe_context.get("forced") else GLOBAL_SHOE_CONF_CAP
+        conf = min(conf, cap)
+        if not chaos.get("active"):
+            level = "全靴總控校準" if global_shoe_context.get("forced") else "全靴總控弱訊號"
+    if 'early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"):
+        cap = EARLY_DRAGON_STRONG_CONF_CAP if early_dragon_guard.get("forced") else EARLY_DRAGON_CONF_CAP
+        conf = min(conf, cap)
+        if not chaos.get("active"):
+            level = "早期龍反轉警戒" if early_dragon_guard.get("forced") else "早期龍低追擊"
+    if 'room_break_to_chop' in locals() and room_break_to_chop.get("active") and room_break_to_chop.get("adjusted"):
+        conf = min(conf, ROOM_BREAK_CONF_CAP)
+        if not chaos.get("active"):
+            level = "房型斷點警戒"
+    if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
+        conf = min(conf, AFTER_TIE_CONF_CAP)
+        level = "和局後安全觀察"
     reason_parts = [road.get("label", "牌路"), f"模型一致{int(agreement * 100)}%"]
     if chaos.get("active"):
         reason_parts.insert(0, f"{chaos.get('label')}({int(float(chaos.get('score', 0))*100)}%)")
@@ -2953,6 +3656,22 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             reason_parts.append("全局反轉校準")
         else:
             reason_parts.append("反轉雷達降追擊")
+    if 'global_shoe_context' in locals() and global_shoe_context.get("active"):
+        reason_parts.insert(0, f"{global_shoe_context.get('label')}({int(float(global_shoe_context.get('score', 0))*100)}%)")
+        if global_shoe_context.get("adjusted"):
+            reason_parts.append("全靴前中後段校準")
+    if 'early_dragon_guard' in locals() and early_dragon_guard.get("active"):
+        reason_parts.insert(0, f"{early_dragon_guard.get('label')}({int(float(early_dragon_guard.get('score', 0))*100)}%)")
+        if early_dragon_guard.get("adjusted"):
+            reason_parts.append("早期龍防傻跟")
+    if 'room_break_to_chop' in locals() and room_break_to_chop.get("active"):
+        reason_parts.insert(0, f"{room_break_to_chop.get('label')}({int(float(room_break_to_chop.get('score', 0))*100)}%)")
+        if room_break_to_chop.get("adjusted"):
+            reason_parts.append("房型斷點轉單跳")
+    if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
+        reason_parts.insert(0, f"{after_tie_safe.get('label')}({int(float(after_tie_safe.get('score', 0))*100)}%)")
+        if AFTER_TIE_FORCE_MINBET:
+            reason_parts.append("和局後三手最小注/觀望")
     if road.get("road_action"):
         reason_parts.append(f"動作:{road.get('road_action')}")
     if 'reversal_final_override' in locals() and reversal_final_override:
@@ -2990,6 +3709,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             (chaos.get("active") and LOW_CONFIDENCE_MINBET)
             or (majority_guard.get("active") and majority_guard.get("adjusted"))
             or (global_reversal.get("active") and global_reversal.get("adjusted"))
+            or ('global_shoe_context' in locals() and global_shoe_context.get("active") and global_shoe_context.get("adjusted"))
+            or ('early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"))
+            or ('room_break_to_chop' in locals() and room_break_to_chop.get("active") and room_break_to_chop.get("adjusted"))
+            or ('after_tie_safe' in locals() and after_tie_safe.get("active") and AFTER_TIE_FORCE_MINBET)
         ) else "信心分級",
         "pattern_label": road.get("label", ""),
         "chaos_label": chaos.get("label", ""),
@@ -3011,6 +3734,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "chaos": chaos,
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
+        "global_shoe_context": global_shoe_context if 'global_shoe_context' in locals() else None,
+        "early_dragon_guard": early_dragon_guard if 'early_dragon_guard' in locals() else None,
+        "room_break_to_chop": room_break_to_chop if 'room_break_to_chop' in locals() else None,
+        "after_tie_safe": after_tie_safe if 'after_tie_safe' in locals() else None,
         "room_pattern": road.get("room_pattern") if isinstance(road, dict) else None,
         "foot_alignment": road.get("foot_alignment") if isinstance(road, dict) else None,
         "effective_weights": {k: round(v, 4) for k, v in weights.items()},
