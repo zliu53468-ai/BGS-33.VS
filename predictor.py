@@ -7,11 +7,11 @@ from typing import Any, Dict, List, Tuple
 from deepseek_client import DeepSeekClient
 
 # ============================================================
-# V19 Classic / Lite + Full Markov + Regime/Dynamic/Bayes
-# 目標：回到百家樂核心牌路判斷，並補強莊閒排列順序捕捉。
-# 主判斷保留 Road / Room / Foot / Chop / Dragon / After-Tie。
-# 新增 Sequence Pattern Layer、Full Markov、Regime Switch、Dynamic Weight、Bayesian Calibration。
-# AI、全靴前中後、全局反轉、多數邊、Chaos 預設只做輕量保護或關閉硬覆蓋。
+# V20 Classic / Lite + XGBoost Fusion
+# 目標：強化牌路穩定度，加入 XGBoost Fusion 最後融合層。
+# 主判斷仍保留 Road / Room / Foot / Chop / Dragon / Regime / Global Shoe。
+# Full Markov / Sequence 降為輔助訊號，避免過度吃單一方。
+# XGBoost Fusion 可吃外部 xgboost 模型；沒有模型時走內建 XGB-Lite 融合，不讓 Render 掛掉。
 # ============================================================
 
 # Base baccarat long-run priors, used only as soft priors for display calibration.
@@ -20,11 +20,11 @@ P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
 # Main ensemble weights.
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.14"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.30"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.06"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.06"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.09"))
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.06"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.42"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.07"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.08"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.10"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.02"))
 AI_BLEND = float(os.getenv("AI_BLEND", "0.06"))
 
@@ -66,21 +66,21 @@ MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "16"))
 # run-length state Markov. This is still a light calibration layer; by default
 # it does not hard-override Road / Room / Foot / Dragon.
 FULL_MARKOV_MODE = os.getenv("FULL_MARKOV_MODE", "1") == "1"
-FULL_MARKOV_WEIGHT = float(os.getenv("FULL_MARKOV_WEIGHT", "0.25"))
+FULL_MARKOV_WEIGHT = float(os.getenv("FULL_MARKOV_WEIGHT", "0.10"))
 FULL_MARKOV_ORDER_MIN = int(os.getenv("FULL_MARKOV_ORDER_MIN", "1"))
 FULL_MARKOV_ORDER_MAX = int(os.getenv("FULL_MARKOV_ORDER_MAX", "5"))
 FULL_MARKOV_MIN_HISTORY = int(os.getenv("FULL_MARKOV_MIN_HISTORY", "10"))
 FULL_MARKOV_MIN_SAMPLE = int(os.getenv("FULL_MARKOV_MIN_SAMPLE", "2"))
-FULL_MARKOV_ALPHA = float(os.getenv("FULL_MARKOV_ALPHA", "1.4"))
-FULL_MARKOV_EDGE = float(os.getenv("FULL_MARKOV_EDGE", "0.042"))
-FULL_MARKOV_MAX_EDGE = float(os.getenv("FULL_MARKOV_MAX_EDGE", "0.074"))
+FULL_MARKOV_ALPHA = float(os.getenv("FULL_MARKOV_ALPHA", "1.6"))
+FULL_MARKOV_EDGE = float(os.getenv("FULL_MARKOV_EDGE", "0.030"))
+FULL_MARKOV_MAX_EDGE = float(os.getenv("FULL_MARKOV_MAX_EDGE", "0.048"))
 FULL_MARKOV_DECAY = float(os.getenv("FULL_MARKOV_DECAY", "0.965"))
 FULL_MARKOV_RUN_STATE_MODE = os.getenv("FULL_MARKOV_RUN_STATE_MODE", "1") == "1"
-FULL_MARKOV_RUN_WEIGHT = float(os.getenv("FULL_MARKOV_RUN_WEIGHT", "0.42"))
+FULL_MARKOV_RUN_WEIGHT = float(os.getenv("FULL_MARKOV_RUN_WEIGHT", "0.24"))
 FULL_MARKOV_FINAL_OVERRIDE = os.getenv("FULL_MARKOV_FINAL_OVERRIDE", "0") == "1"
-FULL_MARKOV_CONF_CAP = float(os.getenv("FULL_MARKOV_CONF_CAP", "0.50"))
-FULL_MARKOV_STRONG_LOCAL_GAP = float(os.getenv("FULL_MARKOV_STRONG_LOCAL_GAP", "0.055"))
-FULL_MARKOV_CHAOS_FACTOR = float(os.getenv("FULL_MARKOV_CHAOS_FACTOR", "0.70"))
+FULL_MARKOV_CONF_CAP = float(os.getenv("FULL_MARKOV_CONF_CAP", "0.46"))
+FULL_MARKOV_STRONG_LOCAL_GAP = float(os.getenv("FULL_MARKOV_STRONG_LOCAL_GAP", "0.045"))
+FULL_MARKOV_CHAOS_FACTOR = float(os.getenv("FULL_MARKOV_CHAOS_FACTOR", "0.60"))
 
 # Breakout Dragon Mode:
 # Handles shoes where a Banker/Player dragon suddenly exceeds previous run lengths.
@@ -188,7 +188,7 @@ ROOM_PATTERN_EARLY_DETECT = os.getenv("ROOM_PATTERN_EARLY_DETECT", "1") == "1"
 ROOM_PATTERN_MIN_CONSISTENCY = float(os.getenv("ROOM_PATTERN_MIN_CONSISTENCY", "0.64"))
 ROOM_PATTERN_EDGE = float(os.getenv("ROOM_PATTERN_EDGE", "0.066"))
 ROOM_PATTERN_MAX_EDGE = float(os.getenv("ROOM_PATTERN_MAX_EDGE", "0.092"))
-ROOM_PATTERN_STRENGTH = float(os.getenv("ROOM_PATTERN_STRENGTH", "0.300"))
+ROOM_PATTERN_STRENGTH = float(os.getenv("ROOM_PATTERN_STRENGTH", "0.320"))
 ONE_TWO_PATTERN_MODE = os.getenv("ONE_TWO_PATTERN_MODE", "1") == "1"
 ONE_TWO_PATTERN_EDGE = float(os.getenv("ONE_TWO_PATTERN_EDGE", "0.068"))
 TWO_ONE_PATTERN_MODE = os.getenv("TWO_ONE_PATTERN_MODE", "1") == "1"
@@ -219,7 +219,7 @@ FOOT_ALIGN_EDGE = float(os.getenv("FOOT_ALIGN_EDGE", "0.052"))
 FOOT_ALIGN_BREAK_EDGE = float(os.getenv("FOOT_ALIGN_BREAK_EDGE", "0.064"))
 FOOT_ALIGN_OVER_EDGE = float(os.getenv("FOOT_ALIGN_OVER_EDGE", "0.040"))
 FOOT_ALIGN_MAX_EDGE = float(os.getenv("FOOT_ALIGN_MAX_EDGE", "0.074"))
-FOOT_ALIGN_STRENGTH = float(os.getenv("FOOT_ALIGN_STRENGTH", "0.250"))
+FOOT_ALIGN_STRENGTH = float(os.getenv("FOOT_ALIGN_STRENGTH", "0.270"))
 FOOT_ALIGN_BREAK_RATE = float(os.getenv("FOOT_ALIGN_BREAK_RATE", "0.58"))
 FOOT_ALIGN_OVER_RATE = float(os.getenv("FOOT_ALIGN_OVER_RATE", "0.58"))
 FOOT_ALIGN_DEFAULT_BREAK = os.getenv("FOOT_ALIGN_DEFAULT_BREAK", "1") == "1"
@@ -320,9 +320,9 @@ GLOBAL_SHOE_MIN_HISTORY = int(os.getenv("GLOBAL_SHOE_MIN_HISTORY", "18"))
 GLOBAL_SHOE_WINDOW = int(os.getenv("GLOBAL_SHOE_WINDOW", "24"))
 GLOBAL_SHOE_CONTEXT_TRIGGER = float(os.getenv("GLOBAL_SHOE_CONTEXT_TRIGGER", "0.58"))
 GLOBAL_SHOE_STRONG_TRIGGER = float(os.getenv("GLOBAL_SHOE_STRONG_TRIGGER", "0.74"))
-GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.022"))
-GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.036"))
-GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.10"))
+GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.020"))
+GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.032"))
+GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.09"))
 GLOBAL_SHOE_CONF_CAP = float(os.getenv("GLOBAL_SHOE_CONF_CAP", "0.50"))
 GLOBAL_SHOE_STRONG_CONF_CAP = float(os.getenv("GLOBAL_SHOE_STRONG_CONF_CAP", "0.42"))
 GLOBAL_SHOE_PHASE_SPLIT = int(os.getenv("GLOBAL_SHOE_PHASE_SPLIT", "3"))
@@ -374,13 +374,13 @@ SEQUENCE_MIN_HISTORY = int(os.getenv("SEQUENCE_MIN_HISTORY", "8"))
 SEQUENCE_NGRAM_MIN = int(os.getenv("SEQUENCE_NGRAM_MIN", "3"))
 SEQUENCE_NGRAM_MAX = int(os.getenv("SEQUENCE_NGRAM_MAX", "5"))
 SEQUENCE_MIN_SAMPLE = int(os.getenv("SEQUENCE_MIN_SAMPLE", "2"))
-SEQUENCE_EDGE = float(os.getenv("SEQUENCE_EDGE", "0.038"))
-SEQUENCE_MAX_EDGE = float(os.getenv("SEQUENCE_MAX_EDGE", "0.060"))
-SEQUENCE_WEIGHT = float(os.getenv("SEQUENCE_WEIGHT", "0.16"))
+SEQUENCE_EDGE = float(os.getenv("SEQUENCE_EDGE", "0.030"))
+SEQUENCE_MAX_EDGE = float(os.getenv("SEQUENCE_MAX_EDGE", "0.046"))
+SEQUENCE_WEIGHT = float(os.getenv("SEQUENCE_WEIGHT", "0.12"))
 SEQUENCE_FINAL_OVERRIDE = os.getenv("SEQUENCE_FINAL_OVERRIDE", "0") == "1"
 SEQUENCE_CONF_CAP = float(os.getenv("SEQUENCE_CONF_CAP", "0.50"))
 SEQUENCE_CHAOS_FACTOR = float(os.getenv("SEQUENCE_CHAOS_FACTOR", "0.70"))
-SEQUENCE_STRONG_LOCAL_GAP = float(os.getenv("SEQUENCE_STRONG_LOCAL_GAP", "0.050"))
+SEQUENCE_STRONG_LOCAL_GAP = float(os.getenv("SEQUENCE_STRONG_LOCAL_GAP", "0.040"))
 
 
 # V19 Regime Switch Model / 路型狀態切換模型:
@@ -388,8 +388,8 @@ SEQUENCE_STRONG_LOCAL_GAP = float(os.getenv("SEQUENCE_STRONG_LOCAL_GAP", "0.050"
 # It keeps Final Override off; it only changes weights/blends so the model keeps baccarat road feel.
 REGIME_SWITCH_MODE = os.getenv("REGIME_SWITCH_MODE", "1") == "1"
 REGIME_WINDOW = int(os.getenv("REGIME_WINDOW", "18"))
-REGIME_MIN_CONFIDENCE = float(os.getenv("REGIME_MIN_CONFIDENCE", "0.58"))
-REGIME_WEIGHT = float(os.getenv("REGIME_WEIGHT", "0.18"))
+REGIME_MIN_CONFIDENCE = float(os.getenv("REGIME_MIN_CONFIDENCE", "0.56"))
+REGIME_WEIGHT = float(os.getenv("REGIME_WEIGHT", "0.20"))
 REGIME_MAX_SHIFT = float(os.getenv("REGIME_MAX_SHIFT", "0.12"))
 REGIME_FINAL_OVERRIDE = os.getenv("REGIME_FINAL_OVERRIDE", "0") == "1"
 REGIME_CHAOS_RELIEF = float(os.getenv("REGIME_CHAOS_RELIEF", "0.70"))
@@ -397,10 +397,10 @@ REGIME_CHAOS_RELIEF = float(os.getenv("REGIME_CHAOS_RELIEF", "0.70"))
 # V19 Bayesian Calibration / 貝葉斯校準模型:
 # Shrinks low-sample Markov/sequence signals back toward 50/50 so short coincidences do not dominate.
 BAYES_CALIBRATION_MODE = os.getenv("BAYES_CALIBRATION_MODE", "1") == "1"
-BAYES_ALPHA = float(os.getenv("BAYES_ALPHA", "2.0"))
+BAYES_ALPHA = float(os.getenv("BAYES_ALPHA", "3.0"))
 BAYES_MIN_SAMPLE = int(os.getenv("BAYES_MIN_SAMPLE", "3"))
-BAYES_SHRINK = float(os.getenv("BAYES_SHRINK", "0.62"))
-BAYES_MAX_EDGE = float(os.getenv("BAYES_MAX_EDGE", "0.042"))
+BAYES_SHRINK = float(os.getenv("BAYES_SHRINK", "0.76"))
+BAYES_MAX_EDGE = float(os.getenv("BAYES_MAX_EDGE", "0.030"))
 BAYES_APPLY_FULL_MARKOV = os.getenv("BAYES_APPLY_FULL_MARKOV", "1") == "1"
 BAYES_APPLY_SEQUENCE = os.getenv("BAYES_APPLY_SEQUENCE", "1") == "1"
 
@@ -409,11 +409,44 @@ BAYES_APPLY_SEQUENCE = os.getenv("BAYES_APPLY_SEQUENCE", "1") == "1"
 DYNAMIC_WEIGHT_MODE = os.getenv("DYNAMIC_WEIGHT_MODE", "1") == "1"
 DYNAMIC_WEIGHT_WINDOW = int(os.getenv("DYNAMIC_WEIGHT_WINDOW", "14"))
 DYNAMIC_WEIGHT_MIN_SAMPLE = int(os.getenv("DYNAMIC_WEIGHT_MIN_SAMPLE", "6"))
-DYNAMIC_WEIGHT_MAX_SHIFT = float(os.getenv("DYNAMIC_WEIGHT_MAX_SHIFT", "0.08"))
+DYNAMIC_WEIGHT_MAX_SHIFT = float(os.getenv("DYNAMIC_WEIGHT_MAX_SHIFT", "0.060"))
 DYNAMIC_WEIGHT_DECAY = float(os.getenv("DYNAMIC_WEIGHT_DECAY", "0.92"))
-DYNAMIC_WEIGHT_STEP = float(os.getenv("DYNAMIC_WEIGHT_STEP", "0.025"))
+DYNAMIC_WEIGHT_STEP = float(os.getenv("DYNAMIC_WEIGHT_STEP", "0.018"))
 DYNAMIC_WEIGHT_APPLY_FULL_MARKOV = os.getenv("DYNAMIC_WEIGHT_APPLY_FULL_MARKOV", "1") == "1"
 DYNAMIC_WEIGHT_APPLY_SEQUENCE = os.getenv("DYNAMIC_WEIGHT_APPLY_SEQUENCE", "1") == "1"
+
+
+# V20 XGBoost Fusion Layer / XGBoost 融合統整層:
+# This layer sits near the end of the local pipeline and integrates Road / Room / Foot / Dragon / Regime /
+# Global Shoe / Markov / Sequence into one final B/P calibration.
+# If a real XGBoost model is provided, it will be used. If not, XGB-Lite fallback will fuse locally,
+# so predictor.py remains one-click deployable without breaking Render.
+XGB_FUSION_MODE = os.getenv("XGB_FUSION_MODE", "1") == "1"
+XGB_EXTERNAL_MODEL_MODE = os.getenv("XGB_EXTERNAL_MODEL_MODE", "0") == "1"
+XGB_MODEL_PATH = os.getenv("XGB_MODEL_PATH", "")
+XGB_USE_FEATURE_NAMES = os.getenv("XGB_USE_FEATURE_NAMES", "1") == "1"
+XGB_FALLBACK_MODE = os.getenv("XGB_FALLBACK_MODE", "1") == "1"
+XGB_MIN_HISTORY = int(os.getenv("XGB_MIN_HISTORY", "12"))
+XGB_FUSION_WEIGHT = float(os.getenv("XGB_FUSION_WEIGHT", "0.18"))
+XGB_MAX_BLEND = float(os.getenv("XGB_MAX_BLEND", "0.18"))
+XGB_EDGE = float(os.getenv("XGB_EDGE", "0.030"))
+XGB_MAX_EDGE = float(os.getenv("XGB_MAX_EDGE", "0.060"))
+XGB_LOCAL_GAP_DAMPEN = float(os.getenv("XGB_LOCAL_GAP_DAMPEN", "0.50"))
+XGB_STRONG_LOCAL_GAP = float(os.getenv("XGB_STRONG_LOCAL_GAP", "0.060"))
+XGB_FINAL_OVERRIDE = os.getenv("XGB_FINAL_OVERRIDE", "0") == "1"
+XGB_CONF_CAP = float(os.getenv("XGB_CONF_CAP", "0.52"))
+XGB_CHAOS_FACTOR = float(os.getenv("XGB_CHAOS_FACTOR", "0.70"))
+XGB_MARKOV_CONFLICT_DAMPEN = float(os.getenv("XGB_MARKOV_CONFLICT_DAMPEN", "0.55"))
+XGB_SINGLE_SIDE_DAMPEN = float(os.getenv("XGB_SINGLE_SIDE_DAMPEN", "0.60"))
+XGB_ROAD_WEIGHT = float(os.getenv("XGB_ROAD_WEIGHT", "0.28"))
+XGB_ROOM_WEIGHT = float(os.getenv("XGB_ROOM_WEIGHT", "0.24"))
+XGB_FOOT_WEIGHT = float(os.getenv("XGB_FOOT_WEIGHT", "0.22"))
+XGB_DRAGON_WEIGHT = float(os.getenv("XGB_DRAGON_WEIGHT", "0.18"))
+XGB_REGIME_WEIGHT = float(os.getenv("XGB_REGIME_WEIGHT", "0.16"))
+XGB_GLOBAL_WEIGHT = float(os.getenv("XGB_GLOBAL_WEIGHT", "0.12"))
+XGB_SEQUENCE_WEIGHT = float(os.getenv("XGB_SEQUENCE_WEIGHT", "0.08"))
+XGB_MARKOV_WEIGHT = float(os.getenv("XGB_MARKOV_WEIGHT", "0.06"))
+_XGB_MODEL_CACHE: Dict[str, Any] = {"path": None, "model": None, "error": None}
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -3826,6 +3859,307 @@ def _module_factor(regime: Dict[str, Any], dynamic: Dict[str, Any], key: str) ->
             pass
     return _clamp(f, 0.70, 1.30)
 
+
+
+def _xgb_num(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _xgb_pick_from_signal(sig: Any) -> str:
+    if not isinstance(sig, dict):
+        return ""
+    return "B" if _xgb_num(sig.get("B", 0.5), 0.5) >= _xgb_num(sig.get("P", 0.5), 0.5) else "P"
+
+
+def _xgb_b_side_from_signal(sig: Any) -> float:
+    if not isinstance(sig, dict):
+        return 0.5
+    b = _xgb_num(sig.get("B", 0.5), 0.5)
+    p = _xgb_num(sig.get("P", 1.0 - b), 1.0 - b)
+    total = max(0.001, b + p)
+    return _clamp(b / total, 0.001, 0.999)
+
+
+def _xgb_add_vote(votes: List[Dict[str, Any]], name: str, sig: Any, weight: float, require_active: bool = False) -> None:
+    if not isinstance(sig, dict) or weight <= 0:
+        return
+    if require_active and not sig.get("active"):
+        return
+    b = _xgb_b_side_from_signal(sig)
+    edge = abs(b - 0.5)
+    if edge < 0.002:
+        return
+    strength = _clamp(_xgb_num(sig.get("strength", sig.get("score", edge * 2.0)), edge * 2.0), 0.02, 1.0)
+    votes.append({"name": name, "B": b, "weight": weight, "edge": edge, "strength": strength, "pick": "B" if b >= 0.5 else "P"})
+
+
+def _xgb_feature_vector(
+    history: List[str],
+    non_tie: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    signals: Dict[str, Any],
+) -> Tuple[List[str], List[float]]:
+    bp_total = max(0.001, 1.0 - tie_prob)
+    local_b = _clamp(b_prob / bp_total, 0.001, 0.999)
+    recent8 = non_tie[-min(len(non_tie), 8):]
+    recent14 = non_tie[-min(len(non_tie), 14):]
+    run_data = _runs(non_tie)
+    cur_side, cur_len = _streak(non_tie)
+    regime = signals.get("regime", {}) if isinstance(signals.get("regime"), dict) else {}
+    dynamic = signals.get("dynamic", {}) if isinstance(signals.get("dynamic"), dict) else {}
+    dscores = dynamic.get("scores", {}) if isinstance(dynamic, dict) else {}
+
+    def acc(name: str) -> float:
+        try:
+            return float((dscores.get(name) or {}).get("accuracy", 0.5))
+        except Exception:
+            return 0.5
+
+    names = [
+        "history_len", "non_tie_len", "hist_tie_rate", "recent8_b_rate", "recent14_b_rate",
+        "switch_rate_8", "switch_rate_14", "run_count", "current_streak_len", "current_side_is_b",
+        "avg_run_len_tail", "max_run_len_tail", "local_b_side", "local_gap",
+        "markov_b", "full_markov_b", "sequence_b", "road_b", "recent_b", "balance_b", "streak_b",
+        "road_strength", "room_active", "room_b", "foot_active", "foot_b",
+        "dragon_reversal_active", "dragon_continuation", "majority_adjusted", "majority_b",
+        "global_shoe_active", "global_shoe_b", "global_shoe_score", "chaos_active", "chaos_score",
+        "regime_confidence", "regime_chop", "regime_room", "regime_dragon", "regime_chaos", "regime_side_imbalance",
+        "dyn_markov_acc", "dyn_road_acc", "dyn_full_markov_acc", "dyn_sequence_acc",
+    ]
+    road = signals.get("road", {}) if isinstance(signals.get("road"), dict) else {}
+    room_sig = signals.get("room_pattern", {}) if isinstance(signals.get("room_pattern"), dict) else {}
+    foot_sig = signals.get("foot_alignment", {}) if isinstance(signals.get("foot_alignment"), dict) else {}
+    global_sig = signals.get("global_shoe", {}) if isinstance(signals.get("global_shoe"), dict) else {}
+    majority = signals.get("majority", {}) if isinstance(signals.get("majority"), dict) else {}
+    chaos = signals.get("chaos", {}) if isinstance(signals.get("chaos"), dict) else {}
+    road_reversal = road.get("reversal") if isinstance(road.get("reversal"), dict) else {}
+    regime_name = str(regime.get("regime", ""))
+    tail_runs = [n for _s, n in run_data[-8:]]
+    avg_run = sum(tail_runs) / len(tail_runs) if tail_runs else 0.0
+    vals = [
+        float(len(history)), float(len(non_tie)), history.count("T") / max(1, len(history)),
+        recent8.count("B") / max(1, len(recent8)), recent14.count("B") / max(1, len(recent14)),
+        _window_switch_rate(recent8), _window_switch_rate(recent14), float(len(run_data)), float(cur_len), 1.0 if cur_side == "B" else 0.0,
+        avg_run, float(max(tail_runs) if tail_runs else 0), local_b, abs(local_b - 0.5) * 2.0,
+        _xgb_b_side_from_signal(signals.get("markov")), _xgb_b_side_from_signal(signals.get("full_markov")),
+        _xgb_b_side_from_signal(signals.get("sequence")), _xgb_b_side_from_signal(road),
+        _xgb_b_side_from_signal(signals.get("recent")), _xgb_b_side_from_signal(signals.get("balance")), _xgb_b_side_from_signal(signals.get("streak")),
+        _xgb_num(road.get("strength", 0.0)), 1.0 if room_sig.get("active") else 0.0, _xgb_b_side_from_signal(room_sig),
+        1.0 if foot_sig.get("active") else 0.0, _xgb_b_side_from_signal(foot_sig),
+        1.0 if road_reversal.get("active") else 0.0, 1.0 if road.get("road_action") == "續龍" else 0.0,
+        1.0 if majority.get("adjusted") else 0.0, _xgb_b_side_from_signal(majority),
+        1.0 if global_sig.get("active") else 0.0, _xgb_b_side_from_signal(global_sig), _xgb_num(global_sig.get("score", 0.0)),
+        1.0 if chaos.get("active") else 0.0, _xgb_num(chaos.get("score", 0.0)),
+        _xgb_num(regime.get("confidence", regime.get("score", 0.0)), 0.0),
+        1.0 if "chop" in regime_name else 0.0, 1.0 if "room" in regime_name or "double" in regime_name else 0.0,
+        1.0 if "dragon" in regime_name else 0.0, 1.0 if "chaos" in regime_name else 0.0, 1.0 if "side" in regime_name or "imbalance" in regime_name else 0.0,
+        acc("markov"), acc("road"), acc("full_markov"), acc("sequence"),
+    ]
+    return names, [float(_clamp(v, -999.0, 999.0)) for v in vals]
+
+
+def _load_xgb_model() -> Tuple[Any, str]:
+    if not XGB_EXTERNAL_MODEL_MODE:
+        return None, "external_model_disabled"
+    if not XGB_MODEL_PATH:
+        return None, "xgb_model_path_empty"
+    if _XGB_MODEL_CACHE.get("path") == XGB_MODEL_PATH and _XGB_MODEL_CACHE.get("model") is not None:
+        return _XGB_MODEL_CACHE["model"], ""
+    if _XGB_MODEL_CACHE.get("path") == XGB_MODEL_PATH and _XGB_MODEL_CACHE.get("error"):
+        return None, str(_XGB_MODEL_CACHE.get("error"))
+    try:
+        import xgboost as xgb  # type: ignore
+        booster = xgb.Booster()
+        booster.load_model(XGB_MODEL_PATH)
+        _XGB_MODEL_CACHE.update({"path": XGB_MODEL_PATH, "model": booster, "error": None})
+        return booster, ""
+    except Exception as e:
+        _XGB_MODEL_CACHE.update({"path": XGB_MODEL_PATH, "model": None, "error": f"{type(e).__name__}: {e}"})
+        return None, str(_XGB_MODEL_CACHE.get("error"))
+
+
+def _xgb_external_predict(feature_names: List[str], features: List[float]) -> Tuple[float | None, str]:
+    model, err = _load_xgb_model()
+    if model is None:
+        return None, err
+    try:
+        import xgboost as xgb  # type: ignore
+        dmat = xgb.DMatrix([features], feature_names=feature_names if XGB_USE_FEATURE_NAMES else None)
+        pred = model.predict(dmat)
+        # Supports binary probability [pB] or multiclass [pP, pB] / [pB, pP].
+        row = pred[0]
+        try:
+            vals = list(row)
+        except Exception:
+            vals = [float(row)]
+        if len(vals) == 1:
+            p_b = float(vals[0])
+        elif len(vals) >= 2:
+            # Default: index 1 is Banker probability in many two-class layouts. Override by env if needed.
+            idx = int(os.getenv("XGB_BANKER_CLASS_INDEX", "1"))
+            idx = max(0, min(idx, len(vals) - 1))
+            p_b = float(vals[idx])
+        else:
+            return None, "xgb_empty_prediction"
+        return _clamp(p_b, 0.001, 0.999), ""
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _xgb_lite_fusion_predict(non_tie: List[str], signals: Dict[str, Any]) -> Dict[str, Any]:
+    votes: List[Dict[str, Any]] = []
+    _xgb_add_vote(votes, "road", signals.get("road"), XGB_ROAD_WEIGHT)
+    _xgb_add_vote(votes, "room", signals.get("room_pattern"), XGB_ROOM_WEIGHT, require_active=True)
+    _xgb_add_vote(votes, "foot", signals.get("foot_alignment"), XGB_FOOT_WEIGHT, require_active=True)
+    _xgb_add_vote(votes, "global_shoe", signals.get("global_shoe"), XGB_GLOBAL_WEIGHT, require_active=True)
+    _xgb_add_vote(votes, "sequence", signals.get("sequence"), XGB_SEQUENCE_WEIGHT, require_active=True)
+    _xgb_add_vote(votes, "full_markov", signals.get("full_markov"), XGB_MARKOV_WEIGHT, require_active=True)
+    _xgb_add_vote(votes, "markov", signals.get("markov"), XGB_MARKOV_WEIGHT * 0.70)
+    _xgb_add_vote(votes, "majority", signals.get("majority"), XGB_GLOBAL_WEIGHT, require_active=True)
+
+    road = signals.get("road", {}) if isinstance(signals.get("road"), dict) else {}
+    reversal = road.get("reversal") if isinstance(road.get("reversal"), dict) else {}
+    if reversal.get("active") and reversal.get("target_side") in {"B", "P"}:
+        target = str(reversal.get("target_side"))
+        edge = min(XGB_MAX_EDGE, max(XGB_EDGE, _xgb_num(reversal.get("break_edge", REVERSAL_EDGE), REVERSAL_EDGE)))
+        b = 0.5 + edge if target == "B" else 0.5 - edge
+        votes.append({"name": "dragon_reversal", "B": b, "weight": XGB_DRAGON_WEIGHT, "edge": edge, "strength": _xgb_num(reversal.get("score", 0.3), 0.3), "pick": target})
+    elif road.get("road_action") == "續龍":
+        _xgb_add_vote(votes, "dragon_continue", road, XGB_DRAGON_WEIGHT * 0.75)
+
+    regime = signals.get("regime", {}) if isinstance(signals.get("regime"), dict) else {}
+    regime_name = str(regime.get("regime", ""))
+    if regime.get("active"):
+        # Regime does not directly predict a side, so it boosts the currently most relevant road-family signal.
+        if "room" in regime_name or "double" in regime_name:
+            _xgb_add_vote(votes, "regime_room", signals.get("room_pattern"), XGB_REGIME_WEIGHT, require_active=True)
+            _xgb_add_vote(votes, "regime_foot", signals.get("foot_alignment"), XGB_REGIME_WEIGHT * 0.85, require_active=True)
+        elif "chop" in regime_name:
+            _xgb_add_vote(votes, "regime_sequence", signals.get("sequence"), XGB_REGIME_WEIGHT, require_active=True)
+        elif "dragon" in regime_name:
+            _xgb_add_vote(votes, "regime_dragon", road, XGB_REGIME_WEIGHT)
+
+    if not votes:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "XGB-Lite 無有效特徵", "strength": 0.0, "votes": []}
+
+    # Conflict guard: when Markov/Sequence chase one side but Road/Room/Foot disagree, dampen Markov-family votes.
+    road_family = [v for v in votes if v["name"] in {"road", "room", "foot", "dragon_reversal", "dragon_continue", "regime_room", "regime_foot", "regime_dragon"}]
+    markov_family = [v for v in votes if v["name"] in {"markov", "full_markov", "sequence", "regime_sequence"}]
+    road_pick = ""
+    if road_family:
+        road_score = sum((v["B"] - 0.5) * 2.0 * v["weight"] for v in road_family)
+        road_pick = "B" if road_score >= 0 else "P"
+    markov_score = sum((v["B"] - 0.5) * 2.0 * v["weight"] for v in markov_family)
+    markov_pick = "B" if markov_score >= 0 else "P"
+    if road_pick and markov_family and road_pick != markov_pick:
+        for v in votes:
+            if v["name"] in {"markov", "full_markov", "sequence", "regime_sequence"}:
+                v["weight"] *= _clamp(XGB_MARKOV_CONFLICT_DAMPEN, 0.20, 1.00)
+
+    recent = non_tie[-min(len(non_tie), 18):]
+    if recent:
+        b_rate = recent.count("B") / len(recent)
+        dominant = "B" if b_rate >= 0.5 else "P"
+        side_rate = max(b_rate, 1 - b_rate)
+        if side_rate >= 0.62:
+            for v in votes:
+                if v["pick"] == dominant and v["name"] in {"markov", "full_markov", "sequence", "global_shoe", "dragon_continue"}:
+                    v["weight"] *= _clamp(XGB_SINGLE_SIDE_DAMPEN, 0.25, 1.00)
+
+    total_w = sum(max(0.0, v["weight"]) for v in votes)
+    if total_w <= 0:
+        return {"active": False, "B": 0.5, "P": 0.5, "label": "XGB-Lite 權重不足", "strength": 0.0, "votes": votes}
+    raw_score = sum((v["B"] - 0.5) * 2.0 * v["weight"] for v in votes) / total_w
+    sign = 1.0 if raw_score >= 0 else -1.0
+    raw_edge = abs(raw_score) * 0.5
+    edge = min(XGB_MAX_EDGE, raw_edge)
+    if edge >= 0.006:
+        edge = max(min(XGB_EDGE, XGB_MAX_EDGE), edge)
+    b = 0.5 + sign * edge
+    top = sorted(votes, key=lambda x: abs(x["B"] - 0.5) * x["weight"], reverse=True)[:3]
+    label = "XGB-Lite融合｜" + "+".join(v["name"] for v in top)
+    return {"active": True, "B": _clamp(b, 0.001, 0.999), "P": _clamp(1.0 - b, 0.001, 0.999), "label": label, "strength": _clamp(abs(raw_score), 0.02, 0.36), "edge": round(edge, 5), "votes": top, "raw_score": round(raw_score, 5), "mode": "xgb_lite"}
+
+
+def _xgb_fusion_layer(
+    history: List[str],
+    non_tie: List[str],
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    signals: Dict[str, Any],
+) -> Dict[str, Any]:
+    base = {"active": False, "adjusted": False, "B": b_prob, "P": p_prob, "T": tie_prob, "label": "XGBoost融合未啟動", "strength": 0.0, "mode": "off"}
+    if not XGB_FUSION_MODE or len(non_tie) < XGB_MIN_HISTORY:
+        return base
+
+    feature_names, features = _xgb_feature_vector(history, non_tie, b_prob, p_prob, tie_prob, signals)
+    p_b_ext, err = _xgb_external_predict(feature_names, features)
+    if p_b_ext is not None:
+        sign = 1.0 if p_b_ext >= 0.5 else -1.0
+        edge = min(XGB_MAX_EDGE, abs(p_b_ext - 0.5))
+        xgb_b_side = 0.5 + sign * edge
+        xgb_signal = {"active": True, "B": xgb_b_side, "P": 1.0 - xgb_b_side, "label": "XGBoost外部模型融合", "strength": _clamp(edge * 6.0, 0.04, 0.36), "edge": round(edge, 5), "mode": "external_xgboost", "error": ""}
+    elif XGB_FALLBACK_MODE:
+        xgb_signal = _xgb_lite_fusion_predict(non_tie, signals)
+        xgb_signal["external_error"] = err
+    else:
+        base["label"] = "XGBoost模型未提供"
+        base["error"] = err
+        return base
+
+    if not xgb_signal.get("active"):
+        out = dict(base)
+        out.update(xgb_signal)
+        out["features"] = dict(zip(feature_names, features)) if os.getenv("DEBUG_XGB_FEATURES", "0") == "1" else None
+        return out
+
+    bp_total = max(0.001, 1.0 - tie_prob)
+    cur_b_side = _clamp(b_prob / bp_total, 0.001, 0.999)
+    xgb_b_side = _clamp(float(xgb_signal.get("B", 0.5)), 0.001, 0.999)
+    cur_pick = "B" if cur_b_side >= 0.5 else "P"
+    xgb_pick = "B" if xgb_b_side >= 0.5 else "P"
+    local_gap = abs(cur_b_side - 0.5) * 2.0
+    strength = _clamp(float(xgb_signal.get("strength", 0.0)), 0.0, 0.40)
+    blend = XGB_FUSION_WEIGHT * (0.70 + min(0.30, strength))
+    if signals.get("chaos", {}).get("active") if isinstance(signals.get("chaos"), dict) else False:
+        blend *= XGB_CHAOS_FACTOR
+    if xgb_pick != cur_pick and local_gap >= XGB_STRONG_LOCAL_GAP and not XGB_FINAL_OVERRIDE:
+        blend *= _clamp(XGB_LOCAL_GAP_DAMPEN, 0.15, 1.0)
+    blend = _clamp(blend, 0.0, XGB_MAX_BLEND)
+
+    new_b_side = cur_b_side * (1.0 - blend) + xgb_b_side * blend
+    forced = False
+    if XGB_FINAL_OVERRIDE and xgb_pick in {"B", "P"}:
+        raw_edge = min(XGB_MAX_EDGE, max(XGB_EDGE, abs(xgb_b_side - 0.5)))
+        new_b_side = 0.5 + raw_edge if xgb_pick == "B" else 0.5 - raw_edge
+        forced = True
+
+    out_b = new_b_side * bp_total
+    out_p = (1.0 - new_b_side) * bp_total
+    out_b, out_p, out_t = _normalize_three(out_b, out_p, tie_prob)
+    out = dict(xgb_signal)
+    out.update({
+        "active": True,
+        "adjusted": True,
+        "forced": forced,
+        "B": out_b,
+        "P": out_p,
+        "T": out_t,
+        "target_side": xgb_pick,
+        "blend": round(blend, 5),
+        "local_gap_before": round(local_gap, 5),
+        "features": dict(zip(feature_names, features)) if os.getenv("DEBUG_XGB_FEATURES", "0") == "1" else None,
+    })
+    return out
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, road_strength: float) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.4 + agreement * 0.20 + road_strength * 0.34 + min(0.15, history_len / 85)
@@ -4085,6 +4419,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             "dynamic_weight_mode": DYNAMIC_WEIGHT_MODE,
             "dynamic_weight_window": DYNAMIC_WEIGHT_WINDOW,
             "dynamic_weight_max_shift": DYNAMIC_WEIGHT_MAX_SHIFT,
+        },
+        "v20_xgb_fusion_config": {
+            "xgb_fusion_mode": XGB_FUSION_MODE,
+            "xgb_external_model_mode": XGB_EXTERNAL_MODEL_MODE,
+            "xgb_model_path": XGB_MODEL_PATH,
+            "xgb_fallback_mode": XGB_FALLBACK_MODE,
+            "xgb_fusion_weight": XGB_FUSION_WEIGHT,
+            "xgb_max_blend": XGB_MAX_BLEND,
+            "xgb_final_override": XGB_FINAL_OVERRIDE,
         },
         "v14_context_config": {
             "global_shoe_context_mode": GLOBAL_SHOE_CONTEXT_MODE,
@@ -4382,6 +4725,31 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         tie_prob = float(global_shoe_context.get("T", tie_prob))
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    # ----- V20 XGBoost Fusion Layer -----
+    # Final fusion stage. It integrates Road / Room / Foot / Dragon / Regime / Global Shoe / Markov / Sequence.
+    xgb_fusion = _xgb_fusion_layer(history, non_tie, b_prob, p_prob, tie_prob, {
+        "markov": markov,
+        "full_markov": full_markov,
+        "road": road,
+        "sequence": sequence,
+        "recent": recent,
+        "balance": balance,
+        "streak": streak,
+        "chaos": chaos,
+        "regime": regime_context,
+        "dynamic": dynamic_weight_context,
+        "majority": majority_guard,
+        "global_reversal": global_reversal,
+        "global_shoe": global_shoe_context,
+        "room_pattern": road_room_pattern if 'road_room_pattern' in locals() else {},
+        "foot_alignment": road_foot_alignment if 'road_foot_alignment' in locals() else {},
+    })
+    if xgb_fusion.get("active") and xgb_fusion.get("adjusted"):
+        b_prob = float(xgb_fusion.get("B", b_prob))
+        p_prob = float(xgb_fusion.get("P", p_prob))
+        tie_prob = float(xgb_fusion.get("T", tie_prob))
+        b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -4405,6 +4773,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if full_markov.get("B", 0.5) >= full_markov.get("P", 0.5) else "P")
     if isinstance(sequence, dict) and sequence.get("active"):
         votes.append("B" if sequence.get("B", 0.5) >= sequence.get("P", 0.5) else "P")
+    if isinstance(xgb_fusion, dict) and xgb_fusion.get("active"):
+        votes.append("B" if xgb_fusion.get("B", 0.5) >= xgb_fusion.get("P", 0.5) else "P")
     if 'road_room_pattern' in locals() and isinstance(road_room_pattern, dict) and road_room_pattern.get("active"):
         votes.append("B" if road_room_pattern.get("B", 0.5) >= road_room_pattern.get("P", 0.5) else "P")
     if 'road_foot_alignment' in locals() and isinstance(road_foot_alignment, dict) and road_foot_alignment.get("active"):
@@ -4453,6 +4823,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, FULL_MARKOV_CONF_CAP)
         if not chaos.get("active"):
             level = "完整馬可夫校準"
+    if isinstance(xgb_fusion, dict) and xgb_fusion.get("active") and xgb_fusion.get("adjusted"):
+        conf = min(conf, XGB_CONF_CAP)
+        if not chaos.get("active"):
+            level = "XGBoost融合校準" if not xgb_fusion.get("forced") else "XGBoost融合強校準"
     if 'after_tie_safe' in locals() and after_tie_safe.get("active"):
         conf = min(conf, AFTER_TIE_CONF_CAP)
         level = "和局後安全觀察"
@@ -4466,6 +4840,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.append(f"路型:{regime_context.get('regime')}")
     if isinstance(dynamic_weight_context, dict) and dynamic_weight_context.get("active"):
         reason_parts.append(f"動態權重:{dynamic_weight_context.get('best_model')}")
+    if isinstance(xgb_fusion, dict) and xgb_fusion.get("active"):
+        reason_parts.insert(0, f"{xgb_fusion.get('label')}({int(float(xgb_fusion.get('strength', 0))*100)}%)")
+        if xgb_fusion.get("adjusted"):
+            reason_parts.append("XGBoost融合統整")
+        if xgb_fusion.get("mode") == "xgb_lite":
+            reason_parts.append("XGB-Lite本地融合")
+        elif xgb_fusion.get("mode") == "external_xgboost":
+            reason_parts.append("外部XGBoost模型")
     if majority_guard.get("active") and majority_guard.get("adjusted"):
         reason_parts.insert(0, f"{majority_guard.get('label')}({int(float(majority_guard.get('score', 0))*100)}%)")
         if majority_guard.get("forced"):
@@ -4533,7 +4915,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     return {
         "ok": True,
-        "model_version": "V19 Full Markov + Global Shoe + Regime Switch + Dynamic Weight + Bayes",
+        "model_version": "V20 XGBoost Fusion + Road/Regime/Bayes/Dynamic",
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -4548,6 +4930,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "signal_level": level,
         "regime": regime_context.get("regime") if isinstance(regime_context, dict) else "",
         "dynamic_best_model": dynamic_weight_context.get("best_model") if isinstance(dynamic_weight_context, dict) else "",
+        "xgb_fusion_mode": xgb_fusion.get("mode") if isinstance(xgb_fusion, dict) else "",
         "bet_mode": "最小注" if (
             (chaos.get("active") and LOW_CONFIDENCE_MINBET)
             or (majority_guard.get("active") and majority_guard.get("adjusted"))
@@ -4578,6 +4961,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "chaos": chaos,
         "full_markov": full_markov,
         "sequence_pattern": sequence,
+        "xgb_fusion": xgb_fusion,
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
         "global_shoe_context": global_shoe_context if 'global_shoe_context' in locals() else None,
