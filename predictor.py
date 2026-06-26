@@ -1,12 +1,17 @@
 import math
 import os
-import json
-import time
 from collections import Counter, defaultdict
 from statistics import median
 from typing import Any, Dict, List, Tuple
 
 from deepseek_client import DeepSeekClient
+
+# ============================================================
+# V16 Classic / Lite
+# 目標：回到百家樂核心牌路判斷。
+# 主判斷保留 Road / Room / Foot / Chop / Dragon / After-Tie。
+# AI、全靴前中後、全局反轉、多數邊、Chaos 預設只做輕量保護或關閉硬覆蓋。
+# ============================================================
 
 # Base baccarat long-run priors, used only as soft priors for display calibration.
 B_PRIOR = float(os.getenv("B_PRIOR", "0.4586"))
@@ -14,24 +19,24 @@ P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
 # Main ensemble weights.
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.22"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.30"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.16"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.10"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.10"))
-TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
-AI_BLEND = float(os.getenv("AI_BLEND", "0.14"))
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.16"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.46"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.08"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.05"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.12"))
+TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.02"))
+AI_BLEND = float(os.getenv("AI_BLEND", "0.06"))
 
 # DeepSeek full-shoe payload controls.
 # The local model always uses the full current shoe. These settings make the
 # DeepSeek calibration layer receive the full current shoe as raw B/P/T sequence
 # plus full run-length diagnostics instead of only a short tail summary.
 AI_FULL_HISTORY_MODE = os.getenv("AI_FULL_HISTORY_MODE", "1") == "1"
-AI_HISTORY_FULL_LIMIT = int(os.getenv("AI_HISTORY_FULL_LIMIT", "180"))
-AI_NON_TIE_FULL_LIMIT = int(os.getenv("AI_NON_TIE_FULL_LIMIT", "180"))
-AI_RUNS_FULL_LIMIT = int(os.getenv("AI_RUNS_FULL_LIMIT", "90"))
-AI_HISTORY_TAIL_LIMIT = int(os.getenv("AI_HISTORY_TAIL_LIMIT", "80"))
-AI_RUNS_TAIL_LIMIT = int(os.getenv("AI_RUNS_TAIL_LIMIT", "30"))
+AI_HISTORY_FULL_LIMIT = int(os.getenv("AI_HISTORY_FULL_LIMIT", "90"))
+AI_NON_TIE_FULL_LIMIT = int(os.getenv("AI_NON_TIE_FULL_LIMIT", "90"))
+AI_RUNS_FULL_LIMIT = int(os.getenv("AI_RUNS_FULL_LIMIT", "50"))
+AI_HISTORY_TAIL_LIMIT = int(os.getenv("AI_HISTORY_TAIL_LIMIT", "50"))
+AI_RUNS_TAIL_LIMIT = int(os.getenv("AI_RUNS_TAIL_LIMIT", "28"))
 AI_INCLUDE_PATTERN_DIAGNOSTICS = os.getenv("AI_INCLUDE_PATTERN_DIAGNOSTICS", "1") == "1"
 
 # Tie handling. Tie should usually be a warning layer, not a main recommendation.
@@ -40,18 +45,18 @@ TIE_MAX_PROB = float(os.getenv("TIE_MAX_PROB", "0.18"))
 ALLOW_TIE_RECOMMEND = os.getenv("ALLOW_TIE_RECOMMEND", "0") == "1"
 TIE_RECOMMEND_MIN = float(os.getenv("TIE_RECOMMEND_MIN", "0.165"))
 
-MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "6"))
+MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "12"))
 MIN_HISTORY_FOR_SIGNAL = int(os.getenv("MIN_HISTORY_FOR_SIGNAL", "4"))
 
 # Advanced road / dragon controls.
-DRAGON_MIN_LEN = int(os.getenv("DRAGON_MIN_LEN", "3"))
-DRAGON_STRONG_LEN = int(os.getenv("DRAGON_STRONG_LEN", "5"))
-DRAGON_FATIGUE_START = int(os.getenv("DRAGON_FATIGUE_START", "8"))
-DRAGON_MAX_EDGE = float(os.getenv("DRAGON_MAX_EDGE", "0.105"))
-DRAGON_BREAK_EDGE = float(os.getenv("DRAGON_BREAK_EDGE", "0.080"))
-RUN_CYCLE_MIN_HITS = int(os.getenv("RUN_CYCLE_MIN_HITS", "3"))
-ROAD_PATTERN_WINDOW = int(os.getenv("ROAD_PATTERN_WINDOW", "16"))
-PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "5"))
+DRAGON_MIN_LEN = int(os.getenv("DRAGON_MIN_LEN", "2"))
+DRAGON_STRONG_LEN = int(os.getenv("DRAGON_STRONG_LEN", "4"))
+DRAGON_FATIGUE_START = int(os.getenv("DRAGON_FATIGUE_START", "4"))
+DRAGON_MAX_EDGE = float(os.getenv("DRAGON_MAX_EDGE", "0.056"))
+DRAGON_BREAK_EDGE = float(os.getenv("DRAGON_BREAK_EDGE", "0.092"))
+RUN_CYCLE_MIN_HITS = int(os.getenv("RUN_CYCLE_MIN_HITS", "2"))
+ROAD_PATTERN_WINDOW = int(os.getenv("ROAD_PATTERN_WINDOW", "12"))
+PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "4"))
 MARKOV_ALPHA = float(os.getenv("MARKOV_ALPHA", "2.6"))
 MARKOV_FULL_SAMPLE = float(os.getenv("MARKOV_FULL_SAMPLE", "16"))
 
@@ -62,11 +67,11 @@ DRAGON_MEMORY_LOOKBACK = int(os.getenv("DRAGON_MEMORY_LOOKBACK", "28"))
 DRAGON_BREAK_REPEAT_MIN = int(os.getenv("DRAGON_BREAK_REPEAT_MIN", "3"))
 BREAKOUT_DRAGON_MODE = os.getenv("BREAKOUT_DRAGON_MODE", "1") == "1"
 BREAKOUT_MIN_LEN = int(os.getenv("BREAKOUT_MIN_LEN", str(DRAGON_STRONG_LEN)))
-BREAKOUT_PROTECT_STEPS = int(os.getenv("BREAKOUT_PROTECT_STEPS", "2"))
-BREAKOUT_EXTEND_STEPS = int(os.getenv("BREAKOUT_EXTEND_STEPS", "2"))
-BREAKOUT_CONT_EDGE = float(os.getenv("BREAKOUT_CONT_EDGE", "0.038"))
-BREAKOUT_NEW_HIGH_BONUS = float(os.getenv("BREAKOUT_NEW_HIGH_BONUS", "0.014"))
-BREAKOUT_OVERHEAT_PENALTY = float(os.getenv("BREAKOUT_OVERHEAT_PENALTY", "0.018"))
+BREAKOUT_PROTECT_STEPS = int(os.getenv("BREAKOUT_PROTECT_STEPS", "0"))
+BREAKOUT_EXTEND_STEPS = int(os.getenv("BREAKOUT_EXTEND_STEPS", "1"))
+BREAKOUT_CONT_EDGE = float(os.getenv("BREAKOUT_CONT_EDGE", "0.014"))
+BREAKOUT_NEW_HIGH_BONUS = float(os.getenv("BREAKOUT_NEW_HIGH_BONUS", "0.004"))
+BREAKOUT_OVERHEAT_PENALTY = float(os.getenv("BREAKOUT_OVERHEAT_PENALTY", "0.030"))
 
 # Chaos / broken-road regime controls.
 # These protect the model from forcing dragon/chop/double-chop logic on unstable shoes.
@@ -77,20 +82,20 @@ CHOP_BREAK_DETECTOR = os.getenv("CHOP_BREAK_DETECTOR", "1") == "1"
 LOW_CONFIDENCE_MINBET = os.getenv("LOW_CONFIDENCE_MINBET", "1") == "1"
 
 CHAOS_WINDOW = int(os.getenv("CHAOS_WINDOW", "18"))
-CHAOS_TRIGGER = float(os.getenv("CHAOS_TRIGGER", "0.58"))
-CHAOS_STRONG_TRIGGER = float(os.getenv("CHAOS_STRONG_TRIGGER", "0.72"))
-CHAOS_MAX_EDGE = float(os.getenv("CHAOS_MAX_EDGE", "0.045"))
-CHAOS_RECENT_BLEND = float(os.getenv("CHAOS_RECENT_BLEND", "0.26"))
-CHAOS_CONF_CAP = float(os.getenv("CHAOS_CONF_CAP", "0.46"))
-CHAOS_STRONG_CONF_CAP = float(os.getenv("CHAOS_STRONG_CONF_CAP", "0.38"))
-CHAOS_AI_BLEND_FACTOR = float(os.getenv("CHAOS_AI_BLEND_FACTOR", "0.55"))
+CHAOS_TRIGGER = float(os.getenv("CHAOS_TRIGGER", "0.70"))
+CHAOS_STRONG_TRIGGER = float(os.getenv("CHAOS_STRONG_TRIGGER", "0.84"))
+CHAOS_MAX_EDGE = float(os.getenv("CHAOS_MAX_EDGE", "0.025"))
+CHAOS_RECENT_BLEND = float(os.getenv("CHAOS_RECENT_BLEND", "0.12"))
+CHAOS_CONF_CAP = float(os.getenv("CHAOS_CONF_CAP", "0.58"))
+CHAOS_STRONG_CONF_CAP = float(os.getenv("CHAOS_STRONG_CONF_CAP", "0.48"))
+CHAOS_AI_BLEND_FACTOR = float(os.getenv("CHAOS_AI_BLEND_FACTOR", "0.45"))
 
 # Dynamic weight factors used only when chaos mode is active.
 CHAOS_MARKOV_WEIGHT_FACTOR = float(os.getenv("CHAOS_MARKOV_WEIGHT_FACTOR", "1.22"))
-CHAOS_ROAD_WEIGHT_FACTOR = float(os.getenv("CHAOS_ROAD_WEIGHT_FACTOR", "0.45"))
-CHAOS_STREAK_WEIGHT_FACTOR = float(os.getenv("CHAOS_STREAK_WEIGHT_FACTOR", "0.48"))
+CHAOS_ROAD_WEIGHT_FACTOR = float(os.getenv("CHAOS_ROAD_WEIGHT_FACTOR", "0.85"))
+CHAOS_STREAK_WEIGHT_FACTOR = float(os.getenv("CHAOS_STREAK_WEIGHT_FACTOR", "0.75"))
 CHAOS_BALANCE_WEIGHT_FACTOR = float(os.getenv("CHAOS_BALANCE_WEIGHT_FACTOR", "0.70"))
-CHAOS_RECENT_WEIGHT_FACTOR = float(os.getenv("CHAOS_RECENT_WEIGHT_FACTOR", "1.60"))
+CHAOS_RECENT_WEIGHT_FACTOR = float(os.getenv("CHAOS_RECENT_WEIGHT_FACTOR", "1.10"))
 
 # Chaos scoring knobs.
 CHAOS_MIN_RUN_VARIETY = int(os.getenv("CHAOS_MIN_RUN_VARIETY", "3"))
@@ -110,9 +115,9 @@ CHOP_BREAK_DROP = float(os.getenv("CHOP_BREAK_DROP", "0.22"))
 FIRST_SIDE_DRAGON_MODE = os.getenv("FIRST_SIDE_DRAGON_MODE", "1") == "1"
 FIRST_SIDE_DRAGON_MIN_LEN = int(os.getenv("FIRST_SIDE_DRAGON_MIN_LEN", "4"))
 FIRST_SIDE_DRAGON_BASELINE = int(os.getenv("FIRST_SIDE_DRAGON_BASELINE", "3"))
-FIRST_SIDE_DRAGON_PROTECT_STEPS = int(os.getenv("FIRST_SIDE_DRAGON_PROTECT_STEPS", "2"))
-FIRST_SIDE_DRAGON_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_EDGE", "0.034"))
-FIRST_SIDE_DRAGON_MAX_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_MAX_EDGE", "0.055"))
+FIRST_SIDE_DRAGON_PROTECT_STEPS = int(os.getenv("FIRST_SIDE_DRAGON_PROTECT_STEPS", "0"))
+FIRST_SIDE_DRAGON_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_EDGE", "0.014"))
+FIRST_SIDE_DRAGON_MAX_EDGE = float(os.getenv("FIRST_SIDE_DRAGON_MAX_EDGE", "0.030"))
 SIDE_AWARE_BREAKOUT = os.getenv("SIDE_AWARE_BREAKOUT", "1") == "1"
 
 # Dragon reversal / turning-point controls.
@@ -120,18 +125,18 @@ SIDE_AWARE_BREAKOUT = os.getenv("SIDE_AWARE_BREAKOUT", "1") == "1"
 # It uses length fatigue, repeated same-side cut lengths, imbalance, and prior
 # max length instead of blindly following every long dragon.
 DRAGON_REVERSAL_MODE = os.getenv("DRAGON_REVERSAL_MODE", "1") == "1"
-REVERSAL_MIN_LEN = int(os.getenv("REVERSAL_MIN_LEN", "6"))
-REVERSAL_FATIGUE_LEN = int(os.getenv("REVERSAL_FATIGUE_LEN", "8"))
-REVERSAL_TRIGGER = float(os.getenv("REVERSAL_TRIGGER", "0.46"))
-REVERSAL_STRONG_TRIGGER = float(os.getenv("REVERSAL_STRONG_TRIGGER", "0.62"))
-REVERSAL_REPEAT_NEAR_MIN = int(os.getenv("REVERSAL_REPEAT_NEAR_MIN", "2"))
-REVERSAL_OVER_MAX_LEN = int(os.getenv("REVERSAL_OVER_MAX_LEN", "2"))
+REVERSAL_MIN_LEN = int(os.getenv("REVERSAL_MIN_LEN", "3"))
+REVERSAL_FATIGUE_LEN = int(os.getenv("REVERSAL_FATIGUE_LEN", "4"))
+REVERSAL_TRIGGER = float(os.getenv("REVERSAL_TRIGGER", "0.38"))
+REVERSAL_STRONG_TRIGGER = float(os.getenv("REVERSAL_STRONG_TRIGGER", "0.56"))
+REVERSAL_REPEAT_NEAR_MIN = int(os.getenv("REVERSAL_REPEAT_NEAR_MIN", "1"))
+REVERSAL_OVER_MAX_LEN = int(os.getenv("REVERSAL_OVER_MAX_LEN", "1"))
 REVERSAL_IMBALANCE_TRIGGER = float(os.getenv("REVERSAL_IMBALANCE_TRIGGER", "0.62"))
-REVERSAL_EDGE = float(os.getenv("REVERSAL_EDGE", "0.040"))
-REVERSAL_HARD_EDGE = float(os.getenv("REVERSAL_HARD_EDGE", "0.070"))
+REVERSAL_EDGE = float(os.getenv("REVERSAL_EDGE", "0.052"))
+REVERSAL_HARD_EDGE = float(os.getenv("REVERSAL_HARD_EDGE", "0.088"))
 REVERSAL_PROTECT_FIRST_STEPS = int(os.getenv("REVERSAL_PROTECT_FIRST_STEPS", "1"))
-REVERSAL_FINAL_OVERRIDE = os.getenv("REVERSAL_FINAL_OVERRIDE", "1") == "1"
-REVERSAL_OVERRIDE_EDGE = float(os.getenv("REVERSAL_OVERRIDE_EDGE", "0.058"))
+REVERSAL_FINAL_OVERRIDE = os.getenv("REVERSAL_FINAL_OVERRIDE", "0") == "1"
+REVERSAL_OVERRIDE_EDGE = float(os.getenv("REVERSAL_OVERRIDE_EDGE", "0.040"))
 
 # Single-chop to dragon transition controls.
 # Handles shoes that start as short single-jump / alternating road, then suddenly
@@ -147,7 +152,7 @@ CHOP_TO_DRAGON_EDGE = float(os.getenv("CHOP_TO_DRAGON_EDGE", "0.038"))
 CHOP_TO_DRAGON_MAX_EDGE = float(os.getenv("CHOP_TO_DRAGON_MAX_EDGE", "0.068"))
 CHOP_TO_DRAGON_STRENGTH = float(os.getenv("CHOP_TO_DRAGON_STRENGTH", "0.195"))
 CHOP_TO_DRAGON_CHAOS_RELIEF = float(os.getenv("CHOP_TO_DRAGON_CHAOS_RELIEF", "0.10"))
-CHOP_TO_DRAGON_FINAL_OVERRIDE = os.getenv("CHOP_TO_DRAGON_FINAL_OVERRIDE", "1") == "1"
+CHOP_TO_DRAGON_FINAL_OVERRIDE = os.getenv("CHOP_TO_DRAGON_FINAL_OVERRIDE", "0") == "1"
 CHOP_TO_DRAGON_OVERRIDE_EDGE = float(os.getenv("CHOP_TO_DRAGON_OVERRIDE_EDGE", "0.040"))
 
 # Room Pattern Mode:
@@ -158,22 +163,22 @@ ROOM_PATTERN_MODE = os.getenv("ROOM_PATTERN_MODE", "1") == "1"
 ROOM_PATTERN_LOOKBACK = int(os.getenv("ROOM_PATTERN_LOOKBACK", "8"))
 ROOM_PATTERN_MIN_RUNS = int(os.getenv("ROOM_PATTERN_MIN_RUNS", "3"))
 ROOM_PATTERN_EARLY_DETECT = os.getenv("ROOM_PATTERN_EARLY_DETECT", "1") == "1"
-ROOM_PATTERN_MIN_CONSISTENCY = float(os.getenv("ROOM_PATTERN_MIN_CONSISTENCY", "0.72"))
-ROOM_PATTERN_EDGE = float(os.getenv("ROOM_PATTERN_EDGE", "0.044"))
-ROOM_PATTERN_MAX_EDGE = float(os.getenv("ROOM_PATTERN_MAX_EDGE", "0.072"))
-ROOM_PATTERN_STRENGTH = float(os.getenv("ROOM_PATTERN_STRENGTH", "0.218"))
+ROOM_PATTERN_MIN_CONSISTENCY = float(os.getenv("ROOM_PATTERN_MIN_CONSISTENCY", "0.64"))
+ROOM_PATTERN_EDGE = float(os.getenv("ROOM_PATTERN_EDGE", "0.066"))
+ROOM_PATTERN_MAX_EDGE = float(os.getenv("ROOM_PATTERN_MAX_EDGE", "0.092"))
+ROOM_PATTERN_STRENGTH = float(os.getenv("ROOM_PATTERN_STRENGTH", "0.300"))
 ONE_TWO_PATTERN_MODE = os.getenv("ONE_TWO_PATTERN_MODE", "1") == "1"
-ONE_TWO_PATTERN_EDGE = float(os.getenv("ONE_TWO_PATTERN_EDGE", "0.046"))
+ONE_TWO_PATTERN_EDGE = float(os.getenv("ONE_TWO_PATTERN_EDGE", "0.068"))
 TWO_ONE_PATTERN_MODE = os.getenv("TWO_ONE_PATTERN_MODE", "1") == "1"
-TWO_ONE_PATTERN_EDGE = float(os.getenv("TWO_ONE_PATTERN_EDGE", "0.046"))
+TWO_ONE_PATTERN_EDGE = float(os.getenv("TWO_ONE_PATTERN_EDGE", "0.068"))
 DOUBLE_CHOP_EARLY_MODE = os.getenv("DOUBLE_CHOP_EARLY_MODE", "1") == "1"
 DOUBLE_CHOP_EARLY_HITS = int(os.getenv("DOUBLE_CHOP_EARLY_HITS", "2"))
-DOUBLE_CHOP_EDGE = float(os.getenv("DOUBLE_CHOP_EDGE", "0.050"))
+DOUBLE_CHOP_EDGE = float(os.getenv("DOUBLE_CHOP_EDGE", "0.066"))
 DOUBLE_CHOP_BREAK_GUARD = os.getenv("DOUBLE_CHOP_BREAK_GUARD", "1") == "1"
 ROOM_PATTERN_FINAL_OVERRIDE = os.getenv("ROOM_PATTERN_FINAL_OVERRIDE", "1") == "1"
-ROOM_PATTERN_OVERRIDE_EDGE = float(os.getenv("ROOM_PATTERN_OVERRIDE_EDGE", "0.050"))
+ROOM_PATTERN_OVERRIDE_EDGE = float(os.getenv("ROOM_PATTERN_OVERRIDE_EDGE", "0.074"))
 ROOM_PATTERN_CHAOS_RELIEF = float(os.getenv("ROOM_PATTERN_CHAOS_RELIEF", "0.080"))
-ROOM_PATTERN_PROTECT_RUNS = int(os.getenv("ROOM_PATTERN_PROTECT_RUNS", "2"))
+ROOM_PATTERN_PROTECT_RUNS = int(os.getenv("ROOM_PATTERN_PROTECT_RUNS", "1"))
 
 # Foot Alignment Mode / 對應齊腳模式:
 # Handles "aligned feet" situations: one side fills to the previous side's run length,
@@ -188,18 +193,18 @@ FOOT_ALIGN_MIN_LEN = int(os.getenv("FOOT_ALIGN_MIN_LEN", "2"))
 FOOT_ALIGN_MAX_LEN = int(os.getenv("FOOT_ALIGN_MAX_LEN", "5"))
 FOOT_ALIGN_MATCH_TOLERANCE = int(os.getenv("FOOT_ALIGN_MATCH_TOLERANCE", "0"))
 FOOT_ALIGN_MIN_CONTEXT = int(os.getenv("FOOT_ALIGN_MIN_CONTEXT", "2"))
-FOOT_ALIGN_EDGE = float(os.getenv("FOOT_ALIGN_EDGE", "0.044"))
-FOOT_ALIGN_BREAK_EDGE = float(os.getenv("FOOT_ALIGN_BREAK_EDGE", "0.050"))
-FOOT_ALIGN_OVER_EDGE = float(os.getenv("FOOT_ALIGN_OVER_EDGE", "0.038"))
+FOOT_ALIGN_EDGE = float(os.getenv("FOOT_ALIGN_EDGE", "0.052"))
+FOOT_ALIGN_BREAK_EDGE = float(os.getenv("FOOT_ALIGN_BREAK_EDGE", "0.064"))
+FOOT_ALIGN_OVER_EDGE = float(os.getenv("FOOT_ALIGN_OVER_EDGE", "0.040"))
 FOOT_ALIGN_MAX_EDGE = float(os.getenv("FOOT_ALIGN_MAX_EDGE", "0.074"))
-FOOT_ALIGN_STRENGTH = float(os.getenv("FOOT_ALIGN_STRENGTH", "0.220"))
+FOOT_ALIGN_STRENGTH = float(os.getenv("FOOT_ALIGN_STRENGTH", "0.250"))
 FOOT_ALIGN_BREAK_RATE = float(os.getenv("FOOT_ALIGN_BREAK_RATE", "0.58"))
 FOOT_ALIGN_OVER_RATE = float(os.getenv("FOOT_ALIGN_OVER_RATE", "0.58"))
 FOOT_ALIGN_DEFAULT_BREAK = os.getenv("FOOT_ALIGN_DEFAULT_BREAK", "1") == "1"
 FOOT_ALIGN_BREAK_GUARD = os.getenv("FOOT_ALIGN_BREAK_GUARD", "1") == "1"
 FOOT_ALIGN_OVERFLOW_HANDOFF = int(os.getenv("FOOT_ALIGN_OVERFLOW_HANDOFF", "2"))
 FOOT_ALIGN_FINAL_OVERRIDE = os.getenv("FOOT_ALIGN_FINAL_OVERRIDE", "1") == "1"
-FOOT_ALIGN_OVERRIDE_EDGE = float(os.getenv("FOOT_ALIGN_OVERRIDE_EDGE", "0.054"))
+FOOT_ALIGN_OVERRIDE_EDGE = float(os.getenv("FOOT_ALIGN_OVERRIDE_EDGE", "0.064"))
 FOOT_ALIGN_CHAOS_RELIEF = float(os.getenv("FOOT_ALIGN_CHAOS_RELIEF", "0.075"))
 FOOT_ALIGN_ROOM_BOOST = float(os.getenv("FOOT_ALIGN_ROOM_BOOST", "0.014"))
 
@@ -218,7 +223,7 @@ MIRROR_RUN_STRENGTH = float(os.getenv("MIRROR_RUN_STRENGTH", "0.185"))
 MIRROR_RUN_COMPLETE_REVERSAL = os.getenv("MIRROR_RUN_COMPLETE_REVERSAL", "1") == "1"
 MIRROR_RUN_REVERSAL_EDGE = float(os.getenv("MIRROR_RUN_REVERSAL_EDGE", "0.042"))
 MIRROR_RUN_REVERSAL_MAX_EDGE = float(os.getenv("MIRROR_RUN_REVERSAL_MAX_EDGE", "0.066"))
-MIRROR_RUN_FINAL_OVERRIDE = os.getenv("MIRROR_RUN_FINAL_OVERRIDE", "1") == "1"
+MIRROR_RUN_FINAL_OVERRIDE = os.getenv("MIRROR_RUN_FINAL_OVERRIDE", "0") == "1"
 MIRROR_RUN_OVERRIDE_EDGE = float(os.getenv("MIRROR_RUN_OVERRIDE_EDGE", "0.042"))
 MIRROR_RUN_CHAOS_RELIEF = float(os.getenv("MIRROR_RUN_CHAOS_RELIEF", "0.085"))
 
@@ -245,7 +250,7 @@ MAJORITY_FORCE_REVERSAL_SCORE = float(os.getenv("MAJORITY_FORCE_REVERSAL_SCORE",
 MAJORITY_MAX_EDGE = float(os.getenv("MAJORITY_MAX_EDGE", "0.052"))
 MAJORITY_CONF_CAP = float(os.getenv("MAJORITY_CONF_CAP", "0.48"))
 MAJORITY_STRONG_CONF_CAP = float(os.getenv("MAJORITY_STRONG_CONF_CAP", "0.42"))
-MAJORITY_FINAL_OVERRIDE = os.getenv("MAJORITY_FINAL_OVERRIDE", "1") == "1"
+MAJORITY_FINAL_OVERRIDE = os.getenv("MAJORITY_FINAL_OVERRIDE", "0") == "1"
 
 # Global Reversal Mode:
 # Final reversal radar for ordinary road states, complex roads, and after-tie turns.
@@ -259,7 +264,7 @@ GLOBAL_REVERSAL_TRIGGER = float(os.getenv("GLOBAL_REVERSAL_TRIGGER", "0.50"))
 GLOBAL_REVERSAL_STRONG_TRIGGER = float(os.getenv("GLOBAL_REVERSAL_STRONG_TRIGGER", "0.64"))
 GLOBAL_REVERSAL_EDGE = float(os.getenv("GLOBAL_REVERSAL_EDGE", "0.034"))
 GLOBAL_REVERSAL_HARD_EDGE = float(os.getenv("GLOBAL_REVERSAL_HARD_EDGE", "0.060"))
-GLOBAL_REVERSAL_FINAL_OVERRIDE = os.getenv("GLOBAL_REVERSAL_FINAL_OVERRIDE", "1") == "1"
+GLOBAL_REVERSAL_FINAL_OVERRIDE = os.getenv("GLOBAL_REVERSAL_FINAL_OVERRIDE", "0") == "1"
 GLOBAL_REVERSAL_CONF_CAP = float(os.getenv("GLOBAL_REVERSAL_CONF_CAP", "0.44"))
 GLOBAL_REVERSAL_STRONG_CONF_CAP = float(os.getenv("GLOBAL_REVERSAL_STRONG_CONF_CAP", "0.38"))
 GLOBAL_REVERSAL_VALID_DRAGON_PROTECT = float(os.getenv("GLOBAL_REVERSAL_VALID_DRAGON_PROTECT", "0.55"))
@@ -288,23 +293,23 @@ AFTER_TIE_SCORE_BONUS = float(os.getenv("AFTER_TIE_SCORE_BONUS", "0.080"))
 # Full-shoe controller for 60~70-round baccarat tables. It compares early/mid/recent
 # shoe phases and prevents local short-window signals from overpowering the shoe's
 # dominant road structure too easily.
-GLOBAL_SHOE_CONTEXT_MODE = os.getenv("GLOBAL_SHOE_CONTEXT_MODE", "1") == "1"
+GLOBAL_SHOE_CONTEXT_MODE = os.getenv("GLOBAL_SHOE_CONTEXT_MODE", "0") == "1"
 GLOBAL_SHOE_MIN_HISTORY = int(os.getenv("GLOBAL_SHOE_MIN_HISTORY", "18"))
 GLOBAL_SHOE_WINDOW = int(os.getenv("GLOBAL_SHOE_WINDOW", "24"))
-GLOBAL_SHOE_CONTEXT_TRIGGER = float(os.getenv("GLOBAL_SHOE_CONTEXT_TRIGGER", "0.50"))
-GLOBAL_SHOE_STRONG_TRIGGER = float(os.getenv("GLOBAL_SHOE_STRONG_TRIGGER", "0.66"))
-GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.036"))
-GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.058"))
-GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.18"))
+GLOBAL_SHOE_CONTEXT_TRIGGER = float(os.getenv("GLOBAL_SHOE_CONTEXT_TRIGGER", "0.58"))
+GLOBAL_SHOE_STRONG_TRIGGER = float(os.getenv("GLOBAL_SHOE_STRONG_TRIGGER", "0.74"))
+GLOBAL_SHOE_CONTEXT_EDGE = float(os.getenv("GLOBAL_SHOE_CONTEXT_EDGE", "0.020"))
+GLOBAL_SHOE_OVERRIDE_EDGE = float(os.getenv("GLOBAL_SHOE_OVERRIDE_EDGE", "0.034"))
+GLOBAL_SHOE_CONTEXT_WEIGHT = float(os.getenv("GLOBAL_SHOE_CONTEXT_WEIGHT", "0.08"))
 GLOBAL_SHOE_CONF_CAP = float(os.getenv("GLOBAL_SHOE_CONF_CAP", "0.50"))
 GLOBAL_SHOE_STRONG_CONF_CAP = float(os.getenv("GLOBAL_SHOE_STRONG_CONF_CAP", "0.42"))
 GLOBAL_SHOE_PHASE_SPLIT = int(os.getenv("GLOBAL_SHOE_PHASE_SPLIT", "3"))
-GLOBAL_SHOE_ALLOW_RECENT_SHIFT = os.getenv("GLOBAL_SHOE_ALLOW_RECENT_SHIFT", "1") == "1"
+GLOBAL_SHOE_ALLOW_RECENT_SHIFT = os.getenv("GLOBAL_SHOE_ALLOW_RECENT_SHIFT", "0") == "1"
 
 # V14 Early Dragon Guard:
 # Prevents blindly following very early 2~4 hand dragons unless there is room/foot/mirror
 # support or strong full-shoe evidence. This is separate from long-dragon reversal.
-EARLY_DRAGON_GUARD = os.getenv("EARLY_DRAGON_GUARD", "1") == "1"
+EARLY_DRAGON_GUARD = os.getenv("EARLY_DRAGON_GUARD", "0") == "1"
 EARLY_DRAGON_WARN_LEN = int(os.getenv("EARLY_DRAGON_WARN_LEN", "2"))
 EARLY_DRAGON_ALERT_LEN = int(os.getenv("EARLY_DRAGON_ALERT_LEN", "3"))
 EARLY_DRAGON_MAX_LEN = int(os.getenv("EARLY_DRAGON_MAX_LEN", "4"))
@@ -319,13 +324,13 @@ EARLY_DRAGON_STRONG_CONF_CAP = float(os.getenv("EARLY_DRAGON_STRONG_CONF_CAP", "
 # V14 Room Break To Chop Mode:
 # Detects when one-room-two-halls / two-room-one-hall / double-chop rhythm has repeated
 # 3~4 cycles and then starts breaking into single chop or a new short rhythm.
-ROOM_BREAK_TO_CHOP_MODE = os.getenv("ROOM_BREAK_TO_CHOP_MODE", "1") == "1"
+ROOM_BREAK_TO_CHOP_MODE = os.getenv("ROOM_BREAK_TO_CHOP_MODE", "0") == "1"
 ROOM_BREAK_REPEAT_MIN = int(os.getenv("ROOM_BREAK_REPEAT_MIN", "3"))
 ROOM_BREAK_LOOKBACK = int(os.getenv("ROOM_BREAK_LOOKBACK", "8"))
 ROOM_BREAK_CONSISTENCY = float(os.getenv("ROOM_BREAK_CONSISTENCY", "0.68"))
 ROOM_BREAK_TO_CHOP_EDGE = float(os.getenv("ROOM_BREAK_TO_CHOP_EDGE", "0.056"))
 ROOM_BREAK_DAMPEN_ROOM = float(os.getenv("ROOM_BREAK_DAMPEN_ROOM", "0.055"))
-ROOM_BREAK_FINAL_OVERRIDE = os.getenv("ROOM_BREAK_FINAL_OVERRIDE", "1") == "1"
+ROOM_BREAK_FINAL_OVERRIDE = os.getenv("ROOM_BREAK_FINAL_OVERRIDE", "0") == "1"
 ROOM_BREAK_CONF_CAP = float(os.getenv("ROOM_BREAK_CONF_CAP", "0.46"))
 
 # V14 After Tie Safe Mode:
@@ -335,34 +340,6 @@ AFTER_TIE_SAFE_MODE = os.getenv("AFTER_TIE_SAFE_MODE", "1") == "1"
 AFTER_TIE_NO_ENTRY_WINDOW = int(os.getenv("AFTER_TIE_NO_ENTRY_WINDOW", "3"))
 AFTER_TIE_FORCE_MINBET = os.getenv("AFTER_TIE_FORCE_MINBET", "1") == "1"
 AFTER_TIE_CONF_CAP = float(os.getenv("AFTER_TIE_CONF_CAP", "0.36"))
-
-# V15 Global History Memory Mode:
-# Learns from all previously entered shoes stored locally by predictor.py.
-# This is different from current-shoe full history: it builds cross-shoe memory for
-# run cut points, short tail patterns, and room/venue/all-table tendencies.
-GLOBAL_HISTORY_MEMORY_MODE = os.getenv("GLOBAL_HISTORY_MEMORY_MODE", "1") == "1"
-GLOBAL_HISTORY_WRITE_ENABLED = os.getenv("GLOBAL_HISTORY_WRITE_ENABLED", "1") == "1"
-GLOBAL_HISTORY_DB_PATH = os.getenv("GLOBAL_HISTORY_DB_PATH", "/tmp/baccarat_global_history_memory.json")
-GLOBAL_HISTORY_SCOPE = os.getenv("GLOBAL_HISTORY_SCOPE", "room_then_venue_then_all")
-GLOBAL_HISTORY_MIN_SHOES = int(os.getenv("GLOBAL_HISTORY_MIN_SHOES", "4"))
-GLOBAL_HISTORY_MAX_SHOES = int(os.getenv("GLOBAL_HISTORY_MAX_SHOES", "120"))
-GLOBAL_HISTORY_MIN_EVENTS = float(os.getenv("GLOBAL_HISTORY_MIN_EVENTS", "8"))
-GLOBAL_HISTORY_MIN_SHOE_LEN = int(os.getenv("GLOBAL_HISTORY_MIN_SHOE_LEN", "8"))
-GLOBAL_HISTORY_SAVE_MIN_LEN = int(os.getenv("GLOBAL_HISTORY_SAVE_MIN_LEN", "2"))
-GLOBAL_HISTORY_WEIGHT = float(os.getenv("GLOBAL_HISTORY_WEIGHT", "0.12"))
-GLOBAL_HISTORY_MAX_EDGE = float(os.getenv("GLOBAL_HISTORY_MAX_EDGE", "0.045"))
-GLOBAL_HISTORY_OVERRIDE_EDGE = float(os.getenv("GLOBAL_HISTORY_OVERRIDE_EDGE", "0.052"))
-GLOBAL_HISTORY_TRIGGER = float(os.getenv("GLOBAL_HISTORY_TRIGGER", "0.14"))
-GLOBAL_HISTORY_STRONG_TRIGGER = float(os.getenv("GLOBAL_HISTORY_STRONG_TRIGGER", "0.30"))
-GLOBAL_HISTORY_FINAL_OVERRIDE = os.getenv("GLOBAL_HISTORY_FINAL_OVERRIDE", "1") == "1"
-GLOBAL_HISTORY_LOCAL_GAP_ALLOW = float(os.getenv("GLOBAL_HISTORY_LOCAL_GAP_ALLOW", "0.060"))
-GLOBAL_HISTORY_DECAY = float(os.getenv("GLOBAL_HISTORY_DECAY", "0.985"))
-GLOBAL_HISTORY_CONF_CAP = float(os.getenv("GLOBAL_HISTORY_CONF_CAP", "0.48"))
-GLOBAL_HISTORY_STRONG_CONF_CAP = float(os.getenv("GLOBAL_HISTORY_STRONG_CONF_CAP", "0.40"))
-GLOBAL_HISTORY_TAIL_LENS = tuple(
-    int(x.strip()) for x in os.getenv("GLOBAL_HISTORY_TAIL_LENS", "8,6,4").split(",")
-    if x.strip().isdigit()
-)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -3254,338 +3231,6 @@ def _run_profile(run_data: List[Tuple[str, int]]) -> Dict[str, Any]:
     }
 
 
-
-def _global_history_now() -> float:
-    try:
-        return time.time()
-    except Exception:
-        return 0.0
-
-
-def _global_history_norm_key_part(x: str, default: str = "unknown") -> str:
-    x = str(x or "").strip()
-    if not x:
-        return default
-    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in x)[:80]
-
-
-def _global_history_key(venue: str, room: str, shoe_id: str) -> str:
-    v = _global_history_norm_key_part(venue, "venue")
-    r = _global_history_norm_key_part(room, "room")
-    s = _global_history_norm_key_part(shoe_id, "active")
-    return f"{v}|{r}|{s}"
-
-
-def _global_history_load() -> Dict[str, Any]:
-    if not GLOBAL_HISTORY_MEMORY_MODE:
-        return {"version": 1, "shoes": {}}
-    try:
-        if not os.path.exists(GLOBAL_HISTORY_DB_PATH):
-            return {"version": 1, "shoes": {}}
-        with open(GLOBAL_HISTORY_DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"version": 1, "shoes": {}}
-        if not isinstance(data.get("shoes"), dict):
-            data["shoes"] = {}
-        return data
-    except Exception:
-        return {"version": 1, "shoes": {}}
-
-
-def _global_history_save(data: Dict[str, Any]) -> bool:
-    if not GLOBAL_HISTORY_MEMORY_MODE or not GLOBAL_HISTORY_WRITE_ENABLED:
-        return False
-    try:
-        path = GLOBAL_HISTORY_DB_PATH
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        return False
-
-
-def _global_history_scope_weight(rec: Dict[str, Any], venue: str, room: str) -> float:
-    rv = str(rec.get("venue", "") or "")
-    rr = str(rec.get("room", "") or "")
-    v = str(venue or "")
-    r = str(room or "")
-    same_room = bool(v and r and rv == v and rr == r)
-    same_venue = bool(v and rv == v)
-    scope = (GLOBAL_HISTORY_SCOPE or "room_then_venue_then_all").lower()
-    if scope == "room_only":
-        return 1.0 if same_room else 0.0
-    if scope == "venue_only":
-        return 1.0 if same_venue else 0.0
-    if scope == "all_only":
-        return 1.0
-    if same_room:
-        return 1.00
-    if same_venue:
-        return 0.72
-    return 0.42
-
-
-def _global_history_records(venue: str, room: str, shoe_id: str) -> List[Dict[str, Any]]:
-    data = _global_history_load()
-    shoes = data.get("shoes", {}) if isinstance(data, dict) else {}
-    if not isinstance(shoes, dict):
-        return []
-    current_key = _global_history_key(venue, room, shoe_id)
-    records: List[Dict[str, Any]] = []
-    for key, rec in shoes.items():
-        if key == current_key or not isinstance(rec, dict):
-            continue
-        hist = str(rec.get("history", "") or "").upper()
-        hist = "".join(x for x in hist if x in {"B", "P", "T"})
-        non_tie = "".join(x for x in hist if x in {"B", "P"})
-        if len(hist) < GLOBAL_HISTORY_MIN_SHOE_LEN or len(non_tie) < 4:
-            continue
-        w = _global_history_scope_weight(rec, venue, room)
-        if w <= 0:
-            continue
-        out = dict(rec)
-        out["_key"] = key
-        out["_history"] = hist
-        out["_non_tie"] = non_tie
-        out["_scope_weight"] = w
-        records.append(out)
-    records.sort(key=lambda r: float(r.get("updated_at", 0) or 0), reverse=True)
-    return records[:max(1, GLOBAL_HISTORY_MAX_SHOES)]
-
-
-def _global_history_next_counts_by_tail(seq: str, tail: str, weight: float) -> Dict[str, float]:
-    counts = {"B": 0.0, "P": 0.0}
-    n = len(tail)
-    if n <= 0 or len(seq) <= n:
-        return counts
-    # Count next result after the same non-tie tail pattern in prior shoes.
-    for i in range(0, len(seq) - n):
-        if seq[i:i+n] == tail:
-            nxt = seq[i+n]
-            if nxt in counts:
-                counts[nxt] += weight
-    return counts
-
-
-def _global_history_run_cont_break(seq: str, current_side: str, current_len: int, weight: float) -> Tuple[float, float]:
-    if not current_side or current_len < 2:
-        return 0.0, 0.0
-    runs = _runs(list(seq))
-    cont = 0.0
-    brk = 0.0
-    for idx, (side, length) in enumerate(runs):
-        if length < current_len:
-            continue
-        # Same-side examples are strongest. Opposite-side examples still teach
-        # generic run-length fatigue/continuation behavior, but with lower weight.
-        side_factor = 1.0 if side == current_side else 0.62
-        w = weight * side_factor
-        if length > current_len:
-            cont += w
-        elif idx < len(runs) - 1:
-            brk += w
-    return cont, brk
-
-
-def _global_history_memory_score(history: List[str], non_tie: List[str], venue: str, room: str, shoe_id: str) -> Dict[str, Any]:
-    if not GLOBAL_HISTORY_MEMORY_MODE or len(non_tie) < 4:
-        return {"active": False, "score": 0.0, "label": "歷史總牌路資料不足"}
-
-    records = _global_history_records(venue, room, shoe_id)
-    if len(records) < GLOBAL_HISTORY_MIN_SHOES:
-        return {
-            "active": False,
-            "score": 0.0,
-            "label": "歷史總牌路靴數不足",
-            "memory_shoes": len(records),
-            "min_shoes": GLOBAL_HISTORY_MIN_SHOES,
-        }
-
-    tail_counts = {"B": 0.0, "P": 0.0}
-    tail_detail: List[Dict[str, Any]] = []
-    run_cont = 0.0
-    run_break = 0.0
-    current_side, current_len = _streak(non_tie)
-
-    decay = _clamp(GLOBAL_HISTORY_DECAY, 0.80, 1.0)
-    for idx, rec in enumerate(records):
-        seq = str(rec.get("_non_tie", "") or "")
-        if not seq:
-            continue
-        w = float(rec.get("_scope_weight", 1.0) or 1.0) * (decay ** idx)
-        # Tail pattern memory: exact recent non-tie tail -> next side in previous shoes.
-        for L in GLOBAL_HISTORY_TAIL_LENS:
-            if L <= 0 or len(non_tie) < L:
-                continue
-            tail = "".join(non_tie[-L:])
-            counts = _global_history_next_counts_by_tail(seq, tail, w * (1.0 + min(0.35, L / 24.0)))
-            if counts["B"] or counts["P"]:
-                tail_counts["B"] += counts["B"]
-                tail_counts["P"] += counts["P"]
-                tail_detail.append({"len": L, "B": round(counts["B"], 3), "P": round(counts["P"], 3)})
-                # Do not let the same historical shoe over-count all tail lengths too much.
-                break
-        c, b = _global_history_run_cont_break(seq, current_side, current_len, w)
-        run_cont += c
-        run_break += b
-
-    tail_total = tail_counts["B"] + tail_counts["P"]
-    run_total = run_cont + run_break
-    pieces: List[Tuple[float, float, float, float, str]] = []
-
-    if tail_total >= GLOBAL_HISTORY_MIN_EVENTS:
-        tail_b_rate = tail_counts["B"] / tail_total
-        tail_strength = abs(tail_counts["B"] - tail_counts["P"]) / max(1e-9, tail_total)
-        pieces.append((tail_b_rate, tail_strength, tail_total, 1.25, "tail"))
-
-    if run_total >= GLOBAL_HISTORY_MIN_EVENTS and current_side in {"B", "P"}:
-        cont_rate = run_cont / run_total
-        # Convert generic continuation/break behavior into actual B/P next-side rate.
-        if current_side == "B":
-            run_b_rate = cont_rate
-        else:
-            run_b_rate = 1.0 - cont_rate
-        run_strength = abs(run_cont - run_break) / max(1e-9, run_total)
-        pieces.append((run_b_rate, run_strength, run_total, 1.00, "run_cut"))
-
-    if not pieces:
-        return {
-            "active": False,
-            "score": 0.0,
-            "label": "歷史總牌路事件不足",
-            "memory_shoes": len(records),
-            "tail_sample": round(tail_total, 2),
-            "run_sample": round(run_total, 2),
-        }
-
-    weight_sum = sum(sample * max(0.05, strength) * source_w for _b, strength, sample, source_w, _name in pieces)
-    if weight_sum <= 0:
-        return {"active": False, "score": 0.0, "label": "歷史總牌路權重不足"}
-
-    b_rate = sum(b_rate * sample * max(0.05, strength) * source_w for b_rate, strength, sample, source_w, _name in pieces) / weight_sum
-    score = sum(strength * sample * source_w for _b, strength, sample, source_w, _name in pieces) / max(1e-9, sum(sample * source_w for _b, _strength, sample, source_w, _name in pieces))
-    sample_total = tail_total + run_total
-    target_side = "B" if b_rate >= 0.5 else "P"
-    edge = min(GLOBAL_HISTORY_MAX_EDGE, 0.016 + score * GLOBAL_HISTORY_MAX_EDGE)
-    side_b = 0.5 + edge if target_side == "B" else 0.5 - edge
-    active = score >= GLOBAL_HISTORY_TRIGGER and sample_total >= GLOBAL_HISTORY_MIN_EVENTS
-    strong = score >= GLOBAL_HISTORY_STRONG_TRIGGER and sample_total >= GLOBAL_HISTORY_MIN_EVENTS * 1.5
-
-    source_names = "+".join(name for *_rest, name in pieces)
-    label = f"歷史總牌路記憶｜{source_names}偏{target_side}"
-    return {
-        "active": bool(active),
-        "adjusted": False,
-        "strong": bool(strong),
-        "forced": False,
-        "score": round(score, 3),
-        "label": label,
-        "target_side": target_side,
-        "B_side": round(side_b, 5),
-        "P_side": round(1.0 - side_b, 5),
-        "edge": round(edge, 5),
-        "memory_shoes": len(records),
-        "sample": round(sample_total, 2),
-        "tail_sample": round(tail_total, 2),
-        "run_sample": round(run_total, 2),
-        "tail_counts": {"B": round(tail_counts["B"], 2), "P": round(tail_counts["P"], 2)},
-        "run_counts": {"continue": round(run_cont, 2), "break": round(run_break, 2)},
-        "tail_detail": tail_detail[-6:],
-    }
-
-
-def _apply_global_history_memory(b_prob: float, p_prob: float, tie_prob: float, memory: Dict[str, Any]) -> Tuple[float, float, float, Dict[str, Any]]:
-    if not (GLOBAL_HISTORY_MEMORY_MODE and isinstance(memory, dict) and memory.get("active")):
-        return b_prob, p_prob, tie_prob, memory
-    bp_total = max(0.001, 1 - tie_prob)
-    current_b_side = _clamp(b_prob / max(0.001, b_prob + p_prob), 0.0, 1.0)
-    mem_b_side = _clamp(float(memory.get("B_side", 0.5)), 0.35, 0.65)
-    local_gap = abs(current_b_side - 0.5) * 2.0
-    score = _clamp(float(memory.get("score", 0.0)), 0.0, 1.0)
-    strong = bool(memory.get("strong"))
-
-    adjusted = False
-    forced = False
-    if GLOBAL_HISTORY_FINAL_OVERRIDE and strong and local_gap <= GLOBAL_HISTORY_LOCAL_GAP_ALLOW:
-        target_side = str(memory.get("target_side", ""))
-        edge = min(GLOBAL_HISTORY_OVERRIDE_EDGE, max(0.022, float(memory.get("edge", GLOBAL_HISTORY_MAX_EDGE))))
-        if target_side == "B":
-            b_side = 0.5 + edge
-        elif target_side == "P":
-            b_side = 0.5 - edge
-        else:
-            b_side = mem_b_side
-        forced = True
-        adjusted = True
-    else:
-        # Soft blend: cross-shoe memory calibrates the local model, it does not dominate it.
-        blend = _clamp(GLOBAL_HISTORY_WEIGHT * (0.45 + score * 0.95), 0.02, 0.20)
-        b_side = current_b_side * (1 - blend) + mem_b_side * blend
-        adjusted = abs(b_side - current_b_side) >= 0.002
-
-    b_prob = b_side * bp_total
-    p_prob = (1 - b_side) * bp_total
-    b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
-    out = dict(memory)
-    out.update({
-        "adjusted": bool(adjusted),
-        "forced": bool(forced),
-        "B": round(b_prob, 5),
-        "P": round(p_prob, 5),
-        "T": round(tie_prob, 5),
-        "local_gap": round(local_gap, 4),
-    })
-    return b_prob, p_prob, tie_prob, out
-
-
-def _global_history_memory_update(history: List[str], venue: str, room: str, shoe_id: str) -> Dict[str, Any]:
-    if not (GLOBAL_HISTORY_MEMORY_MODE and GLOBAL_HISTORY_WRITE_ENABLED):
-        return {"saved": False, "reason": "disabled"}
-    clean_history = "".join(x.upper() for x in history if str(x).upper() in {"B", "P", "T"})
-    if len(clean_history) < GLOBAL_HISTORY_SAVE_MIN_LEN:
-        return {"saved": False, "reason": "too_short"}
-    data = _global_history_load()
-    shoes = data.setdefault("shoes", {})
-    if not isinstance(shoes, dict):
-        data["shoes"] = shoes = {}
-    key = _global_history_key(venue, room, shoe_id)
-    now = _global_history_now()
-
-    # If no shoe_id is provided and the same room restarts from a shorter sequence,
-    # archive the previous active shoe before overwriting it.
-    old = shoes.get(key)
-    if isinstance(old, dict) and not str(shoe_id or "").strip():
-        old_hist = str(old.get("history", "") or "")
-        if old_hist and len(clean_history) + 3 < len(old_hist):
-            archive_key = f"{key}|arch|{int(now)}"
-            shoes[archive_key] = old
-
-    rec = {
-        "venue": str(venue or ""),
-        "room": str(room or ""),
-        "shoe_id": str(shoe_id or ""),
-        "history": clean_history,
-        "history_len": len(clean_history),
-        "non_tie_len": len([x for x in clean_history if x in {"B", "P"}]),
-        "updated_at": now,
-    }
-    shoes[key] = rec
-
-    # Prune old records to keep the local file small.
-    keep = max(GLOBAL_HISTORY_MAX_SHOES * 2, GLOBAL_HISTORY_MAX_SHOES + 20, 80)
-    if len(shoes) > keep:
-        items = sorted(shoes.items(), key=lambda kv: float((kv[1] or {}).get("updated_at", 0) or 0), reverse=True)
-        data["shoes"] = dict(items[:keep])
-    ok = _global_history_save(data)
-    return {"saved": bool(ok), "key": key, "records": len(data.get("shoes", {}))}
-
-
 def _ai_full_history_payload(history: List[str], non_tie: List[str], run_data: List[Tuple[str, int]]) -> Dict[str, Any]:
     """
     DeepSeek full-shoe payload.
@@ -3655,7 +3300,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     run_data = _runs(non_tie)
     chaos = _chaos_regime_score(non_tie, history)
     weights = _effective_weights(chaos)
-    historical_memory = _global_history_memory_score(history, non_tie, venue, room, shoe_id)
 
     total_w = weights["markov"] + weights["road"] + weights["streak"] + weights["balance"] + weights["recent"]
     b_side = (
@@ -3694,15 +3338,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "chaos": chaos,
         "effective_weights": {k: round(v, 5) for k, v in weights.items()},
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
-        "historical_memory": historical_memory,
-        "global_history_memory_config": {
-            "enabled": GLOBAL_HISTORY_MEMORY_MODE,
-            "scope": GLOBAL_HISTORY_SCOPE,
-            "min_shoes": GLOBAL_HISTORY_MIN_SHOES,
-            "max_shoes": GLOBAL_HISTORY_MAX_SHOES,
-            "weight": GLOBAL_HISTORY_WEIGHT,
-            "db_path": GLOBAL_HISTORY_DB_PATH if os.getenv("DEBUG_HISTORY_PATH", "0") == "1" else "local_json",
-        },
         "ai_full_history_payload": _ai_full_history_payload(history, non_tie, run_data) if AI_FULL_HISTORY_MODE else {},
         "ai_payload_config": {
             "full_history_mode": AI_FULL_HISTORY_MODE,
@@ -3945,8 +3580,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         tie_prob = float(global_shoe_context.get("T", tie_prob))
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
-    b_prob, p_prob, tie_prob, historical_memory = _apply_global_history_memory(b_prob, p_prob, tie_prob, historical_memory)
-
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -3962,8 +3595,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if global_reversal.get("B", 0.5) >= global_reversal.get("P", 0.5) else "P")
     if 'global_shoe_context' in locals() and isinstance(global_shoe_context, dict) and global_shoe_context.get("active"):
         votes.append("B" if global_shoe_context.get("B", 0.5) >= global_shoe_context.get("P", 0.5) else "P")
-    if 'historical_memory' in locals() and isinstance(historical_memory, dict) and historical_memory.get("active"):
-        votes.append("B" if historical_memory.get("B", 0.5) >= historical_memory.get("P", 0.5) else "P")
     if 'early_dragon_guard' in locals() and isinstance(early_dragon_guard, dict) and early_dragon_guard.get("active"):
         votes.append("B" if early_dragon_guard.get("B", 0.5) >= early_dragon_guard.get("P", 0.5) else "P")
     if 'room_break_to_chop' in locals() and isinstance(room_break_to_chop, dict) and room_break_to_chop.get("active"):
@@ -4003,11 +3634,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, cap)
         if not chaos.get("active"):
             level = "全靴總控校準" if global_shoe_context.get("forced") else "全靴總控弱訊號"
-    if 'historical_memory' in locals() and historical_memory.get("active") and historical_memory.get("adjusted"):
-        cap = GLOBAL_HISTORY_STRONG_CONF_CAP if historical_memory.get("forced") else GLOBAL_HISTORY_CONF_CAP
-        conf = min(conf, cap)
-        if not chaos.get("active"):
-            level = "歷史總牌路校準" if historical_memory.get("forced") else "歷史總牌路弱訊號"
     if 'early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"):
         cap = EARLY_DRAGON_STRONG_CONF_CAP if early_dragon_guard.get("forced") else EARLY_DRAGON_CONF_CAP
         conf = min(conf, cap)
@@ -4041,10 +3667,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{global_shoe_context.get('label')}({int(float(global_shoe_context.get('score', 0))*100)}%)")
         if global_shoe_context.get("adjusted"):
             reason_parts.append("全靴前中後段校準")
-    if 'historical_memory' in locals() and historical_memory.get("active"):
-        reason_parts.insert(0, f"{historical_memory.get('label')}({int(float(historical_memory.get('score', 0))*100)}%)")
-        if historical_memory.get("adjusted"):
-            reason_parts.append("跨靴歷史總牌路校準")
     if 'early_dragon_guard' in locals() and early_dragon_guard.get("active"):
         reason_parts.insert(0, f"{early_dragon_guard.get('label')}({int(float(early_dragon_guard.get('score', 0))*100)}%)")
         if early_dragon_guard.get("adjusted"):
@@ -4076,10 +3698,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     elif ai_result and ai_result.get("error"):
         reason_parts.append("AI離線改本地判斷")
 
-    history_memory_update = _global_history_memory_update(history, venue, room, shoe_id)
-
     return {
         "ok": True,
+        "model_version": "V16 Classic Lite",
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -4097,7 +3718,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             or (majority_guard.get("active") and majority_guard.get("adjusted"))
             or (global_reversal.get("active") and global_reversal.get("adjusted"))
             or ('global_shoe_context' in locals() and global_shoe_context.get("active") and global_shoe_context.get("adjusted"))
-            or ('historical_memory' in locals() and historical_memory.get("active") and historical_memory.get("adjusted"))
             or ('early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"))
             or ('room_break_to_chop' in locals() and room_break_to_chop.get("active") and room_break_to_chop.get("adjusted"))
             or ('after_tie_safe' in locals() and after_tie_safe.get("active") and AFTER_TIE_FORCE_MINBET)
@@ -4123,8 +3743,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
         "global_shoe_context": global_shoe_context if 'global_shoe_context' in locals() else None,
-        "historical_memory": historical_memory if 'historical_memory' in locals() else None,
-        "history_memory_update": history_memory_update if os.getenv("DEBUG_HISTORY_MEMORY", "0") == "1" else None,
         "early_dragon_guard": early_dragon_guard if 'early_dragon_guard' in locals() else None,
         "room_break_to_chop": room_break_to_chop if 'room_break_to_chop' in locals() else None,
         "after_tie_safe": after_tie_safe if 'after_tie_safe' in locals() else None,
