@@ -1,5 +1,7 @@
 import math
 import os
+import json
+import time
 from collections import Counter, defaultdict
 from statistics import median
 from typing import Any, Dict, List, Tuple
@@ -333,6 +335,34 @@ AFTER_TIE_SAFE_MODE = os.getenv("AFTER_TIE_SAFE_MODE", "1") == "1"
 AFTER_TIE_NO_ENTRY_WINDOW = int(os.getenv("AFTER_TIE_NO_ENTRY_WINDOW", "3"))
 AFTER_TIE_FORCE_MINBET = os.getenv("AFTER_TIE_FORCE_MINBET", "1") == "1"
 AFTER_TIE_CONF_CAP = float(os.getenv("AFTER_TIE_CONF_CAP", "0.36"))
+
+# V15 Global History Memory Mode:
+# Learns from all previously entered shoes stored locally by predictor.py.
+# This is different from current-shoe full history: it builds cross-shoe memory for
+# run cut points, short tail patterns, and room/venue/all-table tendencies.
+GLOBAL_HISTORY_MEMORY_MODE = os.getenv("GLOBAL_HISTORY_MEMORY_MODE", "1") == "1"
+GLOBAL_HISTORY_WRITE_ENABLED = os.getenv("GLOBAL_HISTORY_WRITE_ENABLED", "1") == "1"
+GLOBAL_HISTORY_DB_PATH = os.getenv("GLOBAL_HISTORY_DB_PATH", "/tmp/baccarat_global_history_memory.json")
+GLOBAL_HISTORY_SCOPE = os.getenv("GLOBAL_HISTORY_SCOPE", "room_then_venue_then_all")
+GLOBAL_HISTORY_MIN_SHOES = int(os.getenv("GLOBAL_HISTORY_MIN_SHOES", "4"))
+GLOBAL_HISTORY_MAX_SHOES = int(os.getenv("GLOBAL_HISTORY_MAX_SHOES", "120"))
+GLOBAL_HISTORY_MIN_EVENTS = float(os.getenv("GLOBAL_HISTORY_MIN_EVENTS", "8"))
+GLOBAL_HISTORY_MIN_SHOE_LEN = int(os.getenv("GLOBAL_HISTORY_MIN_SHOE_LEN", "8"))
+GLOBAL_HISTORY_SAVE_MIN_LEN = int(os.getenv("GLOBAL_HISTORY_SAVE_MIN_LEN", "2"))
+GLOBAL_HISTORY_WEIGHT = float(os.getenv("GLOBAL_HISTORY_WEIGHT", "0.12"))
+GLOBAL_HISTORY_MAX_EDGE = float(os.getenv("GLOBAL_HISTORY_MAX_EDGE", "0.045"))
+GLOBAL_HISTORY_OVERRIDE_EDGE = float(os.getenv("GLOBAL_HISTORY_OVERRIDE_EDGE", "0.052"))
+GLOBAL_HISTORY_TRIGGER = float(os.getenv("GLOBAL_HISTORY_TRIGGER", "0.14"))
+GLOBAL_HISTORY_STRONG_TRIGGER = float(os.getenv("GLOBAL_HISTORY_STRONG_TRIGGER", "0.30"))
+GLOBAL_HISTORY_FINAL_OVERRIDE = os.getenv("GLOBAL_HISTORY_FINAL_OVERRIDE", "1") == "1"
+GLOBAL_HISTORY_LOCAL_GAP_ALLOW = float(os.getenv("GLOBAL_HISTORY_LOCAL_GAP_ALLOW", "0.060"))
+GLOBAL_HISTORY_DECAY = float(os.getenv("GLOBAL_HISTORY_DECAY", "0.985"))
+GLOBAL_HISTORY_CONF_CAP = float(os.getenv("GLOBAL_HISTORY_CONF_CAP", "0.48"))
+GLOBAL_HISTORY_STRONG_CONF_CAP = float(os.getenv("GLOBAL_HISTORY_STRONG_CONF_CAP", "0.40"))
+GLOBAL_HISTORY_TAIL_LENS = tuple(
+    int(x.strip()) for x in os.getenv("GLOBAL_HISTORY_TAIL_LENS", "8,6,4").split(",")
+    if x.strip().isdigit()
+)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -3224,6 +3254,338 @@ def _run_profile(run_data: List[Tuple[str, int]]) -> Dict[str, Any]:
     }
 
 
+
+def _global_history_now() -> float:
+    try:
+        return time.time()
+    except Exception:
+        return 0.0
+
+
+def _global_history_norm_key_part(x: str, default: str = "unknown") -> str:
+    x = str(x or "").strip()
+    if not x:
+        return default
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in x)[:80]
+
+
+def _global_history_key(venue: str, room: str, shoe_id: str) -> str:
+    v = _global_history_norm_key_part(venue, "venue")
+    r = _global_history_norm_key_part(room, "room")
+    s = _global_history_norm_key_part(shoe_id, "active")
+    return f"{v}|{r}|{s}"
+
+
+def _global_history_load() -> Dict[str, Any]:
+    if not GLOBAL_HISTORY_MEMORY_MODE:
+        return {"version": 1, "shoes": {}}
+    try:
+        if not os.path.exists(GLOBAL_HISTORY_DB_PATH):
+            return {"version": 1, "shoes": {}}
+        with open(GLOBAL_HISTORY_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"version": 1, "shoes": {}}
+        if not isinstance(data.get("shoes"), dict):
+            data["shoes"] = {}
+        return data
+    except Exception:
+        return {"version": 1, "shoes": {}}
+
+
+def _global_history_save(data: Dict[str, Any]) -> bool:
+    if not GLOBAL_HISTORY_MEMORY_MODE or not GLOBAL_HISTORY_WRITE_ENABLED:
+        return False
+    try:
+        path = GLOBAL_HISTORY_DB_PATH
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _global_history_scope_weight(rec: Dict[str, Any], venue: str, room: str) -> float:
+    rv = str(rec.get("venue", "") or "")
+    rr = str(rec.get("room", "") or "")
+    v = str(venue or "")
+    r = str(room or "")
+    same_room = bool(v and r and rv == v and rr == r)
+    same_venue = bool(v and rv == v)
+    scope = (GLOBAL_HISTORY_SCOPE or "room_then_venue_then_all").lower()
+    if scope == "room_only":
+        return 1.0 if same_room else 0.0
+    if scope == "venue_only":
+        return 1.0 if same_venue else 0.0
+    if scope == "all_only":
+        return 1.0
+    if same_room:
+        return 1.00
+    if same_venue:
+        return 0.72
+    return 0.42
+
+
+def _global_history_records(venue: str, room: str, shoe_id: str) -> List[Dict[str, Any]]:
+    data = _global_history_load()
+    shoes = data.get("shoes", {}) if isinstance(data, dict) else {}
+    if not isinstance(shoes, dict):
+        return []
+    current_key = _global_history_key(venue, room, shoe_id)
+    records: List[Dict[str, Any]] = []
+    for key, rec in shoes.items():
+        if key == current_key or not isinstance(rec, dict):
+            continue
+        hist = str(rec.get("history", "") or "").upper()
+        hist = "".join(x for x in hist if x in {"B", "P", "T"})
+        non_tie = "".join(x for x in hist if x in {"B", "P"})
+        if len(hist) < GLOBAL_HISTORY_MIN_SHOE_LEN or len(non_tie) < 4:
+            continue
+        w = _global_history_scope_weight(rec, venue, room)
+        if w <= 0:
+            continue
+        out = dict(rec)
+        out["_key"] = key
+        out["_history"] = hist
+        out["_non_tie"] = non_tie
+        out["_scope_weight"] = w
+        records.append(out)
+    records.sort(key=lambda r: float(r.get("updated_at", 0) or 0), reverse=True)
+    return records[:max(1, GLOBAL_HISTORY_MAX_SHOES)]
+
+
+def _global_history_next_counts_by_tail(seq: str, tail: str, weight: float) -> Dict[str, float]:
+    counts = {"B": 0.0, "P": 0.0}
+    n = len(tail)
+    if n <= 0 or len(seq) <= n:
+        return counts
+    # Count next result after the same non-tie tail pattern in prior shoes.
+    for i in range(0, len(seq) - n):
+        if seq[i:i+n] == tail:
+            nxt = seq[i+n]
+            if nxt in counts:
+                counts[nxt] += weight
+    return counts
+
+
+def _global_history_run_cont_break(seq: str, current_side: str, current_len: int, weight: float) -> Tuple[float, float]:
+    if not current_side or current_len < 2:
+        return 0.0, 0.0
+    runs = _runs(list(seq))
+    cont = 0.0
+    brk = 0.0
+    for idx, (side, length) in enumerate(runs):
+        if length < current_len:
+            continue
+        # Same-side examples are strongest. Opposite-side examples still teach
+        # generic run-length fatigue/continuation behavior, but with lower weight.
+        side_factor = 1.0 if side == current_side else 0.62
+        w = weight * side_factor
+        if length > current_len:
+            cont += w
+        elif idx < len(runs) - 1:
+            brk += w
+    return cont, brk
+
+
+def _global_history_memory_score(history: List[str], non_tie: List[str], venue: str, room: str, shoe_id: str) -> Dict[str, Any]:
+    if not GLOBAL_HISTORY_MEMORY_MODE or len(non_tie) < 4:
+        return {"active": False, "score": 0.0, "label": "歷史總牌路資料不足"}
+
+    records = _global_history_records(venue, room, shoe_id)
+    if len(records) < GLOBAL_HISTORY_MIN_SHOES:
+        return {
+            "active": False,
+            "score": 0.0,
+            "label": "歷史總牌路靴數不足",
+            "memory_shoes": len(records),
+            "min_shoes": GLOBAL_HISTORY_MIN_SHOES,
+        }
+
+    tail_counts = {"B": 0.0, "P": 0.0}
+    tail_detail: List[Dict[str, Any]] = []
+    run_cont = 0.0
+    run_break = 0.0
+    current_side, current_len = _streak(non_tie)
+
+    decay = _clamp(GLOBAL_HISTORY_DECAY, 0.80, 1.0)
+    for idx, rec in enumerate(records):
+        seq = str(rec.get("_non_tie", "") or "")
+        if not seq:
+            continue
+        w = float(rec.get("_scope_weight", 1.0) or 1.0) * (decay ** idx)
+        # Tail pattern memory: exact recent non-tie tail -> next side in previous shoes.
+        for L in GLOBAL_HISTORY_TAIL_LENS:
+            if L <= 0 or len(non_tie) < L:
+                continue
+            tail = "".join(non_tie[-L:])
+            counts = _global_history_next_counts_by_tail(seq, tail, w * (1.0 + min(0.35, L / 24.0)))
+            if counts["B"] or counts["P"]:
+                tail_counts["B"] += counts["B"]
+                tail_counts["P"] += counts["P"]
+                tail_detail.append({"len": L, "B": round(counts["B"], 3), "P": round(counts["P"], 3)})
+                # Do not let the same historical shoe over-count all tail lengths too much.
+                break
+        c, b = _global_history_run_cont_break(seq, current_side, current_len, w)
+        run_cont += c
+        run_break += b
+
+    tail_total = tail_counts["B"] + tail_counts["P"]
+    run_total = run_cont + run_break
+    pieces: List[Tuple[float, float, float, float, str]] = []
+
+    if tail_total >= GLOBAL_HISTORY_MIN_EVENTS:
+        tail_b_rate = tail_counts["B"] / tail_total
+        tail_strength = abs(tail_counts["B"] - tail_counts["P"]) / max(1e-9, tail_total)
+        pieces.append((tail_b_rate, tail_strength, tail_total, 1.25, "tail"))
+
+    if run_total >= GLOBAL_HISTORY_MIN_EVENTS and current_side in {"B", "P"}:
+        cont_rate = run_cont / run_total
+        # Convert generic continuation/break behavior into actual B/P next-side rate.
+        if current_side == "B":
+            run_b_rate = cont_rate
+        else:
+            run_b_rate = 1.0 - cont_rate
+        run_strength = abs(run_cont - run_break) / max(1e-9, run_total)
+        pieces.append((run_b_rate, run_strength, run_total, 1.00, "run_cut"))
+
+    if not pieces:
+        return {
+            "active": False,
+            "score": 0.0,
+            "label": "歷史總牌路事件不足",
+            "memory_shoes": len(records),
+            "tail_sample": round(tail_total, 2),
+            "run_sample": round(run_total, 2),
+        }
+
+    weight_sum = sum(sample * max(0.05, strength) * source_w for _b, strength, sample, source_w, _name in pieces)
+    if weight_sum <= 0:
+        return {"active": False, "score": 0.0, "label": "歷史總牌路權重不足"}
+
+    b_rate = sum(b_rate * sample * max(0.05, strength) * source_w for b_rate, strength, sample, source_w, _name in pieces) / weight_sum
+    score = sum(strength * sample * source_w for _b, strength, sample, source_w, _name in pieces) / max(1e-9, sum(sample * source_w for _b, _strength, sample, source_w, _name in pieces))
+    sample_total = tail_total + run_total
+    target_side = "B" if b_rate >= 0.5 else "P"
+    edge = min(GLOBAL_HISTORY_MAX_EDGE, 0.016 + score * GLOBAL_HISTORY_MAX_EDGE)
+    side_b = 0.5 + edge if target_side == "B" else 0.5 - edge
+    active = score >= GLOBAL_HISTORY_TRIGGER and sample_total >= GLOBAL_HISTORY_MIN_EVENTS
+    strong = score >= GLOBAL_HISTORY_STRONG_TRIGGER and sample_total >= GLOBAL_HISTORY_MIN_EVENTS * 1.5
+
+    source_names = "+".join(name for *_rest, name in pieces)
+    label = f"歷史總牌路記憶｜{source_names}偏{target_side}"
+    return {
+        "active": bool(active),
+        "adjusted": False,
+        "strong": bool(strong),
+        "forced": False,
+        "score": round(score, 3),
+        "label": label,
+        "target_side": target_side,
+        "B_side": round(side_b, 5),
+        "P_side": round(1.0 - side_b, 5),
+        "edge": round(edge, 5),
+        "memory_shoes": len(records),
+        "sample": round(sample_total, 2),
+        "tail_sample": round(tail_total, 2),
+        "run_sample": round(run_total, 2),
+        "tail_counts": {"B": round(tail_counts["B"], 2), "P": round(tail_counts["P"], 2)},
+        "run_counts": {"continue": round(run_cont, 2), "break": round(run_break, 2)},
+        "tail_detail": tail_detail[-6:],
+    }
+
+
+def _apply_global_history_memory(b_prob: float, p_prob: float, tie_prob: float, memory: Dict[str, Any]) -> Tuple[float, float, float, Dict[str, Any]]:
+    if not (GLOBAL_HISTORY_MEMORY_MODE and isinstance(memory, dict) and memory.get("active")):
+        return b_prob, p_prob, tie_prob, memory
+    bp_total = max(0.001, 1 - tie_prob)
+    current_b_side = _clamp(b_prob / max(0.001, b_prob + p_prob), 0.0, 1.0)
+    mem_b_side = _clamp(float(memory.get("B_side", 0.5)), 0.35, 0.65)
+    local_gap = abs(current_b_side - 0.5) * 2.0
+    score = _clamp(float(memory.get("score", 0.0)), 0.0, 1.0)
+    strong = bool(memory.get("strong"))
+
+    adjusted = False
+    forced = False
+    if GLOBAL_HISTORY_FINAL_OVERRIDE and strong and local_gap <= GLOBAL_HISTORY_LOCAL_GAP_ALLOW:
+        target_side = str(memory.get("target_side", ""))
+        edge = min(GLOBAL_HISTORY_OVERRIDE_EDGE, max(0.022, float(memory.get("edge", GLOBAL_HISTORY_MAX_EDGE))))
+        if target_side == "B":
+            b_side = 0.5 + edge
+        elif target_side == "P":
+            b_side = 0.5 - edge
+        else:
+            b_side = mem_b_side
+        forced = True
+        adjusted = True
+    else:
+        # Soft blend: cross-shoe memory calibrates the local model, it does not dominate it.
+        blend = _clamp(GLOBAL_HISTORY_WEIGHT * (0.45 + score * 0.95), 0.02, 0.20)
+        b_side = current_b_side * (1 - blend) + mem_b_side * blend
+        adjusted = abs(b_side - current_b_side) >= 0.002
+
+    b_prob = b_side * bp_total
+    p_prob = (1 - b_side) * bp_total
+    b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+    out = dict(memory)
+    out.update({
+        "adjusted": bool(adjusted),
+        "forced": bool(forced),
+        "B": round(b_prob, 5),
+        "P": round(p_prob, 5),
+        "T": round(tie_prob, 5),
+        "local_gap": round(local_gap, 4),
+    })
+    return b_prob, p_prob, tie_prob, out
+
+
+def _global_history_memory_update(history: List[str], venue: str, room: str, shoe_id: str) -> Dict[str, Any]:
+    if not (GLOBAL_HISTORY_MEMORY_MODE and GLOBAL_HISTORY_WRITE_ENABLED):
+        return {"saved": False, "reason": "disabled"}
+    clean_history = "".join(x.upper() for x in history if str(x).upper() in {"B", "P", "T"})
+    if len(clean_history) < GLOBAL_HISTORY_SAVE_MIN_LEN:
+        return {"saved": False, "reason": "too_short"}
+    data = _global_history_load()
+    shoes = data.setdefault("shoes", {})
+    if not isinstance(shoes, dict):
+        data["shoes"] = shoes = {}
+    key = _global_history_key(venue, room, shoe_id)
+    now = _global_history_now()
+
+    # If no shoe_id is provided and the same room restarts from a shorter sequence,
+    # archive the previous active shoe before overwriting it.
+    old = shoes.get(key)
+    if isinstance(old, dict) and not str(shoe_id or "").strip():
+        old_hist = str(old.get("history", "") or "")
+        if old_hist and len(clean_history) + 3 < len(old_hist):
+            archive_key = f"{key}|arch|{int(now)}"
+            shoes[archive_key] = old
+
+    rec = {
+        "venue": str(venue or ""),
+        "room": str(room or ""),
+        "shoe_id": str(shoe_id or ""),
+        "history": clean_history,
+        "history_len": len(clean_history),
+        "non_tie_len": len([x for x in clean_history if x in {"B", "P"}]),
+        "updated_at": now,
+    }
+    shoes[key] = rec
+
+    # Prune old records to keep the local file small.
+    keep = max(GLOBAL_HISTORY_MAX_SHOES * 2, GLOBAL_HISTORY_MAX_SHOES + 20, 80)
+    if len(shoes) > keep:
+        items = sorted(shoes.items(), key=lambda kv: float((kv[1] or {}).get("updated_at", 0) or 0), reverse=True)
+        data["shoes"] = dict(items[:keep])
+    ok = _global_history_save(data)
+    return {"saved": bool(ok), "key": key, "records": len(data.get("shoes", {}))}
+
+
 def _ai_full_history_payload(history: List[str], non_tie: List[str], run_data: List[Tuple[str, int]]) -> Dict[str, Any]:
     """
     DeepSeek full-shoe payload.
@@ -3293,6 +3655,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     run_data = _runs(non_tie)
     chaos = _chaos_regime_score(non_tie, history)
     weights = _effective_weights(chaos)
+    historical_memory = _global_history_memory_score(history, non_tie, venue, room, shoe_id)
 
     total_w = weights["markov"] + weights["road"] + weights["streak"] + weights["balance"] + weights["recent"]
     b_side = (
@@ -3331,6 +3694,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "chaos": chaos,
         "effective_weights": {k: round(v, 5) for k, v in weights.items()},
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
+        "historical_memory": historical_memory,
+        "global_history_memory_config": {
+            "enabled": GLOBAL_HISTORY_MEMORY_MODE,
+            "scope": GLOBAL_HISTORY_SCOPE,
+            "min_shoes": GLOBAL_HISTORY_MIN_SHOES,
+            "max_shoes": GLOBAL_HISTORY_MAX_SHOES,
+            "weight": GLOBAL_HISTORY_WEIGHT,
+            "db_path": GLOBAL_HISTORY_DB_PATH if os.getenv("DEBUG_HISTORY_PATH", "0") == "1" else "local_json",
+        },
         "ai_full_history_payload": _ai_full_history_payload(history, non_tie, run_data) if AI_FULL_HISTORY_MODE else {},
         "ai_payload_config": {
             "full_history_mode": AI_FULL_HISTORY_MODE,
@@ -3573,6 +3945,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         tie_prob = float(global_shoe_context.get("T", tie_prob))
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    b_prob, p_prob, tie_prob, historical_memory = _apply_global_history_memory(b_prob, p_prob, tie_prob, historical_memory)
+
     votes = [
         "B" if markov["B"] >= markov["P"] else "P",
         "B" if road["B"] >= road["P"] else "P",
@@ -3588,6 +3962,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         votes.append("B" if global_reversal.get("B", 0.5) >= global_reversal.get("P", 0.5) else "P")
     if 'global_shoe_context' in locals() and isinstance(global_shoe_context, dict) and global_shoe_context.get("active"):
         votes.append("B" if global_shoe_context.get("B", 0.5) >= global_shoe_context.get("P", 0.5) else "P")
+    if 'historical_memory' in locals() and isinstance(historical_memory, dict) and historical_memory.get("active"):
+        votes.append("B" if historical_memory.get("B", 0.5) >= historical_memory.get("P", 0.5) else "P")
     if 'early_dragon_guard' in locals() and isinstance(early_dragon_guard, dict) and early_dragon_guard.get("active"):
         votes.append("B" if early_dragon_guard.get("B", 0.5) >= early_dragon_guard.get("P", 0.5) else "P")
     if 'room_break_to_chop' in locals() and isinstance(room_break_to_chop, dict) and room_break_to_chop.get("active"):
@@ -3627,6 +4003,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         conf = min(conf, cap)
         if not chaos.get("active"):
             level = "全靴總控校準" if global_shoe_context.get("forced") else "全靴總控弱訊號"
+    if 'historical_memory' in locals() and historical_memory.get("active") and historical_memory.get("adjusted"):
+        cap = GLOBAL_HISTORY_STRONG_CONF_CAP if historical_memory.get("forced") else GLOBAL_HISTORY_CONF_CAP
+        conf = min(conf, cap)
+        if not chaos.get("active"):
+            level = "歷史總牌路校準" if historical_memory.get("forced") else "歷史總牌路弱訊號"
     if 'early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"):
         cap = EARLY_DRAGON_STRONG_CONF_CAP if early_dragon_guard.get("forced") else EARLY_DRAGON_CONF_CAP
         conf = min(conf, cap)
@@ -3660,6 +4041,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         reason_parts.insert(0, f"{global_shoe_context.get('label')}({int(float(global_shoe_context.get('score', 0))*100)}%)")
         if global_shoe_context.get("adjusted"):
             reason_parts.append("全靴前中後段校準")
+    if 'historical_memory' in locals() and historical_memory.get("active"):
+        reason_parts.insert(0, f"{historical_memory.get('label')}({int(float(historical_memory.get('score', 0))*100)}%)")
+        if historical_memory.get("adjusted"):
+            reason_parts.append("跨靴歷史總牌路校準")
     if 'early_dragon_guard' in locals() and early_dragon_guard.get("active"):
         reason_parts.insert(0, f"{early_dragon_guard.get('label')}({int(float(early_dragon_guard.get('score', 0))*100)}%)")
         if early_dragon_guard.get("adjusted"):
@@ -3691,6 +4076,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     elif ai_result and ai_result.get("error"):
         reason_parts.append("AI離線改本地判斷")
 
+    history_memory_update = _global_history_memory_update(history, venue, room, shoe_id)
+
     return {
         "ok": True,
         "venue": venue,
@@ -3710,6 +4097,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             or (majority_guard.get("active") and majority_guard.get("adjusted"))
             or (global_reversal.get("active") and global_reversal.get("adjusted"))
             or ('global_shoe_context' in locals() and global_shoe_context.get("active") and global_shoe_context.get("adjusted"))
+            or ('historical_memory' in locals() and historical_memory.get("active") and historical_memory.get("adjusted"))
             or ('early_dragon_guard' in locals() and early_dragon_guard.get("active") and early_dragon_guard.get("adjusted"))
             or ('room_break_to_chop' in locals() and room_break_to_chop.get("active") and room_break_to_chop.get("adjusted"))
             or ('after_tie_safe' in locals() and after_tie_safe.get("active") and AFTER_TIE_FORCE_MINBET)
@@ -3735,6 +4123,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "majority_guard": majority_guard,
         "global_reversal": global_reversal,
         "global_shoe_context": global_shoe_context if 'global_shoe_context' in locals() else None,
+        "historical_memory": historical_memory if 'historical_memory' in locals() else None,
+        "history_memory_update": history_memory_update if os.getenv("DEBUG_HISTORY_MEMORY", "0") == "1" else None,
         "early_dragon_guard": early_dragon_guard if 'early_dragon_guard' in locals() else None,
         "room_break_to_chop": room_break_to_chop if 'room_break_to_chop' in locals() else None,
         "after_tie_safe": after_tie_safe if 'after_tie_safe' in locals() else None,
