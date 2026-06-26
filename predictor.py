@@ -2732,17 +2732,17 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
-    # ----- 強龍保護：當明顯有效長龍時，避免規律層 override 干擾 -----
+    # ----- 強龍保護與反轉優先 -----
     current_side, current_len = _streak(non_tie)
     is_strong_dragon = (
         current_len >= DRAGON_STRONG_LEN
         and road.get("road_action") == "續龍"
         and not road.get("reversal", {}).get("active")
     )
+    reversal_override_applied = False  # 一旦反轉生效，後續 override 全部讓位
 
     # If the dragon reversal detector is strong, allow it to actually flip the final
-    # recommendation. Without this guard, Markov/Streak often keep following the old
-    # dragon even when the road layer has already detected a turning zone.
+    # recommendation.
     reversal_final_override = False
     road_reversal = road.get("reversal") if isinstance(road, dict) else None
     if (
@@ -2764,6 +2764,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             p_prob = (0.5 + edge) * bp_total
         b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
         reversal_final_override = True
+        reversal_override_applied = True
 
     chop_to_dragon_final_override = False
     road_chop_to_dragon = road.get("chop_to_dragon") if isinstance(road, dict) else None
@@ -2773,7 +2774,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_chop_to_dragon.get("active")
         and road_chop_to_dragon.get("target_side") in {"B", "P"}
         and road_chop_to_dragon.get("phase") in {"confirmed", "early"}
-        and not is_strong_dragon   # 強龍保護
+        and not is_strong_dragon
+        and not reversal_override_applied   # 反轉已生效則不執行
     ):
         target_side = str(road_chop_to_dragon.get("target_side"))
         raw_edge = float(road_chop_to_dragon.get("edge", CHOP_TO_DRAGON_EDGE))
@@ -2797,7 +2799,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_mirror_run.get("active")
         and road_mirror_run.get("target_side") in {"B", "P"}
         and road_mirror_run.get("phase") in {"fill", "complete_reversal"}
-        and not is_strong_dragon   # 強龍保護
+        and not is_strong_dragon
+        and not reversal_override_applied
     ):
         target_side = str(road_mirror_run.get("target_side"))
         raw_edge = float(road_mirror_run.get("edge", MIRROR_RUN_EDGE))
@@ -2821,7 +2824,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_room_pattern.get("active")
         and road_room_pattern.get("target_side") in {"B", "P"}
         and road_room_pattern.get("phase") in {"fill", "turn"}
-        and not is_strong_dragon   # 強龍保護
+        and not is_strong_dragon
+        and not reversal_override_applied
     ):
         target_side = str(road_room_pattern.get("target_side"))
         raw_edge = float(road_room_pattern.get("edge", ROOM_PATTERN_EDGE))
@@ -2845,7 +2849,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_foot_alignment.get("active")
         and road_foot_alignment.get("target_side") in {"B", "P"}
         and road_foot_alignment.get("phase") in {"fill_to_foot", "aligned_break", "aligned_over", "aligned_room", "aligned_default_break", "overfoot_continue"}
-        and not is_strong_dragon   # 強龍保護
+        and not is_strong_dragon
+        and not reversal_override_applied
     ):
         target_side = str(road_foot_alignment.get("target_side"))
         raw_edge = float(road_foot_alignment.get("edge", FOOT_ALIGN_EDGE))
