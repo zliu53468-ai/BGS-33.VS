@@ -2732,6 +2732,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
+    # ----- 強龍保護：當明顯有效長龍時，避免規律層 override 干擾 -----
+    current_side, current_len = _streak(non_tie)
+    is_strong_dragon = (
+        current_len >= DRAGON_STRONG_LEN
+        and road.get("road_action") == "續龍"
+        and not road.get("reversal", {}).get("active")
+    )
+
     # If the dragon reversal detector is strong, allow it to actually flip the final
     # recommendation. Without this guard, Markov/Streak often keep following the old
     # dragon even when the road layer has already detected a turning zone.
@@ -2765,10 +2773,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_chop_to_dragon.get("active")
         and road_chop_to_dragon.get("target_side") in {"B", "P"}
         and road_chop_to_dragon.get("phase") in {"confirmed", "early"}
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_chop_to_dragon.get("target_side"))
         raw_edge = float(road_chop_to_dragon.get("edge", CHOP_TO_DRAGON_EDGE))
-        # Early phase should guide but not overrule too aggressively.
         factor = 0.78 if road_chop_to_dragon.get("phase") == "early" else 1.0
         edge = min(CHOP_TO_DRAGON_OVERRIDE_EDGE, max(0.022, raw_edge * factor))
         bp_total = max(0.001, 1 - tie_prob)
@@ -2789,6 +2797,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_mirror_run.get("active")
         and road_mirror_run.get("target_side") in {"B", "P"}
         and road_mirror_run.get("phase") in {"fill", "complete_reversal"}
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_mirror_run.get("target_side"))
         raw_edge = float(road_mirror_run.get("edge", MIRROR_RUN_EDGE))
@@ -2812,11 +2821,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_room_pattern.get("active")
         and road_room_pattern.get("target_side") in {"B", "P"}
         and road_room_pattern.get("phase") in {"fill", "turn"}
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_room_pattern.get("target_side"))
         raw_edge = float(road_room_pattern.get("edge", ROOM_PATTERN_EDGE))
-        # Fill phase gets a stronger override because it is often the exact hand
-        # where the old model lagged behind one-two/two-one/double-chop rhythm.
         factor = 1.0 if road_room_pattern.get("phase") == "fill" else 0.92
         edge = min(ROOM_PATTERN_OVERRIDE_EDGE, max(0.024, raw_edge * factor))
         bp_total = max(0.001, 1 - tie_prob)
@@ -2837,12 +2845,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         and road_foot_alignment.get("active")
         and road_foot_alignment.get("target_side") in {"B", "P"}
         and road_foot_alignment.get("phase") in {"fill_to_foot", "aligned_break", "aligned_over", "aligned_room", "aligned_default_break", "overfoot_continue"}
+        and not is_strong_dragon   # 強龍保護
     ):
         target_side = str(road_foot_alignment.get("target_side"))
         raw_edge = float(road_foot_alignment.get("edge", FOOT_ALIGN_EDGE))
         phase = str(road_foot_alignment.get("phase", ""))
-        # Evidence-backed aligned break can be stronger. Fill/default/overfoot are helpful
-        # but should stay a little softer so they do not fight strong dragon reversal.
         if phase == "aligned_break":
             factor = 1.00
         elif phase == "aligned_room":
