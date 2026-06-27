@@ -27,7 +27,7 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LIFF_ID = os.getenv("LIFF_ID", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-DEFAULT_VENUES = "OB:歐博真人,DG:DG真人,MT:MT真人,T9:T9真人,SA:SA真人"
+DEFAULT_VENUES = "OB:歐博真人,DG:DG真人,MT:MT真人,T9:T9真人,SA:SA真人,DB:DB真人"
 VENUES_RAW = os.getenv("VENUES", DEFAULT_VENUES)
 DEFAULT_ROOMS = os.getenv(
     "DEFAULT_ROOMS",
@@ -98,6 +98,11 @@ def parse_venues() -> List[Dict[str, str]]:
         else:
             code, name = item, item
         venues.append({"code": code.strip(), "name": name.strip()})
+
+    # 固定補上 DB真人，避免 Render 後台 VENUES 環境變數漏填時頁面沒有顯示
+    if not any((v.get("code") or "").upper() == "DB" for v in venues):
+        venues.append({"code": "DB", "name": "DB真人"})
+
     return venues
 
 
@@ -721,6 +726,7 @@ def predict_and_save(user_id: str) -> Tuple[Dict[str, Any], bool, str]:
             venue=venue,
             room=room,
             shoe_id=shoe_id,
+            user_id=user_id,
         )
         pred = future.result(timeout=PREDICT_TIMEOUT_SEC)
         used_fallback = False
