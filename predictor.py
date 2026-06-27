@@ -54,38 +54,49 @@ B_PRIOR = float(os.getenv("B_PRIOR", "0.4586"))
 P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
-# 模型權重（最終融合）
+# 模型權重（固定權重模式會使用；動態模式會依牌路型態自動調整）
 MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.26"))
 ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.24"))
 STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.18"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.12"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.10"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.10"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.16"))
+NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.12"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
-AI_BLEND = float(os.getenv("AI_BLEND", "0.16"))
+AI_BLEND = float(os.getenv("AI_BLEND", "0.12"))
+
+# 動態權重開關：只調整融合比例，不加入觀望/下注決策
+USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
+USE_ONLINE_WEIGHTING = os.getenv("USE_ONLINE_WEIGHTING", "1") == "1"
+ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "18"))
+ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "5"))
+ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.45"))
+ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.48"))
+ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.55"))
 
 # ML模型權重（在規律模型之後進行二次校準）
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.25"))  # ML模型在最終決策中的權重
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.14"))
+ML_LR_WEIGHT = float(os.getenv("ML_LR_WEIGHT", "0.35"))
+ML_RF_WEIGHT = float(os.getenv("ML_RF_WEIGHT", "0.45"))
+ML_LSTM_WEIGHT = float(os.getenv("ML_LSTM_WEIGHT", "0.20"))
 
-TIE_SHRINK = float(os.getenv("TIE_SHRINK", "0.35"))
-TIE_MAX_PROB = float(os.getenv("TIE_MAX_PROB", "0.18"))
+TIE_SHRINK = float(os.getenv("TIE_SHRINK", "0.30"))
+TIE_MAX_PROB = float(os.getenv("TIE_MAX_PROB", "0.16"))
 ALLOW_TIE_RECOMMEND = os.getenv("ALLOW_TIE_RECOMMEND", "0") == "1"
 TIE_RECOMMEND_MIN = float(os.getenv("TIE_RECOMMEND_MIN", "0.165"))
 MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "6"))
 MIN_HISTORY_FOR_SIGNAL = int(os.getenv("MIN_HISTORY_FOR_SIGNAL", "4"))
 
-# LSTM參數
-LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "12"))
-LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "8"))
+# LSTM參數：預設改保守，避免單靴資料少時過擬合
+LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
+LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
 LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
-ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
+ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "8"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
     """機器學習模型容器：每個 user_id / 場館 / 房間 / 靴號 可建立獨立實例"""
 
     def __init__(self):
-        
-        # 初始化模型
         self.rf = RandomForestClassifier(
             n_estimators=100,
             max_depth=10,
@@ -99,18 +110,15 @@ class MLModels:
         )
         self.lstm = None
         self.scaler = StandardScaler()
-        
-        # 訓練狀態
+
         self.is_trained = False
         self.training_samples = 0
         self.last_training_history = []
         self.last_training_key = ""
-        
-        # Render 啟動穩定版：
-        # 不在服務啟動/import predictor.py 時建立 LSTM，避免 uvicorn 卡住導致 Render 偵測不到 port。
+
+        # Render 啟動穩定版：不在 import 時建立 LSTM，避免服務啟動卡住。
         # LSTM 會在資料足夠並進入 train() 時才建立與訓練。
-        # self._build_lstm()
-    
+
     def _build_lstm(self):
         """建立 LSTM 模型架構（權重需訓練）"""
         if not TF_AVAILABLE:
@@ -137,92 +145,83 @@ class MLModels:
         """編碼牌路序列為數值"""
         mapping = {'B': 1, 'P': 0}
         return np.array([mapping.get(x, 0) for x in non_tie]).reshape(-1, 1)
-    
+
     def _extract_features(self, non_tie: List[str]) -> np.ndarray:
-        """提取ML特徵（修正版：無資料洩漏）"""
+        """提取ML特徵（無資料洩漏版本）"""
         if len(non_tie) < 6:
             return np.zeros((1, 12))
-        
+
         n = len(non_tie)
-        
-        # 基本統計
         b_count = non_tie.count('B')
         p_count = n - b_count
         b_rate = b_count / n if n > 0 else 0.5
-        
-        # 近期趨勢
+
         recent = non_tie[-10:] if n >= 10 else non_tie
         recent_b_rate = recent.count('B') / len(recent) if len(recent) > 0 else 0.5
-        
-        # 轉換率
+
         if n >= 2:
-            switches = sum(1 for i in range(1, n) if non_tie[i] != non_tie[i-1])
+            switches = sum(1 for i in range(1, n) if non_tie[i] != non_tie[i - 1])
             switch_rate = switches / (n - 1)
         else:
             switch_rate = 0.5
-        
-        # 當前連莊
+
         current_streak = 1
         if n >= 2:
-            for i in range(n-2, -1, -1):
+            for i in range(n - 2, -1, -1):
                 if non_tie[i] == non_tie[-1]:
                     current_streak += 1
                 else:
                     break
-        
-        # 最大連莊
+
         max_streak = 1
         current = 1
         for i in range(1, n):
-            if non_tie[i] == non_tie[i-1]:
+            if non_tie[i] == non_tie[i - 1]:
                 current += 1
                 max_streak = max(max_streak, current)
             else:
                 current = 1
-        
-        # 最近5局
+
         last_5 = non_tie[-5:] if n >= 5 else non_tie
         last_5_b = last_5.count('B') / len(last_5) if len(last_5) > 0 else 0.5
-        
-        # 最近3局
+
         last_3 = non_tie[-3:] if n >= 3 else non_tie
         last_3_b = last_3.count('B') / len(last_3) if len(last_3) > 0 else 0.5
-        
-        # 特徵向量（12個特徵）
+
         features = np.array([[
-            b_rate,                          # 1. 整體莊家率
-            recent_b_rate,                   # 2. 近期莊家率
-            switch_rate,                     # 3. 轉換率
-            current_streak / max(10, n),     # 4. 當前連莊（正規化）
-            max_streak / max(10, n),         # 5. 最大連莊（正規化）
-            last_5_b,                        # 6. 最近5局莊家率
-            last_3_b,                        # 7. 最近3局莊家率
-            b_count / max(10, n),            # 8. 莊家總數（正規化）
-            p_count / max(10, n),            # 9. 玩家總數（正規化）
-            1 if non_tie[-1] == 'B' else 0,  # 10. 上一局結果
-            (b_count - p_count) / max(10, n), # 11. 莊家優勢
-            n / 100                          # 12. 樣本數（正規化）
+            b_rate,
+            recent_b_rate,
+            switch_rate,
+            current_streak / max(10, n),
+            max_streak / max(10, n),
+            last_5_b,
+            last_3_b,
+            b_count / max(10, n),
+            p_count / max(10, n),
+            1 if non_tie[-1] == 'B' else 0,
+            (b_count - p_count) / max(10, n),
+            n / 100
         ]])
-        
+
         return features
-    
+
     def _prepare_lstm_data(self, non_tie: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         """準備LSTM序列資料"""
         if len(non_tie) < LSTM_SEQUENCE_LENGTH + 1:
             return np.array([]), np.array([])
-        
+
         encoded = self._encode_sequence(non_tie)
         X, y = [], []
-        
+
         for i in range(LSTM_SEQUENCE_LENGTH, len(encoded)):
-            X.append(encoded[i-LSTM_SEQUENCE_LENGTH:i, 0])
+            X.append(encoded[i - LSTM_SEQUENCE_LENGTH:i, 0])
             y.append(encoded[i, 0])
-        
+
         if len(X) == 0:
             return np.array([]), np.array([])
-        
+
         return np.array(X).reshape(-1, LSTM_SEQUENCE_LENGTH, 1), np.array(y)
-    
+
     def train(self, non_tie: List[str], training_key: str = "") -> Dict[str, Any]:
         """訓練所有 ML 模型：LR + RF + LSTM（有 TensorFlow 才啟用）"""
         if len(non_tie) < 30:
@@ -232,7 +231,6 @@ class MLModels:
             }
 
         try:
-            # 1. 提取特徵（滾動窗口，避免拿未來資料訓練）
             X_features = []
             y_labels = []
 
@@ -250,17 +248,15 @@ class MLModels:
             if len(set(y_labels.tolist())) < 2:
                 return {"status": "error", "message": "訓練資料只有單一類別，暫不訓練 ML"}
 
-            # 2. 正規化 + 訓練 Logistic Regression / Random Forest
             X_scaled = self.scaler.fit_transform(X_features)
             self.lr.fit(X_scaled, y_labels)
             self.rf.fit(X_scaled, y_labels)
 
-            # 3. 訓練 LSTM（保留，但避免 TensorFlow 未安裝時讓服務掛掉）
             lstm_status = "disabled"
             if TF_AVAILABLE:
                 X_lstm, y_lstm = self._prepare_lstm_data(non_tie)
                 if len(X_lstm) > 10 and len(set(y_lstm.tolist())) >= 2:
-                    self._build_lstm()  # 每次重訓時重置 LSTM
+                    self._build_lstm()
                     callbacks = [
                         tf.keras.callbacks.EarlyStopping(
                             patience=3,
@@ -307,32 +303,28 @@ class MLModels:
             'lstm': 0.5,
             'ensemble': 0.5
         }
-        
+
         if len(non_tie) < 12 or not self.is_trained:
             return default_result
-        
+
         try:
-            # 提取特徵
             features = self._extract_features(non_tie)
             features_scaled = self.scaler.transform(features)
-            
+
             predictions = {}
-            
-            # Logistic Regression
+
             try:
                 lr_prob = self.lr.predict_proba(features_scaled)[0][1]
                 predictions['lr'] = float(lr_prob)
-            except:
+            except Exception:
                 predictions['lr'] = 0.5
-            
-            # Random Forest
+
             try:
                 rf_prob = self.rf.predict_proba(features_scaled)[0][1]
                 predictions['rf'] = float(rf_prob)
-            except:
+            except Exception:
                 predictions['rf'] = 0.5
-            
-            # LSTM
+
             try:
                 if self.lstm is not None and len(non_tie) >= LSTM_SEQUENCE_LENGTH:
                     encoded = self._encode_sequence(non_tie[-LSTM_SEQUENCE_LENGTH:])
@@ -341,23 +333,25 @@ class MLModels:
                     predictions['lstm'] = lstm_prob
                 else:
                     predictions['lstm'] = 0.5
-            except:
+            except Exception:
                 predictions['lstm'] = 0.5
-            
-            # 集成預測（加權平均）
-            weights = {'lr': 0.25, 'rf': 0.35, 'lstm': 0.40}
+
+            total_model_w = max(0.0001, ML_LR_WEIGHT + ML_RF_WEIGHT + ML_LSTM_WEIGHT)
+            weights = {
+                'lr': ML_LR_WEIGHT / total_model_w,
+                'rf': ML_RF_WEIGHT / total_model_w,
+                'lstm': ML_LSTM_WEIGHT / total_model_w,
+            }
             ensemble = sum(predictions[k] * weights[k] for k in weights)
             predictions['ensemble'] = float(ensemble)
-            
+
             return predictions
-            
+
         except Exception as e:
             logger.error(f"ML預測錯誤: {e}")
             return default_result
 
 # ============ 模型快取池 ============
-# 讓每位 LINE 使用者、每個遊戲館、房間、靴號都能使用獨立 ML/LSTM 模型。
-# 注意：Render 記憶體有限，所以用 MAX_MODEL_CACHE 控制最多保留幾組模型。
 MAX_MODEL_CACHE = int(os.getenv("MAX_MODEL_CACHE", "30"))
 _MODEL_CACHE: Dict[str, MLModels] = {}
 _MODEL_CACHE_ORDER: List[str] = []
@@ -367,7 +361,6 @@ def _get_ml_models(training_key: str) -> MLModels:
     key = training_key or "global"
 
     if key in _MODEL_CACHE:
-        # 簡易 LRU：有使用就移到最後
         try:
             _MODEL_CACHE_ORDER.remove(key)
         except ValueError:
@@ -375,7 +368,6 @@ def _get_ml_models(training_key: str) -> MLModels:
         _MODEL_CACHE_ORDER.append(key)
         return _MODEL_CACHE[key]
 
-    # 超過上限時，移除最舊模型，避免 Render 記憶體越吃越高
     while len(_MODEL_CACHE) >= MAX_MODEL_CACHE and _MODEL_CACHE_ORDER:
         old_key = _MODEL_CACHE_ORDER.pop(0)
         _MODEL_CACHE.pop(old_key, None)
@@ -389,8 +381,10 @@ def _get_ml_models(training_key: str) -> MLModels:
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
     return a / b if b else default
+
 
 def _normalize_three(b: float, p: float, t: float) -> Tuple[float, float, float]:
     b = max(0.001, b)
@@ -399,8 +393,10 @@ def _normalize_three(b: float, p: float, t: float) -> Tuple[float, float, float]
     s = b + p + t
     return b / s, p / s, t / s
 
+
 def _last_non_tie(history: List[str]) -> List[str]:
     return [x for x in history if x in {"B", "P"}]
+
 
 def _streak(non_tie: List[str]) -> Tuple[str, int]:
     if not non_tie:
@@ -414,6 +410,24 @@ def _streak(non_tie: List[str]) -> Tuple[str, int]:
             break
     return last, n
 
+
+def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    clean = {k: max(0.0, float(v)) for k, v in weights.items()}
+    total = sum(clean.values())
+    if total <= 0:
+        n = max(1, len(clean))
+        return {k: 1.0 / n for k in clean}
+    return {k: v / total for k, v in clean.items()}
+
+
+def _pick_from_score(score: Dict[str, Any], min_edge: float = 0.001) -> str:
+    b = float(score.get("B", 0.5))
+    p = float(score.get("P", 0.5))
+    if abs(b - p) < min_edge:
+        return ""
+    return "B" if b > p else "P"
+
+# ============ 規律 / 牌路模型 ============
 def _transition_prob(non_tie: List[str]) -> Dict[str, float]:
     counts = defaultdict(lambda: Counter())
     for a, b in zip(non_tie, non_tie[1:]):
@@ -430,6 +444,43 @@ def _transition_prob(non_tie: List[str]) -> Dict[str, float]:
     b = 0.5 * (1 - shrink) + b * shrink
     p = 0.5 * (1 - shrink) + p * shrink
     return {"B": b, "P": p, "sample": sample}
+
+
+def _ngram_score(non_tie: List[str], max_k: int = 6) -> Dict[str, Any]:
+    """通用 N-Gram 回測：尋找最近 k 碼在本靴過去出現後，下一手較常接 B 或 P。"""
+    if len(non_tie) < 10:
+        return {"B": 0.5, "P": 0.5, "label": "NGram資料不足", "sample": 0, "strength": 0.0, "key": ""}
+
+    seq = "".join(non_tie)
+    upper_k = min(max_k, len(non_tie) - 1)
+
+    for k in range(upper_k, 1, -1):
+        key = seq[-k:]
+        follows = []
+
+        for i in range(0, len(seq) - k):
+            if seq[i:i + k] == key and i + k < len(seq):
+                follows.append(seq[i + k])
+
+        if len(follows) >= 2:
+            c = Counter(follows)
+            total = c["B"] + c["P"]
+            alpha = float(os.getenv("NGRAM_ALPHA", "1.6"))
+            b_raw = (c["B"] + alpha) / (total + 2 * alpha)
+            shrink = min(0.80, total / float(os.getenv("NGRAM_FULL_SAMPLE", "8")))
+            b = 0.5 * (1 - shrink) + b_raw * shrink
+            p = 1 - b
+            return {
+                "B": b,
+                "P": p,
+                "label": f"NGram{k}碼:{key}",
+                "sample": total,
+                "strength": min(0.22, 0.08 + total * 0.02),
+                "key": key,
+            }
+
+    return {"B": 0.5, "P": 0.5, "label": "NGram無重複", "sample": 0, "strength": 0.0, "key": ""}
+
 
 def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
     if len(non_tie) < 3:
@@ -490,6 +541,7 @@ def _road_pattern_score(non_tie: List[str]) -> Dict[str, Any]:
 
     return {"B": b, "P": p, "label": label, "strength": strength, "switch_rate": switch_rate, "streak": streak_n}
 
+
 def _recent_score(non_tie: List[str]) -> Dict[str, float]:
     if not non_tie:
         return {"B": 0.5, "P": 0.5}
@@ -511,6 +563,7 @@ def _recent_score(non_tie: List[str]) -> Dict[str, float]:
         edge = min(0.035, abs(b_count - p_count) * 0.006)
     return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
 
+
 def _balance_score(non_tie: List[str]) -> Dict[str, float]:
     if len(non_tie) < 8:
         return {"B": 0.5, "P": 0.5}
@@ -520,6 +573,7 @@ def _balance_score(non_tie: List[str]) -> Dict[str, float]:
     edge = min(0.055, abs(diff) / max(1, len(non_tie)) * 0.16)
     side = "B" if diff < 0 else "P"
     return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
+
 
 def _streak_score(non_tie: List[str]) -> Dict[str, float]:
     last, n = _streak(non_tie)
@@ -538,6 +592,228 @@ def _streak_score(non_tie: List[str]) -> Dict[str, float]:
         side, edge = last, 0.0
     return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
 
+
+def _periodicity_score(non_tie: List[str], window: int = 16) -> Dict[str, Any]:
+    recent = non_tie[-window:]
+    best_period_score = 0.0
+    best_period = 0
+
+    for k in range(2, 6):
+        if len(recent) > k:
+            score = sum(
+                1 for i in range(k, len(recent))
+                if recent[i] == recent[i - k]
+            ) / max(1, len(recent) - k)
+            if score > best_period_score:
+                best_period_score = score
+                best_period = k
+
+    return {"period": best_period, "score": best_period_score}
+
+
+def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
+    """偵測目前牌路型態，只用於調整權重，不做觀望/下注決策。"""
+    fixed_weights = _normalize_weights({
+        "markov": MARKOV_WEIGHT,
+        "road": ROAD_WEIGHT,
+        "streak": STREAK_WEIGHT,
+        "balance": BALANCE_WEIGHT,
+        "recent": RECENT_WEIGHT,
+        "ngram": NGRAM_WEIGHT,
+    })
+
+    if not USE_DYNAMIC_REGIME_WEIGHTS:
+        return {
+            "regime": "fixed",
+            "weights": fixed_weights,
+            "switch_rate": 0.0,
+            "period_score": 0.0,
+            "period": 0,
+            "streak": 0,
+        }
+
+    if len(non_tie) < 8:
+        weights = {
+            "markov": 0.26,
+            "road": 0.22,
+            "streak": 0.18,
+            "balance": 0.10,
+            "recent": 0.16,
+            "ngram": 0.08,
+        }
+        if NGRAM_WEIGHT <= 0:
+            weights["ngram"] = 0.0
+        return {
+            "regime": "cold",
+            "weights": _normalize_weights(weights),
+            "switch_rate": 0.0,
+            "period_score": 0.0,
+            "period": 0,
+            "streak": _streak(non_tie)[1],
+        }
+
+    recent = non_tie[-16:]
+    last, streak_n = _streak(non_tie)
+    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+    b_rate = recent.count("B") / len(recent)
+    period_info = _periodicity_score(non_tie, window=16)
+    best_period_score = period_info["score"]
+    best_period = period_info["period"]
+
+    if streak_n >= 4:
+        regime = "trend_dragon"
+        weights = {
+            "markov": 0.26,
+            "road": 0.22,
+            "streak": 0.30,
+            "balance": 0.06,
+            "recent": 0.10,
+            "ngram": 0.06,
+        }
+    elif switch_rate >= 0.72:
+        regime = "single_jump"
+        weights = {
+            "markov": 0.28,
+            "road": 0.20,
+            "streak": 0.08,
+            "balance": 0.06,
+            "recent": 0.28,
+            "ngram": 0.10,
+        }
+    elif best_period_score >= 0.70:
+        regime = f"periodic_{best_period}"
+        weights = {
+            "markov": 0.20,
+            "road": 0.26,
+            "streak": 0.10,
+            "balance": 0.06,
+            "recent": 0.18,
+            "ngram": 0.20,
+        }
+    elif abs(b_rate - 0.5) >= 0.22:
+        regime = "biased_side"
+        weights = {
+            "markov": 0.30,
+            "road": 0.22,
+            "streak": 0.18,
+            "balance": 0.08,
+            "recent": 0.16,
+            "ngram": 0.06,
+        }
+    elif 0.42 <= switch_rate <= 0.62 and streak_n <= 2 and best_period_score < 0.62:
+        regime = "chaos_mixed"
+        weights = {
+            "markov": 0.26,
+            "road": 0.18,
+            "streak": 0.12,
+            "balance": 0.08,
+            "recent": 0.18,
+            "ngram": 0.18,
+        }
+    else:
+        regime = "mixed"
+        weights = {
+            "markov": 0.26,
+            "road": 0.22,
+            "streak": 0.16,
+            "balance": 0.08,
+            "recent": 0.18,
+            "ngram": 0.10,
+        }
+
+    # 讓環境變數 NGRAM_WEIGHT 仍可控制 NGram 影響力。
+    # 預設 0.12 不變；調高/調低會等比例縮放 ngram 權重後再正規化。
+    if NGRAM_WEIGHT <= 0:
+        weights["ngram"] = 0.0
+    else:
+        weights["ngram"] *= _clamp(NGRAM_WEIGHT / 0.12, 0.25, 2.00)
+
+    return {
+        "regime": regime,
+        "weights": _normalize_weights(weights),
+        "switch_rate": round(switch_rate, 4),
+        "period_score": round(best_period_score, 4),
+        "period": best_period,
+        "streak": streak_n,
+        "recent_b_rate": round(b_rate, 4),
+    }
+
+
+def _rolling_model_performance(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    用最近 N 局做本靴內部回測，估計各子模型近期準度。
+    不需要額外儲存狀態，也不改變 predict 的輸入介面。
+    """
+    model_names = ["markov", "road", "streak", "balance", "recent", "ngram"]
+    result = {
+        name: {"acc": 0.5, "count": 0, "correct": 0, "factor": 1.0}
+        for name in model_names
+    }
+
+    if not USE_ONLINE_WEIGHTING or len(non_tie) < 12:
+        return result
+
+    start = max(6, len(non_tie) - ONLINE_WEIGHT_WINDOW)
+
+    for i in range(start, len(non_tie)):
+        prefix = non_tie[:i]
+        truth = non_tie[i]
+        if truth not in {"B", "P"}:
+            continue
+
+        scores = {
+            "markov": _transition_prob(prefix),
+            "road": _road_pattern_score(prefix),
+            "streak": _streak_score(prefix),
+            "balance": _balance_score(prefix),
+            "recent": _recent_score(prefix),
+            "ngram": _ngram_score(prefix),
+        }
+
+        for name, score in scores.items():
+            pick = _pick_from_score(score, min_edge=0.002)
+            if not pick:
+                continue
+            result[name]["count"] += 1
+            if pick == truth:
+                result[name]["correct"] += 1
+
+    for name in model_names:
+        cnt = result[name]["count"]
+        cor = result[name]["correct"]
+        if cnt > 0:
+            acc = cor / cnt
+            result[name]["acc"] = round(acc, 4)
+        else:
+            acc = 0.5
+            result[name]["acc"] = 0.5
+
+        factor = 1.0
+        if cnt >= ONLINE_WEIGHT_MIN_COUNT:
+            factor = 1.0 + (acc - 0.5) * 2 * ONLINE_WEIGHT_ALPHA
+            if acc <= ONLINE_DISABLE_BELOW:
+                factor = min(factor, 0.70)
+            elif acc >= ONLINE_BOOST_ABOVE:
+                factor = max(factor, 1.08)
+            factor = _clamp(factor, 0.55, 1.35)
+
+        result[name]["factor"] = round(factor, 4)
+
+    return result
+
+
+def _apply_online_weighting(base_weights: Dict[str, float], performance: Dict[str, Any]) -> Dict[str, float]:
+    if not USE_ONLINE_WEIGHTING:
+        return _normalize_weights(base_weights)
+
+    adjusted = {}
+    for name, weight in base_weights.items():
+        factor = float(performance.get(name, {}).get("factor", 1.0))
+        adjusted[name] = weight * factor
+    return _normalize_weights(adjusted)
+
+
 def _tie_score(history: List[str]) -> float:
     if not history:
         return T_PRIOR
@@ -555,6 +831,7 @@ def _tie_score(history: List[str]) -> float:
         pressure += 0.018
     return _clamp(pressure, 0.055, TIE_MAX_PROB)
 
+
 def _confidence(b: float, p: float, t: float, history_len: int, agreement: float, ml_agreement: float = 0.0) -> Tuple[float, str]:
     gap = abs(b - p)
     base = gap * 3.6 + agreement * 0.22 + ml_agreement * 0.10 + min(0.16, history_len / 80)
@@ -570,39 +847,44 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 # ============ 主要預測函數 ============
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
-    整合預測函數：規律模型 + ML模型 + DeepSeek校準
+    整合預測函數：規律模型 + NGram + 牌路型態動態權重 + ML模型 + DeepSeek校準
+    注意：本版不加入觀望/EV/下注決策，仍固定輸出 B/P/T 推薦。
     """
-    history = [x.upper() for x in history if x.upper() in {"B", "P", "T"}]
+    history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
     non_tie = _last_non_tie(history)
-    
-    # ============ 1. 規律模型（原有邏輯） ============
+
+    # ============ 1. 規律模型 + 新增 NGram / Regime ============
     markov = _transition_prob(non_tie)
     road = _road_pattern_score(non_tie)
     recent = _recent_score(non_tie)
     balance = _balance_score(non_tie)
     streak = _streak_score(non_tie)
-    
-    total_w = MARKOV_WEIGHT + ROAD_WEIGHT + STREAK_WEIGHT + BALANCE_WEIGHT + RECENT_WEIGHT
+    ngram = _ngram_score(non_tie)
+
+    regime_info = _detect_regime(non_tie)
+    online_performance = _rolling_model_performance(non_tie)
+    dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
+
+    total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
-        markov["B"] * MARKOV_WEIGHT
-        + road["B"] * ROAD_WEIGHT
-        + streak["B"] * STREAK_WEIGHT
-        + balance["B"] * BALANCE_WEIGHT
-        + recent["B"] * RECENT_WEIGHT
+        markov["B"] * dynamic_weights.get("markov", 0.0)
+        + road["B"] * dynamic_weights.get("road", 0.0)
+        + streak["B"] * dynamic_weights.get("streak", 0.0)
+        + balance["B"] * dynamic_weights.get("balance", 0.0)
+        + recent["B"] * dynamic_weights.get("recent", 0.0)
+        + ngram["B"] * dynamic_weights.get("ngram", 0.0)
     ) / total_w
     p_side = 1 - b_side
-    
+
     tie_prob = _tie_score(history)
     b_prob = b_side * (1 - tie_prob)
     p_prob = p_side * (1 - tie_prob)
-    
+
     # ============ 2. ML模型預測 ============
-    # 每位 LINE 使用者 + 場館 + 房間 + 靴號 建立獨立 key，避免不同 UID / 不同桌互相污染
     identity = str(user_id or "anonymous")
     training_key = f"{identity}|{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else f"{identity}|global"
     ml_models = _get_ml_models(training_key)
 
-    # 資料足夠才訓練；換桌/換靴或新增資料達門檻才重訓，避免每局都重訓拖慢 Render
     should_train = (
         len(non_tie) >= 30
         and (
@@ -616,11 +898,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         train_result = ml_models.train(non_tie, training_key=training_key)
         logger.info(f"ML訓練結果: {train_result}")
 
-    # 訓練後再預測，避免剛訓練完還拿到舊的 0.5
     ml_pred = ml_models.predict(non_tie)
     ml_b_prob = ml_pred.get('ensemble', 0.5)
 
-    # 如果 ML 模型已訓練，使用 ML 預測做小幅修正；避免 ML 過度壓過牌路模型
     if ml_models.is_trained:
         ml_weight = ML_WEIGHT * (0.5 + 0.5 * min(1.0, ml_models.training_samples / 50))
         b_prob = b_prob * (1 - ml_weight) + ml_b_prob * ml_weight
@@ -640,15 +920,23 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "recent": recent,
         "balance": balance,
         "streak": streak,
+        "ngram": ngram,
+        "regime": regime_info,
+        "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
+        "online_performance": online_performance,
         "ml_predictions": ml_pred,
         "tf_available": TF_AVAILABLE,
         "training_key": training_key,
         "local_probs": {"B": round(b_prob, 5), "P": round(p_prob, 5), "T": round(tie_prob, 5)},
     }
-    
+
     ai_result = None
     if len(history) >= MIN_HISTORY_FOR_AI and AI_BLEND > 0:
-        ai_result = DeepSeekClient().calibrate(feature_payload)
+        try:
+            ai_result = DeepSeekClient().calibrate(feature_payload)
+        except Exception as e:
+            ai_result = {"error": True, "message": str(e)}
+
         if ai_result and not ai_result.get("error"):
             try:
                 ba = _clamp(float(ai_result.get("banker_adjust", 0)), -0.035, 0.035)
@@ -661,44 +949,56 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 tie_prob += ta * blend
             except Exception:
                 pass
-    
+
     # ============ 4. 正規化 ============
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
-    
+
     # ============ 5. 投票一致性 ============
-    votes = [
-        "B" if markov["B"] >= markov["P"] else "P",
-        "B" if road["B"] >= road["P"] else "P",
-        "B" if streak["B"] >= streak["P"] else "P",
-        "B" if balance["B"] >= balance["P"] else "P",
-        "B" if recent["B"] >= recent["P"] else "P",
-    ]
+    votes = []
+    for score in [markov, road, streak, balance, recent, ngram]:
+        pick = _pick_from_score(score)
+        if pick:
+            votes.append(pick)
+
     if ml_models.is_trained:
         votes.append("B" if ml_b_prob >= 0.5 else "P")
-    
+
+    if not votes:
+        votes = ["B" if b_prob >= p_prob else "P"]
+
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
-    
-    # ML一致性
-    ml_agreement = 1.0 - abs(b_prob - 0.5) * 2 if ml_models.is_trained else 0.0
-    
-    # ============ 6. 推薦與信心 ============
+
+    # 修正版 ML 一致性：ML 方向與主模型一致，且 ML 自己有偏離 0.5，才提高信心。
+    if ml_models.is_trained:
+        ml_pick = "B" if ml_b_prob >= 0.5 else "P"
+        ml_strength = abs(ml_b_prob - 0.5) * 2
+        ml_agreement = ml_strength if ml_pick == main_pick else 0.0
+    else:
+        ml_agreement = 0.0
+
+    # ============ 6. 推薦與信心（本版不加入觀望決策） ============
     if ALLOW_TIE_RECOMMEND and tie_prob >= TIE_RECOMMEND_MIN and tie_prob > max(b_prob, p_prob) * 0.55:
         recommend = "T"
     else:
         recommend = main_pick
-    
+
     conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, ml_agreement)
-    
+
     # ============ 7. 原因說明 ============
-    reason_parts = [road.get("label", "牌路"), f"一致{int(agreement * 100)}%"]
+    reason_parts = [
+        road.get("label", "牌路"),
+        f"型態:{regime_info.get('regime', '')}",
+        f"{ngram.get('label', '')}",
+        f"一致{int(agreement * 100)}%",
+    ]
     if ml_models.is_trained:
-        reason_parts.append(f"ML集體{int(ml_b_prob*100)}%")
+        reason_parts.append(f"ML集體{int(ml_b_prob * 100)}%")
     if ai_result and ai_result.get("pattern_label"):
         reason_parts.append(f"AI:{ai_result.get('pattern_label')}")
     elif ai_result and ai_result.get("error"):
         reason_parts.append("AI離線改本地判斷")
-    
+
     # ============ 8. 返回結果 ============
     return {
         "ok": True,
@@ -716,7 +1016,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "confidence": round(conf, 3),
         "signal_level": level,
         "pattern_label": road.get("label", ""),
-        "reason": " / ".join(reason_parts),
+        "regime": regime_info.get("regime", ""),
+        "ngram_label": ngram.get("label", ""),
+        "ngram_sample": ngram.get("sample", 0),
+        "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
+        "online_model_performance": online_performance,
+        "reason": " / ".join([x for x in reason_parts if x]),
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ml_trained": ml_models.is_trained,
         "ml_samples": ml_models.training_samples,
