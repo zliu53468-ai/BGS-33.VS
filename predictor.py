@@ -81,19 +81,9 @@ ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
-    """機器學習模型容器（單例）"""
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
+    """機器學習模型容器：每個 user_id / 場館 / 房間 / 靴號 可建立獨立實例"""
+
     def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
         
         # 初始化模型
         self.rf = RandomForestClassifier(
@@ -365,8 +355,35 @@ class MLModels:
             logger.error(f"ML預測錯誤: {e}")
             return default_result
 
-# 全局實例
-ml_models = MLModels()
+# ============ 模型快取池 ============
+# 讓每位 LINE 使用者、每個遊戲館、房間、靴號都能使用獨立 ML/LSTM 模型。
+# 注意：Render 記憶體有限，所以用 MAX_MODEL_CACHE 控制最多保留幾組模型。
+MAX_MODEL_CACHE = int(os.getenv("MAX_MODEL_CACHE", "30"))
+_MODEL_CACHE: Dict[str, MLModels] = {}
+_MODEL_CACHE_ORDER: List[str] = []
+
+
+def _get_ml_models(training_key: str) -> MLModels:
+    key = training_key or "global"
+
+    if key in _MODEL_CACHE:
+        # 簡易 LRU：有使用就移到最後
+        try:
+            _MODEL_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+        _MODEL_CACHE_ORDER.append(key)
+        return _MODEL_CACHE[key]
+
+    # 超過上限時，移除最舊模型，避免 Render 記憶體越吃越高
+    while len(_MODEL_CACHE) >= MAX_MODEL_CACHE and _MODEL_CACHE_ORDER:
+        old_key = _MODEL_CACHE_ORDER.pop(0)
+        _MODEL_CACHE.pop(old_key, None)
+
+    model = MLModels()
+    _MODEL_CACHE[key] = model
+    _MODEL_CACHE_ORDER.append(key)
+    return model
 
 # ============ 輔助函數 ============
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -551,7 +568,7 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
     return conf, "弱訊號"
 
 # ============ 主要預測函數 ============
-def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "") -> Dict[str, Any]:
+def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
     整合預測函數：規律模型 + ML模型 + DeepSeek校準
     """
@@ -580,8 +597,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     p_prob = p_side * (1 - tie_prob)
     
     # ============ 2. ML模型預測 ============
-    # 每個場館 / 房間 / 靴號建立獨立 key，避免不同桌互相污染
-    training_key = f"{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else "global"
+    # 每位 LINE 使用者 + 場館 + 房間 + 靴號 建立獨立 key，避免不同 UID / 不同桌互相污染
+    identity = str(user_id or "anonymous")
+    training_key = f"{identity}|{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else f"{identity}|global"
+    ml_models = _get_ml_models(training_key)
 
     # 資料足夠才訓練；換桌/換靴或新增資料達門檻才重訓，避免每局都重訓拖慢 Render
     should_train = (
@@ -609,6 +628,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     # ============ 3. DeepSeek校準 ============
     feature_payload = {
+        "user_id": user_id,
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -682,6 +702,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     # ============ 8. 返回結果 ============
     return {
         "ok": True,
+        "user_id": user_id,
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
@@ -700,6 +721,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "ml_trained": ml_models.is_trained,
         "ml_samples": ml_models.training_samples,
         "tf_available": TF_AVAILABLE,
+        "training_key": training_key,
+        "model_cache_size": len(_MODEL_CACHE),
         "ml_predictions": {
             "lr": round(ml_pred.get('lr', 0.5), 4),
             "rf": round(ml_pred.get('rf', 0.5), 4),
