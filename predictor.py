@@ -56,68 +56,68 @@ T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
 # 模型權重（固定權重模式會使用；動態模式會依牌路型態自動調整）
 # 本版核心：大路 + 下三路為主，Markov / NGram / ML / DeepSeek 為輔
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.10"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.10"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.06"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.04"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.08"))
-NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.10"))
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.055"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.055"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.030"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.015"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.040"))
+NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.060"))
 
 # 四路主模型權重：大路 / 大眼仔 / 小路 / 蟑螂路
-BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.28"))
-BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.22"))
-SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.18"))
-COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.16"))
+BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.30"))
+BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.24"))
+SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.20"))
+COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.17"))
 
 # 舊版 RoadEngine 權重保留相容用；新版不再把下三路合成單一主權重
 ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.00"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
 AI_BLEND = float(os.getenv("AI_BLEND", "0.08"))
 
-# 動態權重開關：只調整融合比例，不加入觀望/下注決策
+# 動態權重開關：調整融合比例；觀望由下方 ALLOW_OBSERVE 控制
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
 USE_ONLINE_WEIGHTING = os.getenv("USE_ONLINE_WEIGHTING", "1") == "1"
 USE_ROAD_ENGINE = os.getenv("USE_ROAD_ENGINE", "1") == "1"
-ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "24"))
-ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "6"))
-ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.35"))
-ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.47"))
-ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.56"))
+ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "20"))
+ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "5"))
+ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.42"))
+ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.43"))
+ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.54"))
 
 # RoadEngine / 下三路路紙引擎參數
 ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
-ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "8"))
+ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "6"))
 ROAD_ENGINE_BREAK_STREAK = int(os.getenv("ROAD_ENGINE_BREAK_STREAK", "5"))
 ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10"))
 ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.024"))
 ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.016"))
-DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "4"))
-ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.030"))
-ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.022"))
+DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "3"))
+ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.045"))
+ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.040"))
 
 # Road Lifecycle：用大路 + 下三路判斷「規律健康度 / 疲乏 / 斷點壓力」
 # 這層不是觀望/下注決策，而是讓程式知道規律該跟、該降權、還是偏反邊。
 USE_ROAD_LIFECYCLE = os.getenv("USE_ROAD_LIFECYCLE", "1") == "1"
 ROAD_LIFECYCLE_WEIGHT = float(os.getenv("ROAD_LIFECYCLE_WEIGHT", "0.26"))
-FOLLOW_SCORE_MIN = float(os.getenv("FOLLOW_SCORE_MIN", "0.62"))
+FOLLOW_SCORE_MIN = float(os.getenv("FOLLOW_SCORE_MIN", "0.61"))
 BREAK_SCORE_MIN = float(os.getenv("BREAK_SCORE_MIN", "0.64"))
 BREAK_FORCE_SCORE = float(os.getenv("BREAK_FORCE_SCORE", "0.78"))
-FOLLOW_BOOST = float(os.getenv("FOLLOW_BOOST", "0.040"))
-FATIGUE_SHRINK = float(os.getenv("FATIGUE_SHRINK", "0.032"))
-BREAK_REVERSE_BIAS = float(os.getenv("BREAK_REVERSE_BIAS", "0.052"))
+FOLLOW_BOOST = float(os.getenv("FOLLOW_BOOST", "0.060"))
+FATIGUE_SHRINK = float(os.getenv("FATIGUE_SHRINK", "0.045"))
+BREAK_REVERSE_BIAS = float(os.getenv("BREAK_REVERSE_BIAS", "0.070"))
 RED_HEALTH_WEIGHT = float(os.getenv("RED_HEALTH_WEIGHT", "0.36"))
 BLUE_BREAK_WEIGHT = float(os.getenv("BLUE_BREAK_WEIGHT", "0.38"))
 ROAD_CONFLICT_WEIGHT = float(os.getenv("ROAD_CONFLICT_WEIGHT", "0.20"))
 DRAGON_FATIGUE_WEIGHT = float(os.getenv("DRAGON_FATIGUE_WEIGHT", "0.14"))
 LIFECYCLE_PROTECT_MIN_CONF = float(os.getenv("LIFECYCLE_PROTECT_MIN_CONF", "0.66"))
-LIFECYCLE_ML_SHRINK = float(os.getenv("LIFECYCLE_ML_SHRINK", "0.60"))
-LIFECYCLE_AI_SHRINK = float(os.getenv("LIFECYCLE_AI_SHRINK", "0.55"))
+LIFECYCLE_ML_SHRINK = float(os.getenv("LIFECYCLE_ML_SHRINK", "0.45"))
+LIFECYCLE_AI_SHRINK = float(os.getenv("LIFECYCLE_AI_SHRINK", "0.40"))
 
 # ML模型權重（在規律模型之後進行二次校準）
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.08"))
-ML_LR_WEIGHT = float(os.getenv("ML_LR_WEIGHT", "0.35"))
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.12"))
+ML_LR_WEIGHT = float(os.getenv("ML_LR_WEIGHT", "0.40"))
 ML_RF_WEIGHT = float(os.getenv("ML_RF_WEIGHT", "0.45"))
-ML_LSTM_WEIGHT = float(os.getenv("ML_LSTM_WEIGHT", "0.20"))
+ML_LSTM_WEIGHT = float(os.getenv("ML_LSTM_WEIGHT", "0.15"))
 
 TIE_SHRINK = float(os.getenv("TIE_SHRINK", "0.30"))
 TIE_MAX_PROB = float(os.getenv("TIE_MAX_PROB", "0.16"))
@@ -126,11 +126,25 @@ TIE_RECOMMEND_MIN = float(os.getenv("TIE_RECOMMEND_MIN", "0.165"))
 MIN_HISTORY_FOR_AI = int(os.getenv("MIN_HISTORY_FOR_AI", "6"))
 MIN_HISTORY_FOR_SIGNAL = int(os.getenv("MIN_HISTORY_FOR_SIGNAL", "4"))
 
+# 決策彈性：放寬主方向機率鎖，並支援混亂/弱訊號時輸出觀望
+SIDE_CLAMP_MIN = float(os.getenv("SIDE_CLAMP_MIN", "0.20"))
+SIDE_CLAMP_MAX = float(os.getenv("SIDE_CLAMP_MAX", "0.80"))
+ALLOW_OBSERVE = os.getenv("ALLOW_OBSERVE", "1") == "1"
+OBSERVE_EDGE_MIN = float(os.getenv("OBSERVE_EDGE_MIN", "0.015"))
+OBSERVE_CONF_MAX = float(os.getenv("OBSERVE_CONF_MAX", "0.45"))
+OBSERVE_CONFLICT_MIN = float(os.getenv("OBSERVE_CONFLICT_MIN", "0.48"))
+OBSERVE_CONFLICT_CONF_MAX = float(os.getenv("OBSERVE_CONFLICT_CONF_MAX", "0.52"))
+OBSERVE_LIFECYCLE_STATES = set(
+    x.strip().upper()
+    for x in os.getenv("OBSERVE_LIFECYCLE_STATES", "CHAOS").split(",")
+    if x.strip()
+)
+
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
 LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
-ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "8"))
+ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
@@ -1262,7 +1276,7 @@ def _apply_lifecycle_bias(b_side: float, lifecycle: Dict[str, Any]) -> float:
     elif state == "CHAOS":
         b_side = 0.5 + (b_side - 0.5) * 0.82
 
-    return _clamp(b_side, 0.26, 0.74)
+    return _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
 
 def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     """
@@ -1602,7 +1616,7 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
     整合預測函數：大路 + 下三路四路主模型 + Road Lifecycle + NGram + 動態權重 + ML模型 + DeepSeek校準
-    注意：本版不加入觀望/EV/下注決策，仍固定輸出 B/P/T 推薦。
+    注意：本版加入低信心/四路分歧觀望機制；仍不做下注金額/EV 配注決策。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
     non_tie = _last_non_tie(history)
@@ -1655,7 +1669,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     # Road Lifecycle 會判斷規律是健康可跟、疲乏、斷點壓力或已斷，再做方向偏移。
     b_side = _apply_lifecycle_bias(b_side, lifecycle)
-    b_side = _clamp(b_side, 0.28, 0.72)
+    b_side = _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
     p_side = 1 - b_side
 
     tie_prob = _tie_score(history)
@@ -1778,13 +1792,40 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     else:
         ml_agreement = 0.0
 
-    # ============ 6. 推薦與信心（本版不加入觀望決策） ==========
+    # ============ 6. 推薦與信心 ==========
+    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, ml_agreement)
+
+    edge = abs(b_prob - p_prob)
+    observe_reason = ""
+    lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle.get("enabled") else ""
+
     if ALLOW_TIE_RECOMMEND and tie_prob >= TIE_RECOMMEND_MIN and tie_prob > max(b_prob, p_prob) * 0.55:
         recommend = "T"
+    elif (
+        ALLOW_OBSERVE
+        and edge < OBSERVE_EDGE_MIN
+        and conf < OBSERVE_CONF_MAX
+    ):
+        recommend = "NONE"
+        observe_reason = f"莊閒差距{edge * 100:.1f}%且信心不足"
+    elif (
+        ALLOW_OBSERVE
+        and conflict_ratio >= OBSERVE_CONFLICT_MIN
+        and conf < OBSERVE_CONFLICT_CONF_MAX
+    ):
+        recommend = "NONE"
+        observe_reason = f"四路分歧{int(conflict_ratio * 100)}%且信心不足"
+    elif (
+        ALLOW_OBSERVE
+        and lifecycle_state in OBSERVE_LIFECYCLE_STATES
+        and conf < OBSERVE_CONFLICT_CONF_MAX
+    ):
+        recommend = "NONE"
+        observe_reason = f"生命周期{lifecycle_state}且信心不足"
     else:
         recommend = main_pick
 
-    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, ml_agreement)
+    recommend_text_map = {"B": "莊", "P": "閒", "T": "和", "NONE": "觀望"}
 
     # ============ 7. 原因說明 ==========
     reason_parts = [
@@ -1798,6 +1839,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         f"{ngram.get('label', '')}",
         f"一致{int(agreement * 100)}%",
     ]
+    if observe_reason:
+        reason_parts.append(f"觀望:{observe_reason}")
     if ml_models.is_trained:
         reason_parts.append(f"ML集體{int(ml_b_prob * 100)}%")
     if ai_result and ai_result.get("pattern_label"):
@@ -1818,7 +1861,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "player_rate": round(p_prob * 100, 1),
         "tie_rate": round(tie_prob * 100, 1),
         "recommend": recommend,
-        "recommend_text": {"B": "莊", "P": "閒", "T": "和"}[recommend],
+        "recommend_text": recommend_text_map.get(recommend, "觀望"),
+        "is_observe": recommend == "NONE",
+        "observe_reason": observe_reason,
+        "decision_edge": round(edge, 5),
+        "side_clamp": {"min": SIDE_CLAMP_MIN, "max": SIDE_CLAMP_MAX},
         "confidence": round(conf, 3),
         "signal_level": level,
         "pattern_label": road.get("label", ""),
