@@ -140,6 +140,25 @@ OBSERVE_LIFECYCLE_STATES = set(
     if x.strip()
 )
 
+# Adaptive Road Memory：本靴內相似牌路狀態回測記憶
+# 目的：不要只靠固定規則，而是看「目前這種類似路型」在本靴過去是跟路準，還是斷路準。
+USE_ADAPTIVE_ROAD_MEMORY = os.getenv("USE_ADAPTIVE_ROAD_MEMORY", "1") == "1"
+ROAD_MEMORY_LOOKBACK = int(os.getenv("ROAD_MEMORY_LOOKBACK", "48"))
+ROAD_MEMORY_MIN_SAMPLE = int(os.getenv("ROAD_MEMORY_MIN_SAMPLE", "3"))
+ROAD_MEMORY_FULL_SAMPLE = int(os.getenv("ROAD_MEMORY_FULL_SAMPLE", "8"))
+ROAD_MEMORY_ALPHA = float(os.getenv("ROAD_MEMORY_ALPHA", "1.2"))
+ROAD_MEMORY_MIN_MATCH_SCORE = float(os.getenv("ROAD_MEMORY_MIN_MATCH_SCORE", "4.0"))
+ROAD_MEMORY_EXACT_BONUS = float(os.getenv("ROAD_MEMORY_EXACT_BONUS", "1.0"))
+ROAD_MEMORY_RECENCY_BONUS = float(os.getenv("ROAD_MEMORY_RECENCY_BONUS", "0.35"))
+ROAD_MEMORY_WEIGHT = float(os.getenv("ROAD_MEMORY_WEIGHT", "0.22"))
+ROAD_MEMORY_MAX_BIAS = float(os.getenv("ROAD_MEMORY_MAX_BIAS", "0.055"))
+ROAD_MEMORY_FOLLOW_THRESHOLD = float(os.getenv("ROAD_MEMORY_FOLLOW_THRESHOLD", "0.56"))
+ROAD_MEMORY_BREAK_THRESHOLD = float(os.getenv("ROAD_MEMORY_BREAK_THRESHOLD", "0.56"))
+ROAD_MEMORY_MIN_ADVANTAGE = float(os.getenv("ROAD_MEMORY_MIN_ADVANTAGE", "0.08"))
+ROAD_MEMORY_PROTECT_MIN_CONF = float(os.getenv("ROAD_MEMORY_PROTECT_MIN_CONF", "0.62"))
+ROAD_MEMORY_ML_SHRINK = float(os.getenv("ROAD_MEMORY_ML_SHRINK", "0.45"))
+ROAD_MEMORY_AI_SHRINK = float(os.getenv("ROAD_MEMORY_AI_SHRINK", "0.40"))
+
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
@@ -1278,6 +1297,304 @@ def _apply_lifecycle_bias(b_side: float, lifecycle: Dict[str, Any]) -> float:
 
     return _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
 
+
+def _bucket_value(value: float, cuts: List[float], labels: List[str]) -> str:
+    """把連續數值轉成穩定桶，避免記憶匹配太死。"""
+    try:
+        v = float(value)
+    except Exception:
+        v = 0.0
+    for cut, label in zip(cuts, labels):
+        if v < cut:
+            return label
+    return labels[-1] if labels else "X"
+
+
+def _road_state_fingerprint(non_tie: List[str], road_family: Dict[str, Any], lifecycle: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Road State Fingerprint：把目前路型壓成「可比較」的狀態指紋。
+    重點是用相對路型，不死綁 B/P，讓程式學：同類狀態到底是跟準還是斷準。
+    """
+    last_side, streak_n = _streak(non_tie)
+    opp = "P" if last_side == "B" else "B" if last_side == "P" else ""
+    consensus = road_family.get("consensus", {}) if road_family else {}
+    trend_side = lifecycle.get("trend_side", "") or consensus.get("pick", "") or last_side
+
+    consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
+    conflict_ratio = float(consensus.get("conflict_ratio", 0.5))
+    red_pressure = float(lifecycle.get("red_pressure", lifecycle.get("health_score", 0.5))) if lifecycle else 0.5
+    blue_pressure = float(lifecycle.get("blue_pressure", 0.5)) if lifecycle else 0.5
+    break_score = float(lifecycle.get("break_score", 0.0)) if lifecycle else 0.0
+    follow_score = float(lifecycle.get("follow_score", 0.5)) if lifecycle else 0.5
+    fatigue_score = float(lifecycle.get("fatigue_score", 0.0)) if lifecycle else 0.0
+    regime = str(regime_info.get("regime", "mixed"))
+    if regime.startswith("periodic"):
+        regime = "periodic"
+
+    streak_bucket = _bucket_value(streak_n, [2, 3, 4, 5, 7], ["S1", "S2", "S3", "S4", "S5_6", "S7P"])
+    consensus_bucket = _bucket_value(consensus_ratio, [0.58, 0.66, 0.74, 0.84], ["C50", "C60", "C70", "C80", "C90"])
+    conflict_bucket = _bucket_value(conflict_ratio, [0.28, 0.40, 0.50], ["KLOW", "KMID", "KHIGH", "KMAX"])
+    red_bucket = _bucket_value(red_pressure, [0.46, 0.56, 0.66], ["RLOW", "RMID", "RHIGH", "RMAX"])
+    blue_bucket = _bucket_value(blue_pressure, [0.46, 0.56, 0.66], ["BLOW", "BMID", "BHIGH", "BMAX"])
+    break_bucket = _bucket_value(break_score, [0.40, 0.58, 0.70], ["BRLOW", "BRMID", "BRHIGH", "BRMAX"])
+    follow_bucket = _bucket_value(follow_score, [0.52, 0.62, 0.72], ["FLOW", "FMID", "FHIGH", "FMAX"])
+    fatigue_bucket = _bucket_value(fatigue_score, [0.35, 0.52, 0.68], ["TLOW", "TMID", "THIGH", "TMAX"])
+    lifecycle_state = str(lifecycle.get("state", "NEUTRAL")) if lifecycle else "NEUTRAL"
+
+    # 四路投票型態，用相對於 trend_side 的 F=跟趨勢、R=反趨勢、N=中性。
+    vote_pattern = []
+    details = consensus.get("details", {}) if consensus else {}
+    for key in ["big_road", "big_eye", "small_road", "cockroach"]:
+        pick = details.get(key, {}).get("pick", "")
+        if not pick or not trend_side:
+            vote_pattern.append("N")
+        elif pick == trend_side:
+            vote_pattern.append("F")
+        else:
+            vote_pattern.append("R")
+    vote_pattern = "".join(vote_pattern)
+
+    # trend_relation 讓不同 B/P 可以共用記憶：趨勢是跟最後一口，還是反最後一口。
+    if trend_side and last_side and trend_side == last_side:
+        trend_relation = "TREND_LAST"
+    elif trend_side and opp and trend_side == opp:
+        trend_relation = "TREND_OPP"
+    else:
+        trend_relation = "TREND_UNKNOWN"
+
+    components = {
+        "regime": regime,
+        "streak_bucket": streak_bucket,
+        "consensus_bucket": consensus_bucket,
+        "conflict_bucket": conflict_bucket,
+        "red_bucket": red_bucket,
+        "blue_bucket": blue_bucket,
+        "break_bucket": break_bucket,
+        "follow_bucket": follow_bucket,
+        "fatigue_bucket": fatigue_bucket,
+        "lifecycle_state": lifecycle_state,
+        "vote_pattern": vote_pattern,
+        "trend_relation": trend_relation,
+    }
+    key = "|".join(f"{k}:{v}" for k, v in components.items())
+    return {
+        "key": key,
+        "components": components,
+        "trend_side": trend_side,
+        "last_side": last_side,
+        "opp_side": opp,
+    }
+
+
+def _memory_match_score(current_fp: Dict[str, Any], past_fp: Dict[str, Any]) -> float:
+    """相似狀態分數：不要求完全一樣，避免記憶模型太死板。"""
+    c = current_fp.get("components", {})
+    p = past_fp.get("components", {})
+    if not c or not p:
+        return 0.0
+    score = 0.0
+    weights = {
+        "regime": 1.25,
+        "streak_bucket": 1.00,
+        "consensus_bucket": 1.00,
+        "conflict_bucket": 0.90,
+        "red_bucket": 1.05,
+        "blue_bucket": 1.10,
+        "break_bucket": 1.10,
+        "follow_bucket": 0.90,
+        "fatigue_bucket": 0.80,
+        "lifecycle_state": 1.00,
+        "vote_pattern": 1.25,
+        "trend_relation": 0.80,
+    }
+    for name, w in weights.items():
+        if c.get(name) == p.get(name):
+            score += w
+    if current_fp.get("key") == past_fp.get("key"):
+        score += ROAD_MEMORY_EXACT_BONUS
+    return score
+
+
+def _adaptive_road_memory_score(non_tie: List[str], road_family: Dict[str, Any], lifecycle: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adaptive Road Memory：本靴內相似牌路回測記憶。
+    它不再只問「紅多還是藍多」，而是回看本靴過去相似狀態：
+    - 當時如果跟趨勢，下一手有沒有中？
+    - 當時如果斷趨勢，下一手有沒有中？
+    樣本夠且偏向明顯時，才用柔性 bias 修正主方向。
+    """
+    default = {
+        "enabled": False,
+        "state": "MEMORY_COLD",
+        "label": "記憶樣本不足",
+        "bias_side": "",
+        "trend_side": "",
+        "follow_rate": 0.5,
+        "break_rate": 0.5,
+        "confidence": 0.0,
+        "sample": 0,
+        "weighted_sample": 0.0,
+        "follow_weight": 0.0,
+        "break_weight": 0.0,
+        "current_fingerprint": {},
+        "matched_examples": [],
+    }
+
+    if not USE_ADAPTIVE_ROAD_MEMORY or not USE_ROAD_ENGINE or len(non_tie) < max(ROAD_ENGINE_MIN_HISTORY + 3, 10):
+        return default
+
+    current_fp = _road_state_fingerprint(non_tie, road_family, lifecycle, regime_info)
+    trend_side = current_fp.get("trend_side", "")
+    opp_side = current_fp.get("opp_side", "")
+    if trend_side not in {"B", "P"}:
+        return {**default, "current_fingerprint": current_fp}
+    if not opp_side:
+        opp_side = "P" if trend_side == "B" else "B"
+
+    start = max(ROAD_ENGINE_MIN_HISTORY, len(non_tie) - ROAD_MEMORY_LOOKBACK)
+    end = len(non_tie)  # i 的 truth 是 non_tie[i]，所以 prefix 到 i 前一手
+    follow_w = 0.0
+    break_w = 0.0
+    raw_matches = 0
+    examples = []
+
+    max_score_seen = 0.0
+    for i in range(start, end):
+        prefix = non_tie[:i]
+        truth = non_tie[i]
+        if len(prefix) < ROAD_ENGINE_MIN_HISTORY or truth not in {"B", "P"}:
+            continue
+        try:
+            pfamily = _road_family_scores(prefix)
+            pregime = _detect_regime(prefix)
+            plifecycle = _road_lifecycle_score(prefix, pfamily, pregime)
+            pfp = _road_state_fingerprint(prefix, pfamily, plifecycle, pregime)
+            ptrend = pfp.get("trend_side", "")
+            if ptrend not in {"B", "P"}:
+                continue
+            match_score = _memory_match_score(current_fp, pfp)
+            max_score_seen = max(max_score_seen, match_score)
+            if match_score < ROAD_MEMORY_MIN_MATCH_SCORE:
+                continue
+
+            # 近期相似狀態稍微加權，但不讓最近幾手完全主宰。
+            recency = (i - start + 1) / max(1, end - start)
+            weight = (match_score / max(ROAD_MEMORY_MIN_MATCH_SCORE, 0.0001)) * (1.0 + ROAD_MEMORY_RECENCY_BONUS * recency)
+            raw_matches += 1
+            if truth == ptrend:
+                follow_w += weight
+                outcome = "follow"
+            else:
+                break_w += weight
+                outcome = "break"
+            if len(examples) < 6:
+                examples.append({
+                    "round": i + 1,
+                    "match_score": round(match_score, 3),
+                    "trend": ptrend,
+                    "truth": truth,
+                    "outcome": outcome,
+                    "state": plifecycle.get("state", ""),
+                    "key": pfp.get("key", ""),
+                })
+        except Exception:
+            continue
+
+    weighted_sample = follow_w + break_w
+    alpha = max(0.0, ROAD_MEMORY_ALPHA)
+    denom = weighted_sample + 2 * alpha
+    if denom <= 0:
+        follow_rate = 0.5
+    else:
+        follow_rate = (follow_w + alpha) / denom
+    break_rate = 1.0 - follow_rate
+    advantage = abs(follow_rate - break_rate)
+
+    sample_strength = _clamp(weighted_sample / max(ROAD_MEMORY_FULL_SAMPLE, 1), 0.0, 1.0)
+    confidence = _clamp(sample_strength * (0.30 + advantage * 1.65), 0.0, 1.0)
+
+    state = "MEMORY_COLD"
+    bias_side = ""
+    if raw_matches >= ROAD_MEMORY_MIN_SAMPLE and weighted_sample >= ROAD_MEMORY_MIN_SAMPLE:
+        if follow_rate >= ROAD_MEMORY_FOLLOW_THRESHOLD and advantage >= ROAD_MEMORY_MIN_ADVANTAGE:
+            state = "MEMORY_FOLLOW"
+            bias_side = trend_side
+        elif break_rate >= ROAD_MEMORY_BREAK_THRESHOLD and advantage >= ROAD_MEMORY_MIN_ADVANTAGE:
+            state = "MEMORY_BREAK"
+            bias_side = opp_side
+        else:
+            state = "MEMORY_NEUTRAL"
+            bias_side = ""
+
+    state_text = {
+        "MEMORY_COLD": "記憶樣本不足",
+        "MEMORY_FOLLOW": "相似路型過去偏跟",
+        "MEMORY_BREAK": "相似路型過去偏斷",
+        "MEMORY_NEUTRAL": "相似路型跟斷接近",
+    }.get(state, state)
+    side_text = {"B": "莊", "P": "閒", "": "無"}.get(bias_side, bias_side)
+
+    return {
+        "enabled": True,
+        "state": state,
+        "label": f"{state_text}:{side_text} 跟{int(follow_rate*100)} 斷{int(break_rate*100)} 樣本{raw_matches}",
+        "bias_side": bias_side,
+        "trend_side": trend_side,
+        "opp_side": opp_side,
+        "follow_rate": round(follow_rate, 4),
+        "break_rate": round(break_rate, 4),
+        "advantage": round(advantage, 4),
+        "confidence": round(confidence, 4),
+        "sample": raw_matches,
+        "weighted_sample": round(weighted_sample, 4),
+        "follow_weight": round(follow_w, 4),
+        "break_weight": round(break_w, 4),
+        "max_score_seen": round(max_score_seen, 4),
+        "current_fingerprint": current_fp,
+        "matched_examples": examples,
+    }
+
+
+def _apply_road_memory_weighting(weights: Dict[str, float], memory: Dict[str, Any]) -> Dict[str, float]:
+    """依相似牌路記憶微調權重：偏跟時保留四路主導；偏斷時提高下三路/回測，降低盲目跟龍。"""
+    if not USE_ADAPTIVE_ROAD_MEMORY or not memory.get("enabled"):
+        return _normalize_weights(weights)
+    state = memory.get("state", "MEMORY_COLD")
+    conf = float(memory.get("confidence", 0.0))
+    if state not in {"MEMORY_FOLLOW", "MEMORY_BREAK"} or conf <= 0:
+        return _normalize_weights(weights)
+
+    adjusted = dict(weights)
+    scale = _clamp(ROAD_MEMORY_WEIGHT / 0.22, 0.10, 2.20)
+    if state == "MEMORY_FOLLOW":
+        for k in ["big_road", "big_eye", "small_road", "cockroach"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.16 * conf * scale)
+        adjusted["recent"] = adjusted.get("recent", 0.0) * 0.92
+    elif state == "MEMORY_BREAK":
+        adjusted["big_road"] = adjusted.get("big_road", 0.0) * (1.0 - 0.10 * conf * scale)
+        adjusted["streak"] = adjusted.get("streak", 0.0) * (1.0 - 0.22 * conf * scale)
+        adjusted["recent"] = adjusted.get("recent", 0.0) * (1.0 - 0.12 * conf * scale)
+        for k in ["big_eye", "small_road", "cockroach", "ngram"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.14 * conf * scale)
+    return _normalize_weights(adjusted)
+
+
+def _apply_road_memory_bias(b_side: float, memory: Dict[str, Any]) -> float:
+    """將 Adaptive Road Memory 轉成柔性偏移，不用硬切換方向。"""
+    if not USE_ADAPTIVE_ROAD_MEMORY or not memory.get("enabled"):
+        return b_side
+    state = memory.get("state", "MEMORY_COLD")
+    bias_side = memory.get("bias_side", "")
+    if state not in {"MEMORY_FOLLOW", "MEMORY_BREAK"} or bias_side not in {"B", "P"}:
+        return b_side
+    conf = float(memory.get("confidence", 0.0))
+    advantage = float(memory.get("advantage", 0.0))
+    scale = _clamp(ROAD_MEMORY_WEIGHT / 0.22, 0.10, 2.20)
+    strength = ROAD_MEMORY_MAX_BIAS * conf * _clamp(advantage * 2.2, 0.25, 1.0) * scale
+    signed = 1 if bias_side == "B" else -1
+    return _clamp(b_side + signed * strength, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
+
 def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     舊欄位相容：把四路共識包裝成 road_engine。
@@ -1615,7 +1932,7 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 # ============ 主要預測函數 ============
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
-    整合預測函數：大路 + 下三路四路主模型 + Road Lifecycle + NGram + 動態權重 + ML模型 + DeepSeek校準
+    整合預測函數：四路主模型 + Road Lifecycle + Adaptive Road Memory + NGram + 動態權重 + ML模型 + DeepSeek校準
     注意：本版加入低信心/四路分歧觀望機制；仍不做下注金額/EV 配注決策。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
@@ -1640,8 +1957,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     regime_info = _detect_regime(non_tie)
     online_performance = _rolling_model_performance(non_tie)
     lifecycle = _road_lifecycle_score(non_tie, road_family, regime_info)
+    road_memory = _adaptive_road_memory_score(non_tie, road_family, lifecycle, regime_info)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
     dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
+    dynamic_weights = _apply_road_memory_weighting(dynamic_weights, road_memory)
 
     total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
@@ -1669,6 +1988,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     # Road Lifecycle 會判斷規律是健康可跟、疲乏、斷點壓力或已斷，再做方向偏移。
     b_side = _apply_lifecycle_bias(b_side, lifecycle)
+    # Adaptive Road Memory 會看本靴過去相似牌路到底是跟準還是斷準，再做柔性修正。
+    b_side = _apply_road_memory_bias(b_side, road_memory)
     b_side = _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
     p_side = 1 - b_side
 
@@ -1702,9 +2023,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         # 如果四路生命週期高信心偏某一邊，而 ML 強烈反向，就縮小 ML 影響，避免 ML 把「該跟/該斷」拉歪。
         lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
         lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
+        memory_bias_side = road_memory.get("bias_side", "") if road_memory.get("enabled") else ""
+        memory_conf = float(road_memory.get("confidence", 0.0)) if road_memory.get("enabled") else 0.0
+        protect_side = memory_bias_side if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF else lifecycle_bias_side
+        protect_conf = memory_conf if protect_side == memory_bias_side else lifecycle_conf
+        shrink = ROAD_MEMORY_ML_SHRINK if protect_side == memory_bias_side else LIFECYCLE_ML_SHRINK
         ml_pick = "B" if ml_b_prob >= 0.5 else "P"
-        if lifecycle_bias_side and lifecycle_conf >= LIFECYCLE_PROTECT_MIN_CONF and ml_pick != lifecycle_bias_side:
-            ml_weight *= _clamp(1.0 - LIFECYCLE_ML_SHRINK, 0.05, 1.0)
+        if protect_side and protect_conf >= min(LIFECYCLE_PROTECT_MIN_CONF, ROAD_MEMORY_PROTECT_MIN_CONF) and ml_pick != protect_side:
+            ml_weight *= _clamp(1.0 - shrink, 0.05, 1.0)
         b_prob = b_prob * (1 - ml_weight) + ml_b_prob * ml_weight
         p_prob = p_prob * (1 - ml_weight) + (1 - ml_b_prob) * ml_weight
 
@@ -1724,6 +2050,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_consensus": road_consensus,
         "road_family": road_family,
         "road_lifecycle": lifecycle,
+        "adaptive_road_memory": road_memory,
         "road_engine": road_engine,
         "markov": markov,
         "road": road,
@@ -1757,9 +2084,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 # AI 是校準器；若它與高信心生命周期方向反向，縮小校準幅度，避免覆蓋四路生命周期判斷。
                 lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
                 lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
+                memory_bias_side = road_memory.get("bias_side", "") if road_memory.get("enabled") else ""
+                memory_conf = float(road_memory.get("confidence", 0.0)) if road_memory.get("enabled") else 0.0
+                protect_side = memory_bias_side if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF else lifecycle_bias_side
+                protect_conf = memory_conf if protect_side == memory_bias_side else lifecycle_conf
+                shrink = ROAD_MEMORY_AI_SHRINK if protect_side == memory_bias_side else LIFECYCLE_AI_SHRINK
                 ai_side = "B" if ba > pa else "P" if pa > ba else ""
-                if lifecycle_bias_side and ai_side and lifecycle_conf >= LIFECYCLE_PROTECT_MIN_CONF and ai_side != lifecycle_bias_side:
-                    blend *= _clamp(1.0 - LIFECYCLE_AI_SHRINK, 0.05, 1.0)
+                if protect_side and ai_side and protect_conf >= min(LIFECYCLE_PROTECT_MIN_CONF, ROAD_MEMORY_PROTECT_MIN_CONF) and ai_side != protect_side:
+                    blend *= _clamp(1.0 - shrink, 0.05, 1.0)
                 b_prob += ba * blend
                 p_prob += pa * blend
                 tie_prob += ta * blend
@@ -1831,6 +2163,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     reason_parts = [
         f"四路:{road_consensus.get('label', '')}",
         f"生命周期:{lifecycle.get('label', '')}",
+        f"記憶:{road_memory.get('label', '')}",
         big_road.get("label", ""),
         big_eye.get("label", ""),
         small_road.get("label", ""),
@@ -1881,6 +2214,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_conflict_ratio": road_consensus.get("conflict_ratio", 0.5),
         "road_family": road_family,
         "road_lifecycle": lifecycle,
+        "adaptive_road_memory": road_memory,
+        "road_memory_state": road_memory.get("state", ""),
+        "road_memory_label": road_memory.get("label", ""),
+        "road_memory_sample": road_memory.get("sample", 0),
+        "road_memory_follow_rate": road_memory.get("follow_rate", 0.5),
+        "road_memory_break_rate": road_memory.get("break_rate", 0.5),
+        "road_memory_confidence": road_memory.get("confidence", 0.0),
         "road_lifecycle_state": lifecycle.get("state", ""),
         "road_lifecycle_label": lifecycle.get("label", ""),
         "road_follow_score": lifecycle.get("follow_score", 0.5),
