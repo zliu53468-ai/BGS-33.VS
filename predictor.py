@@ -55,33 +55,45 @@ P_PRIOR = float(os.getenv("P_PRIOR", "0.4462"))
 T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 
 # 模型權重（固定權重模式會使用；動態模式會依牌路型態自動調整）
-MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.24"))
-ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.21"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.16"))
-BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.08"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.15"))
-NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.11"))
-ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.10"))
+# 本版核心：大路 + 下三路為主，Markov / NGram / ML / DeepSeek 為輔
+MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.10"))
+ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.10"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.06"))
+BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.04"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.08"))
+NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.10"))
+
+# 四路主模型權重：大路 / 大眼仔 / 小路 / 蟑螂路
+BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.20"))
+BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.16"))
+SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.14"))
+COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.12"))
+
+# 舊版 RoadEngine 權重保留相容用；新版不再把下三路合成單一主權重
+ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.00"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
-AI_BLEND = float(os.getenv("AI_BLEND", "0.12"))
+AI_BLEND = float(os.getenv("AI_BLEND", "0.10"))
 
 # 動態權重開關：只調整融合比例，不加入觀望/下注決策
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
 USE_ONLINE_WEIGHTING = os.getenv("USE_ONLINE_WEIGHTING", "1") == "1"
 USE_ROAD_ENGINE = os.getenv("USE_ROAD_ENGINE", "1") == "1"
-ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "18"))
-ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "5"))
-ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.45"))
-ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.48"))
-ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.55"))
+ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "24"))
+ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "6"))
+ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.35"))
+ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.47"))
+ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.56"))
 
-# RoadEngine 路紙引擎參數
+# RoadEngine / 下三路路紙引擎參數
 ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
-ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "10"))
+ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "8"))
 ROAD_ENGINE_BREAK_STREAK = int(os.getenv("ROAD_ENGINE_BREAK_STREAK", "5"))
 ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10"))
-ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.018"))
-ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.014"))
+ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.022"))
+ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.018"))
+DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "4"))
+ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.025"))
+ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.018"))
 
 # ML模型權重（在規律模型之後進行二次校準）
 ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.14"))
@@ -602,13 +614,13 @@ def _streak_score(non_tie: List[str]) -> Dict[str, float]:
         side, edge = last, 0.0
     return {"B": 0.5 + edge if side == "B" else 0.5 - edge, "P": 0.5 + edge if side == "P" else 0.5 - edge}
 
-# ============ RoadEngine：大路 / 衍生路紙特徵 ============
+# ============ RoadEngine：大路 / 下三路獨立主模型 ============
 def _build_big_road(non_tie: List[str], rows: int = ROAD_ENGINE_ROWS) -> Dict[str, Any]:
     """
     建立簡化且穩定的大路矩陣。
     - 同邊：往下排；到底或被占用則往右延伸。
     - 換邊：新欄第一列。
-    回傳位置、欄高、最後位置等，供 RoadEngine 特徵使用。
+    回傳位置、欄高、最後位置等，供大路與下三路使用。
     """
     rows = max(3, int(rows or 6))
     grid: Dict[Tuple[int, int], str] = {}
@@ -672,7 +684,7 @@ def _derived_color_at(layout: Dict[str, Any], pos: Dict[str, Any], offset: int) 
     """
     衍生路紙紅藍簡化規則。
     回傳：1=紅，-1=藍，0=資料不足。
-    目的不是下注決策，而是把路紙整齊/斷點特徵量化。
+    用途：把大眼仔 / 小路 / 蟑螂路的「整齊或變化」量化。
     """
     col = int(pos.get("col", 0))
     row = int(pos.get("row", 0))
@@ -721,27 +733,19 @@ def _color_stats(series: List[int], lookback: int = ROAD_ENGINE_DERIVED_LOOKBACK
     }
 
 
-def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
-    """
-    RoadEngine：把大路、大眼仔、小路、蟑螂路轉成數值特徵與一個輕量方向分數。
-    注意：這不是必勝路紙，只是讓模型多一層「傳統路紙特徵工程」。
-    """
+def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
+    """大路獨立模型：負責長龍、跳路、欄高、黏邊、斷龍壓力。"""
     default = {
-        "B": 0.5,
-        "P": 0.5,
-        "label": "RoadEngine資料不足",
-        "strength": 0.0,
-        "big_road": {},
-        "derived": {},
-        "break_risk": 0.0,
-        "consistency": 0.5,
+        "B": 0.5, "P": 0.5, "label": "大路資料不足", "strength": 0.0,
+        "break_risk": 0.0, "big_road": {}, "red_pressure": 0.5, "blue_pressure": 0.5,
     }
-
     if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
         return default
 
     layout = _build_big_road(non_tie)
     last_side, streak_n = _streak(non_tie)
+    if not last_side:
+        return default
     opp = "P" if last_side == "B" else "B"
 
     recent = non_tie[-16:]
@@ -754,99 +758,74 @@ def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     col_heights = layout.get("col_heights", {})
     current_col_height = int(col_heights.get(last_col, 0))
 
-    big_eye = _derived_series(layout, offset=1)
-    small_road = _derived_series(layout, offset=2)
-    cockroach = _derived_series(layout, offset=3)
+    big_eye_stats = _color_stats(_derived_series(layout, 1))
+    small_road_stats = _color_stats(_derived_series(layout, 2))
+    cockroach_stats = _color_stats(_derived_series(layout, 3))
 
-    big_eye_stats = _color_stats(big_eye)
-    small_road_stats = _color_stats(small_road)
-    cockroach_stats = _color_stats(cockroach)
-
-    derived_stats = {
-        "big_eye": big_eye_stats,
-        "small_road": small_road_stats,
-        "cockroach": cockroach_stats,
-    }
-
-    red_rates = []
-    blue_rates = []
-    counts = []
-    for stats in derived_stats.values():
-        if stats.get("count", 0) > 0:
-            red_rates.append(float(stats.get("red_rate", 0.5)))
-            blue_rates.append(float(stats.get("blue_rate", 0.5)))
-            counts.append(int(stats.get("count", 0)))
-
+    red_rates = [float(x.get("red_rate", 0.5)) for x in [big_eye_stats, small_road_stats, cockroach_stats] if x.get("count", 0) > 0]
+    blue_rates = [float(x.get("blue_rate", 0.5)) for x in [big_eye_stats, small_road_stats, cockroach_stats] if x.get("count", 0) > 0]
     red_pressure = sum(red_rates) / len(red_rates) if red_rates else 0.5
     blue_pressure = sum(blue_rates) / len(blue_rates) if blue_rates else 0.5
-    derived_count = sum(counts)
 
-    # 大路斷點風險：長龍、到底/黏邊、衍生路偏藍時提高。
     break_risk = 0.0
     if streak_n >= ROAD_ENGINE_BREAK_STREAK:
         break_risk += 0.24
     if last_row >= ROAD_ENGINE_ROWS - 1:
         break_risk += 0.16
     if blue_pressure >= 0.58:
-        break_risk += min(0.22, (blue_pressure - 0.5) * 0.60)
-    if switch_rate >= 0.70:
+        break_risk += min(0.24, (blue_pressure - 0.5) * 0.70)
+    if switch_rate >= 0.72:
         break_risk += 0.10
-    break_risk = _clamp(break_risk, 0.0, 0.80)
+    break_risk = _clamp(break_risk, 0.0, 0.85)
 
-    # 方向分數：保持輕量，不讓 RoadEngine 壓過原始模型。
-    b = p = 0.5
-    label = "RoadEngine混合"
-    strength = 0.08
+    label = "大路混合"
+    strength = 0.10
+    side = last_side
+    edge = 0.022
 
     if switch_rate >= 0.72:
         side = opp
-        edge = 0.045 + min(0.015, (switch_rate - 0.72) * 0.10)
-        label = "RoadEngine跳路"
-        strength = 0.13
+        edge = 0.050 + min(0.018, (switch_rate - 0.72) * 0.12)
+        label = "大路單跳"
+        strength = 0.16
     elif streak_n >= 4:
-        cont_edge = 0.042 + min(0.025, (streak_n - 4) * 0.006)
-        if red_pressure >= 0.58:
-            cont_edge += ROAD_ENGINE_RED_CONT_BIAS
-            label = "RoadEngine紅路續龍"
-        elif blue_pressure >= 0.58:
-            cont_edge -= ROAD_ENGINE_BLUE_BREAK_BIAS
-            label = "RoadEngine藍路斷龍壓力"
+        cont_edge = 0.050 + min(0.030, (streak_n - 4) * 0.007)
+        label = "大路長龍延續"
+        if blue_pressure >= 0.60 or break_risk >= 0.62:
+            side = opp
+            edge = min(0.052, cont_edge * 0.68 + ROAD_ENGINE_BLUE_BREAK_BIAS * 0.50)
+            label = "大路斷龍壓力"
         else:
-            label = "RoadEngine大路長龍"
-
-        cont_edge = _clamp(cont_edge, 0.018, 0.075)
-        side = last_side if break_risk < 0.58 else opp
-        edge = cont_edge if side == last_side else min(0.045, cont_edge * 0.70)
-        strength = 0.15 + min(0.05, streak_n * 0.006)
-    elif derived_count >= 8 and red_pressure >= 0.64:
-        side = last_side
-        edge = 0.035
-        label = "RoadEngine衍生紅路整齊"
-        strength = 0.12
-    elif derived_count >= 8 and blue_pressure >= 0.64:
-        side = opp
-        edge = 0.035
-        label = "RoadEngine衍生藍路變化"
-        strength = 0.12
+            side = last_side
+            edge = cont_edge + (ROAD_ENGINE_RED_CONT_BIAS if red_pressure >= 0.58 else 0.0)
+        edge = _clamp(edge, 0.025, 0.085)
+        strength = 0.18 + min(0.06, streak_n * 0.006)
     elif current_col_height >= 3:
         side = last_side
-        edge = 0.032
-        label = "RoadEngine欄高延續"
-        strength = 0.10
-    else:
-        side = last_side if red_pressure >= blue_pressure else opp
-        edge = min(0.025, abs(red_pressure - blue_pressure) * 0.06)
+        edge = 0.038
+        label = "大路欄高延續"
+        strength = 0.14
+    elif blue_pressure >= 0.64:
+        side = opp
+        edge = 0.034 + ROAD_ENGINE_BLUE_BREAK_BIAS * 0.35
+        label = "大路藍路變化"
+        strength = 0.13
+    elif red_pressure >= 0.64:
+        side = last_side
+        edge = 0.034 + ROAD_ENGINE_RED_CONT_BIAS * 0.35
+        label = "大路紅路整齊"
+        strength = 0.13
 
     b = 0.5 + edge if side == "B" else 0.5 - edge
     p = 1 - b
-
-    consistency = _clamp(max(red_pressure, blue_pressure), 0.5, 1.0)
-
     return {
         "B": b,
         "P": p,
         "label": label,
         "strength": round(strength, 4),
+        "break_risk": round(break_risk, 4),
+        "red_pressure": round(red_pressure, 4),
+        "blue_pressure": round(blue_pressure, 4),
         "big_road": {
             "last_side": last_side,
             "last_col": last_col,
@@ -857,11 +836,195 @@ def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
             "streak": streak_n,
             "switch_rate_16": round(switch_rate, 4),
         },
-        "derived": derived_stats,
-        "break_risk": round(break_risk, 4),
-        "red_pressure": round(red_pressure, 4),
-        "blue_pressure": round(blue_pressure, 4),
-        "consistency": round(consistency, 4),
+    }
+
+
+def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_name: str) -> Dict[str, Any]:
+    """
+    下三路獨立模型：
+    - 紅偏多：路型整齊，偏向延續目前大路方向。
+    - 藍偏多：路型變化，偏向反邊/斷點方向。
+    offset=1 大眼仔；offset=2 小路；offset=3 蟑螂路。
+    """
+    default = {
+        "B": 0.5, "P": 0.5, "label": f"{display_name}資料不足", "strength": 0.0,
+        "road_key": road_key, "stats": {"last": 0, "red_rate": 0.5, "blue_rate": 0.5, "count": 0, "tail": ""},
+        "red_pressure": 0.5, "blue_pressure": 0.5,
+    }
+    if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
+        return default
+
+    layout = _build_big_road(non_tie)
+    series = _derived_series(layout, offset=offset)
+    stats = _color_stats(series)
+    last_side, streak_n = _streak(non_tie)
+    if not last_side:
+        return default
+    opp = "P" if last_side == "B" else "B"
+
+    count = int(stats.get("count", 0))
+    red_rate = float(stats.get("red_rate", 0.5))
+    blue_rate = float(stats.get("blue_rate", 0.5))
+    diff = abs(red_rate - blue_rate)
+
+    if count < DERIVED_ROAD_MIN_COUNT:
+        return {**default, "stats": stats, "label": f"{display_name}樣本不足"}
+
+    recent = non_tie[-16:]
+    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+
+    # 三條路敏感度不同：蟑螂路最短線，小路居中，大眼仔較穩。
+    sensitivity = {1: 0.95, 2: 1.00, 3: 1.10}.get(offset, 1.0)
+    base_edge = 0.024 + min(0.034, diff * 0.080 * sensitivity)
+
+    if red_rate > blue_rate:
+        side = last_side
+        edge = base_edge + ROAD_ENGINE_RED_CONT_BIAS * sensitivity
+        label = f"{display_name}紅路續勢"
+    elif blue_rate > red_rate:
+        side = opp
+        edge = base_edge + ROAD_ENGINE_BLUE_BREAK_BIAS * sensitivity
+        label = f"{display_name}藍路變化"
+    else:
+        side = opp if switch_rate >= 0.66 else last_side
+        edge = 0.020
+        label = f"{display_name}紅藍均衡"
+
+    # 單跳盤時，下三路若藍偏多，短線反邊訊號加強；長龍時紅路延續加強。
+    if switch_rate >= 0.72 and blue_rate >= 0.56:
+        side = opp
+        edge += 0.010 * sensitivity
+        label = f"{display_name}跳路變化"
+    if streak_n >= 4 and red_rate >= 0.58:
+        side = last_side
+        edge += 0.008 * sensitivity
+        label = f"{display_name}紅路跟龍"
+
+    edge = _clamp(edge, 0.012, 0.078)
+    b = 0.5 + edge if side == "B" else 0.5 - edge
+    p = 1 - b
+
+    return {
+        "B": b,
+        "P": p,
+        "label": label,
+        "strength": round(0.10 + min(0.10, diff * 0.22) + min(0.04, count * 0.004), 4),
+        "road_key": road_key,
+        "stats": stats,
+        "red_pressure": round(red_rate, 4),
+        "blue_pressure": round(blue_rate, 4),
+        "tail": stats.get("tail", ""),
+    }
+
+
+def _big_eye_score(non_tie: List[str]) -> Dict[str, Any]:
+    return _derived_road_score(non_tie, offset=1, road_key="big_eye", display_name="大眼仔")
+
+
+def _small_road_score(non_tie: List[str]) -> Dict[str, Any]:
+    return _derived_road_score(non_tie, offset=2, road_key="small_road", display_name="小路")
+
+
+def _cockroach_score(non_tie: List[str]) -> Dict[str, Any]:
+    return _derived_road_score(non_tie, offset=3, road_key="cockroach", display_name="蟑螂路")
+
+
+def _road_consensus_score(road_scores: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """四路共識：大路、大眼仔、小路、蟑螂路各自投票後整合。"""
+    vote_weights = _normalize_weights({
+        "big_road": BIG_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "big_eye": BIG_EYE_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "small_road": SMALL_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "cockroach": COCKROACH_WEIGHT if USE_ROAD_ENGINE else 0.0,
+    })
+    vote_score = {"B": 0.0, "P": 0.0}
+    votes = []
+    details = {}
+    for name, score in road_scores.items():
+        pick = _pick_from_score(score, min_edge=0.002)
+        weight = vote_weights.get(name, 0.0)
+        if pick:
+            vote_score[pick] += weight
+            votes.append(pick)
+        details[name] = {
+            "pick": pick,
+            "weight": round(weight, 4),
+            "label": score.get("label", ""),
+            "B": round(float(score.get("B", 0.5)), 4),
+            "P": round(float(score.get("P", 0.5)), 4),
+        }
+
+    if vote_score["B"] == vote_score["P"]:
+        side = ""
+    else:
+        side = "B" if vote_score["B"] > vote_score["P"] else "P"
+
+    total_vote = max(0.0001, vote_score["B"] + vote_score["P"])
+    consensus_ratio = max(vote_score["B"], vote_score["P"]) / total_vote
+    conflict_ratio = 1.0 - consensus_ratio
+
+    b_raw = sum(float(road_scores[k].get("B", 0.5)) * vote_weights.get(k, 0.0) for k in road_scores)
+    p_raw = sum(float(road_scores[k].get("P", 0.5)) * vote_weights.get(k, 0.0) for k in road_scores)
+    b, p = (0.5, 0.5) if b_raw + p_raw <= 0 else (b_raw / (b_raw + p_raw), p_raw / (b_raw + p_raw))
+
+    if side:
+        label = f"四路共識:{'莊' if side == 'B' else '閒'} {int(consensus_ratio * 100)}%"
+    else:
+        label = "四路分歧"
+
+    return {
+        "B": b,
+        "P": p,
+        "label": label,
+        "pick": side,
+        "votes": votes,
+        "vote_score": {"B": round(vote_score["B"], 4), "P": round(vote_score["P"], 4)},
+        "consensus_ratio": round(consensus_ratio, 4),
+        "conflict_ratio": round(conflict_ratio, 4),
+        "details": details,
+        "strength": round(0.10 + max(0.0, consensus_ratio - 0.5) * 0.30, 4),
+    }
+
+
+def _road_family_scores(non_tie: List[str]) -> Dict[str, Any]:
+    """一次取得大路與下三路四個獨立模型 + 四路共識。"""
+    big_road = _big_road_score(non_tie)
+    big_eye = _big_eye_score(non_tie)
+    small_road = _small_road_score(non_tie)
+    cockroach = _cockroach_score(non_tie)
+    scores = {
+        "big_road": big_road,
+        "big_eye": big_eye,
+        "small_road": small_road,
+        "cockroach": cockroach,
+    }
+    consensus = _road_consensus_score(scores)
+    return {**scores, "consensus": consensus}
+
+
+def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
+    """
+    舊欄位相容：把四路共識包裝成 road_engine。
+    新版真正參與融合的是 big_road / big_eye / small_road / cockroach 四個獨立模型。
+    """
+    family = _road_family_scores(non_tie)
+    consensus = family.get("consensus", {})
+    big_road = family.get("big_road", {})
+    return {
+        "B": float(consensus.get("B", 0.5)),
+        "P": float(consensus.get("P", 0.5)),
+        "label": consensus.get("label", "四路共識資料不足"),
+        "strength": consensus.get("strength", 0.0),
+        "big_road": big_road.get("big_road", {}),
+        "derived": {
+            "big_eye": family.get("big_eye", {}).get("stats", {}),
+            "small_road": family.get("small_road", {}).get("stats", {}),
+            "cockroach": family.get("cockroach", {}).get("stats", {}),
+        },
+        "break_risk": big_road.get("break_risk", 0.0),
+        "consistency": consensus.get("consensus_ratio", 0.5),
+        "road_family": family,
     }
 
 
@@ -886,13 +1049,16 @@ def _periodicity_score(non_tie: List[str], window: int = 16) -> Dict[str, Any]:
 def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
     """偵測目前牌路型態，只用於調整權重，不做觀望/下注決策。"""
     fixed_weights = _normalize_weights({
+        "big_road": BIG_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "big_eye": BIG_EYE_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "small_road": SMALL_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "cockroach": COCKROACH_WEIGHT if USE_ROAD_ENGINE else 0.0,
+        "ngram": NGRAM_WEIGHT,
         "markov": MARKOV_WEIGHT,
         "road": ROAD_WEIGHT,
+        "recent": RECENT_WEIGHT,
         "streak": STREAK_WEIGHT,
         "balance": BALANCE_WEIGHT,
-        "recent": RECENT_WEIGHT,
-        "ngram": NGRAM_WEIGHT,
-        "road_engine": ROAD_ENGINE_WEIGHT if USE_ROAD_ENGINE else 0.0,
     })
 
     if not USE_DYNAMIC_REGIME_WEIGHTS:
@@ -907,18 +1073,20 @@ def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
 
     if len(non_tie) < 8:
         weights = {
-            "markov": 0.24,
-            "road": 0.20,
-            "streak": 0.17,
-            "balance": 0.09,
-            "recent": 0.16,
-            "ngram": 0.07,
-            "road_engine": 0.07,
+            "big_road": 0.18,
+            "big_eye": 0.13,
+            "small_road": 0.11,
+            "cockroach": 0.10,
+            "ngram": 0.06,
+            "markov": 0.14,
+            "road": 0.12,
+            "recent": 0.09,
+            "streak": 0.05,
+            "balance": 0.02,
         }
-        if NGRAM_WEIGHT <= 0:
-            weights["ngram"] = 0.0
-        if ROAD_ENGINE_WEIGHT <= 0 or not USE_ROAD_ENGINE:
-            weights["road_engine"] = 0.0
+        if not USE_ROAD_ENGINE:
+            for k in ["big_road", "big_eye", "small_road", "cockroach"]:
+                weights[k] = 0.0
         return {
             "regime": "cold",
             "weights": _normalize_weights(weights),
@@ -937,83 +1105,114 @@ def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
     best_period_score = period_info["score"]
     best_period = period_info["period"]
 
+    # 四路主模型基準權重：大路 + 下三路合計約 62%
     if streak_n >= 4:
         regime = "trend_dragon"
         weights = {
-            "markov": 0.23,
-            "road": 0.20,
-            "streak": 0.27,
-            "balance": 0.05,
-            "recent": 0.09,
-            "ngram": 0.06,
-            "road_engine": 0.10,
+            "big_road": 0.24,
+            "big_eye": 0.17,
+            "small_road": 0.14,
+            "cockroach": 0.10,
+            "ngram": 0.07,
+            "markov": 0.09,
+            "road": 0.08,
+            "recent": 0.04,
+            "streak": 0.06,
+            "balance": 0.01,
         }
     elif switch_rate >= 0.72:
         regime = "single_jump"
         weights = {
-            "markov": 0.25,
-            "road": 0.17,
-            "streak": 0.07,
-            "balance": 0.05,
-            "recent": 0.26,
+            "big_road": 0.18,
+            "big_eye": 0.15,
+            "small_road": 0.15,
+            "cockroach": 0.16,
             "ngram": 0.09,
-            "road_engine": 0.11,
+            "markov": 0.11,
+            "road": 0.06,
+            "recent": 0.08,
+            "streak": 0.01,
+            "balance": 0.01,
         }
     elif best_period_score >= 0.70:
         regime = f"periodic_{best_period}"
         weights = {
-            "markov": 0.18,
-            "road": 0.23,
-            "streak": 0.09,
-            "balance": 0.05,
-            "recent": 0.16,
-            "ngram": 0.19,
-            "road_engine": 0.10,
+            "big_road": 0.18,
+            "big_eye": 0.15,
+            "small_road": 0.14,
+            "cockroach": 0.12,
+            "ngram": 0.16,
+            "markov": 0.08,
+            "road": 0.09,
+            "recent": 0.05,
+            "streak": 0.02,
+            "balance": 0.01,
         }
     elif abs(b_rate - 0.5) >= 0.22:
         regime = "biased_side"
         weights = {
-            "markov": 0.27,
-            "road": 0.20,
-            "streak": 0.16,
-            "balance": 0.07,
-            "recent": 0.14,
+            "big_road": 0.21,
+            "big_eye": 0.16,
+            "small_road": 0.13,
+            "cockroach": 0.10,
             "ngram": 0.06,
-            "road_engine": 0.10,
+            "markov": 0.13,
+            "road": 0.09,
+            "recent": 0.06,
+            "streak": 0.04,
+            "balance": 0.02,
         }
     elif 0.42 <= switch_rate <= 0.62 and streak_n <= 2 and best_period_score < 0.62:
         regime = "chaos_mixed"
         weights = {
-            "markov": 0.23,
-            "road": 0.16,
-            "streak": 0.10,
-            "balance": 0.07,
-            "recent": 0.16,
-            "ngram": 0.15,
-            "road_engine": 0.13,
+            "big_road": 0.16,
+            "big_eye": 0.15,
+            "small_road": 0.15,
+            "cockroach": 0.15,
+            "ngram": 0.12,
+            "markov": 0.10,
+            "road": 0.06,
+            "recent": 0.07,
+            "streak": 0.02,
+            "balance": 0.02,
         }
     else:
         regime = "mixed"
         weights = {
-            "markov": 0.23,
-            "road": 0.20,
-            "streak": 0.14,
-            "balance": 0.07,
-            "recent": 0.16,
+            "big_road": 0.20,
+            "big_eye": 0.16,
+            "small_road": 0.14,
+            "cockroach": 0.12,
             "ngram": 0.10,
-            "road_engine": 0.10,
+            "markov": 0.10,
+            "road": 0.08,
+            "recent": 0.06,
+            "streak": 0.03,
+            "balance": 0.01,
         }
 
-    # 讓環境變數 NGRAM_WEIGHT / ROAD_ENGINE_WEIGHT 仍可控制影響力。
-    if NGRAM_WEIGHT <= 0:
-        weights["ngram"] = 0.0
-    else:
-        weights["ngram"] *= _clamp(NGRAM_WEIGHT / 0.11, 0.25, 2.00)
+    if not USE_ROAD_ENGINE:
+        for k in ["big_road", "big_eye", "small_road", "cockroach"]:
+            weights[k] = 0.0
 
-    if ROAD_ENGINE_WEIGHT <= 0 or not USE_ROAD_ENGINE:
-        weights["road_engine"] = 0.0
-    else:
-        weights["road_engine"] *= _clamp(ROAD_ENGINE_WEIGHT / 0.10, 0.25, 2.00)
+    # 讓環境變數仍可控制四路與 NGram 影響力。
+    scale_map = {
+        "big_road": (BIG_ROAD_WEIGHT, 0.20),
+        "big_eye": (BIG_EYE_WEIGHT, 0.16),
+        "small_road": (SMALL_ROAD_WEIGHT, 0.14),
+        "cockroach": (COCKROACH_WEIGHT, 0.12),
+        "ngram": (NGRAM_WEIGHT, 0.10),
+        "markov": (MARKOV_WEIGHT, 0.10),
+        "road": (ROAD_WEIGHT, 0.10),
+        "recent": (RECENT_WEIGHT, 0.08),
+        "streak": (STREAK_WEIGHT, 0.06),
+        "balance": (BALANCE_WEIGHT, 0.04),
+    }
+    for name, (value, base) in scale_map.items():
+        if value <= 0:
+            weights[name] = 0.0
+        else:
+            weights[name] *= _clamp(value / max(base, 0.0001), 0.20, 2.50)
 
     return {
         "regime": regime,
@@ -1029,9 +1228,12 @@ def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
 def _rolling_model_performance(non_tie: List[str]) -> Dict[str, Any]:
     """
     用最近 N 局做本靴內部回測，估計各子模型近期準度。
-    不需要額外儲存狀態，也不改變 predict 的輸入介面。
+    新版四路獨立：big_road / big_eye / small_road / cockroach 各自統計。
     """
-    model_names = ["markov", "road", "streak", "balance", "recent", "ngram", "road_engine"]
+    model_names = [
+        "big_road", "big_eye", "small_road", "cockroach",
+        "ngram", "markov", "road", "recent", "streak", "balance"
+    ]
     result = {
         name: {"acc": 0.5, "count": 0, "correct": 0, "factor": 1.0}
         for name in model_names
@@ -1048,14 +1250,18 @@ def _rolling_model_performance(non_tie: List[str]) -> Dict[str, Any]:
         if truth not in {"B", "P"}:
             continue
 
+        family = _road_family_scores(prefix)
         scores = {
+            "big_road": family.get("big_road", {}),
+            "big_eye": family.get("big_eye", {}),
+            "small_road": family.get("small_road", {}),
+            "cockroach": family.get("cockroach", {}),
+            "ngram": _ngram_score(prefix),
             "markov": _transition_prob(prefix),
             "road": _road_pattern_score(prefix),
+            "recent": _recent_score(prefix),
             "streak": _streak_score(prefix),
             "balance": _balance_score(prefix),
-            "recent": _recent_score(prefix),
-            "ngram": _ngram_score(prefix),
-            "road_engine": _road_engine_score(prefix),
         }
 
         for name, score in scores.items():
@@ -1134,20 +1340,27 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 # ============ 主要預測函數 ============
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
-    整合預測函數：規律模型 + NGram + RoadEngine + 牌路型態動態權重 + ML模型 + DeepSeek校準
+    整合預測函數：大路 + 下三路四路主模型 + NGram + 動態權重 + ML模型 + DeepSeek校準
     注意：本版不加入觀望/EV/下注決策，仍固定輸出 B/P/T 推薦。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
     non_tie = _last_non_tie(history)
 
-    # ============ 1. 規律模型 + 新增 NGram / RoadEngine / Regime ============
+    # ============ 1. 基礎模型 + 四路主模型 ==========
     markov = _transition_prob(non_tie)
     road = _road_pattern_score(non_tie)
     recent = _recent_score(non_tie)
     balance = _balance_score(non_tie)
     streak = _streak_score(non_tie)
     ngram = _ngram_score(non_tie)
-    road_engine = _road_engine_score(non_tie)
+
+    road_family = _road_family_scores(non_tie)
+    big_road = road_family.get("big_road", {"B": 0.5, "P": 0.5, "label": "大路資料不足"})
+    big_eye = road_family.get("big_eye", {"B": 0.5, "P": 0.5, "label": "大眼仔資料不足"})
+    small_road = road_family.get("small_road", {"B": 0.5, "P": 0.5, "label": "小路資料不足"})
+    cockroach = road_family.get("cockroach", {"B": 0.5, "P": 0.5, "label": "蟑螂路資料不足"})
+    road_consensus = road_family.get("consensus", {"B": 0.5, "P": 0.5, "label": "四路共識資料不足"})
+    road_engine = _road_engine_score(non_tie)  # 舊欄位相容用
 
     regime_info = _detect_regime(non_tie)
     online_performance = _rolling_model_performance(non_tie)
@@ -1155,21 +1368,36 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
-        markov["B"] * dynamic_weights.get("markov", 0.0)
+        big_road["B"] * dynamic_weights.get("big_road", 0.0)
+        + big_eye["B"] * dynamic_weights.get("big_eye", 0.0)
+        + small_road["B"] * dynamic_weights.get("small_road", 0.0)
+        + cockroach["B"] * dynamic_weights.get("cockroach", 0.0)
+        + ngram["B"] * dynamic_weights.get("ngram", 0.0)
+        + markov["B"] * dynamic_weights.get("markov", 0.0)
         + road["B"] * dynamic_weights.get("road", 0.0)
+        + recent["B"] * dynamic_weights.get("recent", 0.0)
         + streak["B"] * dynamic_weights.get("streak", 0.0)
         + balance["B"] * dynamic_weights.get("balance", 0.0)
-        + recent["B"] * dynamic_weights.get("recent", 0.0)
-        + ngram["B"] * dynamic_weights.get("ngram", 0.0)
-        + road_engine["B"] * dynamic_weights.get("road_engine", 0.0)
     ) / total_w
+
+    # 四路共識很高時，輕微加強；四路分歧時，輕微回收到 0.5，避免互打。
+    consensus_pick = road_consensus.get("pick", "")
+    consensus_ratio = float(road_consensus.get("consensus_ratio", 0.5))
+    conflict_ratio = float(road_consensus.get("conflict_ratio", 0.5))
+    if consensus_pick and consensus_ratio >= 0.72:
+        signed = 1 if consensus_pick == "B" else -1
+        b_side += signed * ROAD_CONSENSUS_BOOST * (consensus_ratio - 0.5) * 2
+    elif conflict_ratio >= 0.45:
+        b_side = 0.5 + (b_side - 0.5) * (1 - ROAD_CONFLICT_SHRINK)
+
+    b_side = _clamp(b_side, 0.30, 0.70)
     p_side = 1 - b_side
 
     tie_prob = _tie_score(history)
     b_prob = b_side * (1 - tie_prob)
     p_prob = p_side * (1 - tie_prob)
 
-    # ============ 2. ML模型預測 ============
+    # ============ 2. ML模型預測 ==========
     identity = str(user_id or "anonymous")
     training_key = f"{identity}|{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else f"{identity}|global"
     ml_models = _get_ml_models(training_key)
@@ -1195,7 +1423,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         b_prob = b_prob * (1 - ml_weight) + ml_b_prob * ml_weight
         p_prob = p_prob * (1 - ml_weight) + (1 - ml_b_prob) * ml_weight
 
-    # ============ 3. DeepSeek校準 ============
+    # ============ 3. DeepSeek校準 ==========
     feature_payload = {
         "user_id": user_id,
         "venue": venue,
@@ -1204,13 +1432,19 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "history_len": len(history),
         "history_tail": "".join(history[-36:]),
         "non_tie_tail": "".join(non_tie[-36:]),
+        "big_road_model": big_road,
+        "big_eye_model": big_eye,
+        "small_road_model": small_road,
+        "cockroach_model": cockroach,
+        "road_consensus": road_consensus,
+        "road_family": road_family,
+        "road_engine": road_engine,
         "markov": markov,
         "road": road,
         "recent": recent,
         "balance": balance,
         "streak": streak,
         "ngram": ngram,
-        "road_engine": road_engine,
         "regime": regime_info,
         "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
         "online_performance": online_performance,
@@ -1240,12 +1474,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             except Exception:
                 pass
 
-    # ============ 4. 正規化 ============
+    # ============ 4. 正規化 ==========
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
 
-    # ============ 5. 投票一致性 ============
+    # ============ 5. 投票一致性 ==========
     votes = []
-    for score in [markov, road, streak, balance, recent, ngram, road_engine]:
+    for score in [big_road, big_eye, small_road, cockroach, ngram, markov, road, recent, streak, balance]:
         pick = _pick_from_score(score)
         if pick:
             votes.append(pick)
@@ -1259,7 +1493,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     main_pick = "B" if b_prob >= p_prob else "P"
     agreement = votes.count(main_pick) / len(votes)
 
-    # 修正版 ML 一致性：ML 方向與主模型一致，且 ML 自己有偏離 0.5，才提高信心。
     if ml_models.is_trained:
         ml_pick = "B" if ml_b_prob >= 0.5 else "P"
         ml_strength = abs(ml_b_prob - 0.5) * 2
@@ -1267,7 +1500,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     else:
         ml_agreement = 0.0
 
-    # ============ 6. 推薦與信心（本版不加入觀望決策） ============
+    # ============ 6. 推薦與信心（本版不加入觀望決策） ==========
     if ALLOW_TIE_RECOMMEND and tie_prob >= TIE_RECOMMEND_MIN and tie_prob > max(b_prob, p_prob) * 0.55:
         recommend = "T"
     else:
@@ -1275,12 +1508,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, ml_agreement)
 
-    # ============ 7. 原因說明 ============
+    # ============ 7. 原因說明 ==========
     reason_parts = [
-        road.get("label", "牌路"),
+        f"四路:{road_consensus.get('label', '')}",
+        big_road.get("label", ""),
+        big_eye.get("label", ""),
+        small_road.get("label", ""),
+        cockroach.get("label", ""),
         f"型態:{regime_info.get('regime', '')}",
         f"{ngram.get('label', '')}",
-        f"{road_engine.get('label', '')}",
         f"一致{int(agreement * 100)}%",
     ]
     if ml_models.is_trained:
@@ -1290,7 +1526,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     elif ai_result and ai_result.get("error"):
         reason_parts.append("AI離線改本地判斷")
 
-    # ============ 8. 返回結果 ============
+    # ============ 8. 返回結果 ==========
     return {
         "ok": True,
         "user_id": user_id,
@@ -1310,6 +1546,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "regime": regime_info.get("regime", ""),
         "ngram_label": ngram.get("label", ""),
         "ngram_sample": ngram.get("sample", 0),
+        "big_road_label": big_road.get("label", ""),
+        "big_eye_label": big_eye.get("label", ""),
+        "small_road_label": small_road.get("label", ""),
+        "cockroach_label": cockroach.get("label", ""),
+        "road_consensus_label": road_consensus.get("label", ""),
+        "road_consensus_ratio": road_consensus.get("consensus_ratio", 0.5),
+        "road_conflict_ratio": road_consensus.get("conflict_ratio", 0.5),
+        "road_family": road_family,
         "road_engine_label": road_engine.get("label", ""),
         "road_engine_break_risk": road_engine.get("break_risk", 0.0),
         "road_engine_consistency": road_engine.get("consistency", 0.5),
