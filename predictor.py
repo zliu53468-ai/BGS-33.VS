@@ -64,15 +64,15 @@ RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.08"))
 NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.10"))
 
 # 四路主模型權重：大路 / 大眼仔 / 小路 / 蟑螂路
-BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.20"))
-BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.16"))
-SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.14"))
-COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.12"))
+BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.28"))
+BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.22"))
+SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.18"))
+COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.16"))
 
 # 舊版 RoadEngine 權重保留相容用；新版不再把下三路合成單一主權重
 ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.00"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
-AI_BLEND = float(os.getenv("AI_BLEND", "0.10"))
+AI_BLEND = float(os.getenv("AI_BLEND", "0.08"))
 
 # 動態權重開關：只調整融合比例，不加入觀望/下注決策
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
@@ -89,14 +89,32 @@ ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
 ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "8"))
 ROAD_ENGINE_BREAK_STREAK = int(os.getenv("ROAD_ENGINE_BREAK_STREAK", "5"))
 ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10"))
-ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.022"))
-ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.018"))
+ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.024"))
+ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.016"))
 DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "4"))
-ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.025"))
-ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.018"))
+ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.030"))
+ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.022"))
+
+# Road Lifecycle：用大路 + 下三路判斷「規律健康度 / 疲乏 / 斷點壓力」
+# 這層不是觀望/下注決策，而是讓程式知道規律該跟、該降權、還是偏反邊。
+USE_ROAD_LIFECYCLE = os.getenv("USE_ROAD_LIFECYCLE", "1") == "1"
+ROAD_LIFECYCLE_WEIGHT = float(os.getenv("ROAD_LIFECYCLE_WEIGHT", "0.26"))
+FOLLOW_SCORE_MIN = float(os.getenv("FOLLOW_SCORE_MIN", "0.62"))
+BREAK_SCORE_MIN = float(os.getenv("BREAK_SCORE_MIN", "0.64"))
+BREAK_FORCE_SCORE = float(os.getenv("BREAK_FORCE_SCORE", "0.78"))
+FOLLOW_BOOST = float(os.getenv("FOLLOW_BOOST", "0.040"))
+FATIGUE_SHRINK = float(os.getenv("FATIGUE_SHRINK", "0.032"))
+BREAK_REVERSE_BIAS = float(os.getenv("BREAK_REVERSE_BIAS", "0.052"))
+RED_HEALTH_WEIGHT = float(os.getenv("RED_HEALTH_WEIGHT", "0.36"))
+BLUE_BREAK_WEIGHT = float(os.getenv("BLUE_BREAK_WEIGHT", "0.38"))
+ROAD_CONFLICT_WEIGHT = float(os.getenv("ROAD_CONFLICT_WEIGHT", "0.20"))
+DRAGON_FATIGUE_WEIGHT = float(os.getenv("DRAGON_FATIGUE_WEIGHT", "0.14"))
+LIFECYCLE_PROTECT_MIN_CONF = float(os.getenv("LIFECYCLE_PROTECT_MIN_CONF", "0.66"))
+LIFECYCLE_ML_SHRINK = float(os.getenv("LIFECYCLE_ML_SHRINK", "0.60"))
+LIFECYCLE_AI_SHRINK = float(os.getenv("LIFECYCLE_AI_SHRINK", "0.55"))
 
 # ML模型權重（在規律模型之後進行二次校準）
-ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.14"))
+ML_WEIGHT = float(os.getenv("ML_WEIGHT", "0.08"))
 ML_LR_WEIGHT = float(os.getenv("ML_LR_WEIGHT", "0.35"))
 ML_RF_WEIGHT = float(os.getenv("ML_RF_WEIGHT", "0.45"))
 ML_LSTM_WEIGHT = float(os.getenv("ML_LSTM_WEIGHT", "0.20"))
@@ -1003,6 +1021,249 @@ def _road_family_scores(non_tie: List[str]) -> Dict[str, Any]:
     return {**scores, "consensus": consensus}
 
 
+
+
+def _road_lifecycle_score(non_tie: List[str], road_family: Dict[str, Any], regime_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Road Lifecycle：判斷一段牌路規律目前是「可跟、疲乏、斷點壓力、已斷、混亂」。
+
+    核心概念：
+    - 大路負責主趨勢與龍/跳狀態。
+    - 下三路紅藍負責規律健康度：紅多偏健康可跟，藍多偏變化/斷點。
+    - 四路共識負責確認方向；四路分歧代表路型開始不穩。
+
+    這個函數不直接做觀望或下注金額決策，只輸出 bias 給主融合層使用。
+    """
+    default = {
+        "enabled": False,
+        "state": "NEUTRAL",
+        "trend_side": "",
+        "bias_side": "",
+        "follow_score": 0.5,
+        "break_score": 0.0,
+        "fatigue_score": 0.0,
+        "health_score": 0.5,
+        "confidence": 0.0,
+        "label": "Lifecycle資料不足",
+        "components": {},
+    }
+
+    if not USE_ROAD_LIFECYCLE or not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
+        return default
+
+    regime_info = regime_info or {}
+    last_side, streak_n = _streak(non_tie)
+    if not last_side:
+        return default
+    opp = "P" if last_side == "B" else "B"
+
+    consensus = road_family.get("consensus", {})
+    big_road = road_family.get("big_road", {})
+    big_eye = road_family.get("big_eye", {})
+    small_road = road_family.get("small_road", {})
+    cockroach = road_family.get("cockroach", {})
+
+    trend_side = consensus.get("pick", "") or last_side
+    consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
+    conflict_ratio = float(consensus.get("conflict_ratio", 0.5))
+
+    def _get_rate(model: Dict[str, Any], key: str, default_v: float = 0.5) -> float:
+        return float(model.get(key, default_v))
+
+    # 下三路紅藍健康度：大眼仔較穩，小路居中，蟑螂路較短線。
+    derived_models = [big_eye, small_road, cockroach]
+    valid = [m for m in derived_models if int(m.get("stats", {}).get("count", 0)) >= DERIVED_ROAD_MIN_COUNT]
+    if valid:
+        red_pressure = sum(_get_rate(m, "red_pressure", 0.5) for m in valid) / len(valid)
+        blue_pressure = sum(_get_rate(m, "blue_pressure", 0.5) for m in valid) / len(valid)
+        derived_count = sum(int(m.get("stats", {}).get("count", 0)) for m in valid)
+    else:
+        red_pressure = float(big_road.get("red_pressure", 0.5))
+        blue_pressure = float(big_road.get("blue_pressure", 0.5))
+        derived_count = 0
+
+    big_break = float(big_road.get("break_risk", 0.0))
+    big_info = big_road.get("big_road", {})
+    last_row = int(big_info.get("last_row", 0))
+    current_col_height = int(big_info.get("current_col_height", 0))
+    switch_rate = float(regime_info.get("switch_rate", big_info.get("switch_rate_16", 0.5)))
+
+    # 龍/規律疲乏：長龍、到底/黏邊、欄高過高、下三路轉藍、四路分歧都會提高。
+    dragon_len_pressure = 0.0
+    if streak_n >= max(3, ROAD_ENGINE_BREAK_STREAK - 1):
+        dragon_len_pressure = _clamp((streak_n - (ROAD_ENGINE_BREAK_STREAK - 1)) / 6.0, 0.0, 1.0)
+
+    edge_pressure = 0.0
+    if last_row >= ROAD_ENGINE_ROWS - 1:
+        edge_pressure += 0.45
+    if current_col_height >= ROAD_ENGINE_ROWS:
+        edge_pressure += 0.20
+    edge_pressure = _clamp(edge_pressure, 0.0, 1.0)
+
+    blue_shift = _clamp((blue_pressure - 0.50) * 2.0, 0.0, 1.0)
+    red_health = _clamp((red_pressure - 0.50) * 2.0, 0.0, 1.0)
+    conflict_pressure = _clamp((conflict_ratio - 0.25) / 0.35, 0.0, 1.0)
+
+    fatigue_score = _clamp(
+        dragon_len_pressure * DRAGON_FATIGUE_WEIGHT * 2.1
+        + edge_pressure * 0.22
+        + blue_shift * 0.26
+        + conflict_pressure * 0.20,
+        0.0,
+        1.0,
+    )
+
+    follow_score = _clamp(
+        0.42
+        + red_health * RED_HEALTH_WEIGHT
+        + (consensus_ratio - 0.50) * 0.50
+        + max(0.0, 0.62 - conflict_ratio) * 0.12
+        - blue_shift * 0.22
+        - big_break * 0.22
+        - fatigue_score * 0.18,
+        0.0,
+        1.0,
+    )
+
+    break_score = _clamp(
+        0.18
+        + blue_shift * BLUE_BREAK_WEIGHT
+        + big_break * 0.42
+        + conflict_pressure * ROAD_CONFLICT_WEIGHT
+        + fatigue_score * 0.32
+        - red_health * 0.16,
+        0.0,
+        1.0,
+    )
+
+    # 狀態判斷：不是「硬條件下注」，只是讓模型理解規律生命週期。
+    state = "FORMING"
+    bias_side = trend_side
+    if conflict_ratio >= 0.48 and follow_score < 0.58 and break_score < BREAK_SCORE_MIN:
+        state = "CHAOS"
+        bias_side = ""
+    elif break_score >= BREAK_FORCE_SCORE:
+        state = "BROKEN"
+        bias_side = opp if trend_side == last_side else ("P" if trend_side == "B" else "B")
+    elif break_score >= BREAK_SCORE_MIN:
+        state = "BREAK_RISK"
+        bias_side = opp if trend_side == last_side else ("P" if trend_side == "B" else "B")
+    elif follow_score >= FOLLOW_SCORE_MIN and break_score < BREAK_SCORE_MIN:
+        state = "FOLLOW"
+        bias_side = trend_side
+    elif fatigue_score >= 0.48 or break_score >= 0.52:
+        state = "FATIGUE"
+        bias_side = trend_side
+
+    confidence = _clamp(max(follow_score, break_score) * 0.65 + consensus_ratio * 0.25 + (1.0 - conflict_ratio) * 0.10, 0.0, 1.0)
+
+    side_text = {"B": "莊", "P": "閒", "": "無"}.get(bias_side, bias_side)
+    state_text = {
+        "FORMING": "規律形成",
+        "FOLLOW": "規律健康可跟",
+        "FATIGUE": "規律疲乏降權",
+        "BREAK_RISK": "斷點壓力偏反",
+        "BROKEN": "規律已斷偏反",
+        "CHAOS": "四路混亂",
+        "NEUTRAL": "中性",
+    }.get(state, state)
+
+    return {
+        "enabled": True,
+        "state": state,
+        "trend_side": trend_side,
+        "bias_side": bias_side,
+        "follow_score": round(follow_score, 4),
+        "break_score": round(break_score, 4),
+        "fatigue_score": round(fatigue_score, 4),
+        "health_score": round(red_pressure, 4),
+        "red_pressure": round(red_pressure, 4),
+        "blue_pressure": round(blue_pressure, 4),
+        "confidence": round(confidence, 4),
+        "label": f"{state_text}:{side_text} F{int(follow_score*100)} B{int(break_score*100)}",
+        "components": {
+            "streak": streak_n,
+            "last_side": last_side,
+            "consensus_ratio": round(consensus_ratio, 4),
+            "conflict_ratio": round(conflict_ratio, 4),
+            "big_break": round(big_break, 4),
+            "dragon_len_pressure": round(dragon_len_pressure, 4),
+            "edge_pressure": round(edge_pressure, 4),
+            "blue_shift": round(blue_shift, 4),
+            "red_health": round(red_health, 4),
+            "derived_count": derived_count,
+            "switch_rate": round(switch_rate, 4),
+        },
+    }
+
+
+def _apply_lifecycle_weighting(weights: Dict[str, float], lifecycle: Dict[str, Any]) -> Dict[str, float]:
+    """依照規律生命週期微調權重：可跟時提高四路；疲乏/斷點時降低追近路與盲目跟龍。"""
+    if not USE_ROAD_LIFECYCLE or not lifecycle.get("enabled"):
+        return _normalize_weights(weights)
+
+    adjusted = dict(weights)
+    state = lifecycle.get("state", "NEUTRAL")
+    conf = float(lifecycle.get("confidence", 0.0))
+    scale = _clamp(ROAD_LIFECYCLE_WEIGHT / 0.26, 0.20, 2.00)
+    road_keys = ["big_road", "big_eye", "small_road", "cockroach"]
+
+    if state == "FOLLOW":
+        boost = 1.0 + 0.22 * conf * scale
+        for k in road_keys:
+            adjusted[k] = adjusted.get(k, 0.0) * boost
+        adjusted["balance"] = adjusted.get("balance", 0.0) * 0.80
+    elif state == "FATIGUE":
+        for k in ["streak", "recent"]:
+            adjusted[k] = adjusted.get(k, 0.0) * 0.72
+        adjusted["big_road"] = adjusted.get("big_road", 0.0) * 0.86
+        for k in ["big_eye", "small_road", "cockroach"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.10 * conf * scale)
+    elif state in {"BREAK_RISK", "BROKEN"}:
+        # 斷點壓力高時，下三路比單純大路/連莊更重要。
+        adjusted["streak"] = adjusted.get("streak", 0.0) * 0.45
+        adjusted["recent"] = adjusted.get("recent", 0.0) * 0.70
+        adjusted["big_road"] = adjusted.get("big_road", 0.0) * 0.78
+        for k in ["big_eye", "small_road", "cockroach"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.18 * conf * scale)
+    elif state == "CHAOS":
+        # 混亂時不要讓任何單一路型過度主導，回到較均衡的融合。
+        for k in road_keys + ["ngram", "markov", "road", "recent", "streak", "balance"]:
+            adjusted[k] = adjusted.get(k, 0.0) * 0.95
+
+    return _normalize_weights(adjusted)
+
+
+def _apply_lifecycle_bias(b_side: float, lifecycle: Dict[str, Any]) -> float:
+    """將生命周期狀態轉成輕量方向偏移：跟、降權、斷點偏反。"""
+    if not USE_ROAD_LIFECYCLE or not lifecycle.get("enabled"):
+        return b_side
+
+    state = lifecycle.get("state", "NEUTRAL")
+    bias_side = lifecycle.get("bias_side", "")
+    trend_side = lifecycle.get("trend_side", "")
+    follow_score = float(lifecycle.get("follow_score", 0.5))
+    break_score = float(lifecycle.get("break_score", 0.0))
+    fatigue_score = float(lifecycle.get("fatigue_score", 0.0))
+    scale = _clamp(ROAD_LIFECYCLE_WEIGHT / 0.26, 0.20, 2.00)
+
+    def _signed(side: str) -> int:
+        return 1 if side == "B" else -1 if side == "P" else 0
+
+    if state == "FOLLOW" and bias_side:
+        b_side += _signed(bias_side) * FOLLOW_BOOST * follow_score * scale
+    elif state == "FATIGUE" and trend_side:
+        # 疲乏不是直接反打，而是先把原本跟路方向降權，避免傻傻續跟。
+        b_side -= _signed(trend_side) * FATIGUE_SHRINK * max(0.45, fatigue_score) * scale
+    elif state == "BREAK_RISK" and bias_side:
+        b_side += _signed(bias_side) * BREAK_REVERSE_BIAS * break_score * scale
+    elif state == "BROKEN" and bias_side:
+        b_side += _signed(bias_side) * BREAK_REVERSE_BIAS * min(1.0, break_score * 1.18) * scale
+    elif state == "CHAOS":
+        b_side = 0.5 + (b_side - 0.5) * 0.82
+
+    return _clamp(b_side, 0.26, 0.74)
+
 def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     舊欄位相容：把四路共識包裝成 road_engine。
@@ -1340,7 +1601,7 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 # ============ 主要預測函數 ============
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
-    整合預測函數：大路 + 下三路四路主模型 + NGram + 動態權重 + ML模型 + DeepSeek校準
+    整合預測函數：大路 + 下三路四路主模型 + Road Lifecycle + NGram + 動態權重 + ML模型 + DeepSeek校準
     注意：本版不加入觀望/EV/下注決策，仍固定輸出 B/P/T 推薦。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
@@ -1364,7 +1625,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     regime_info = _detect_regime(non_tie)
     online_performance = _rolling_model_performance(non_tie)
+    lifecycle = _road_lifecycle_score(non_tie, road_family, regime_info)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
+    dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
 
     total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
@@ -1390,7 +1653,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     elif conflict_ratio >= 0.45:
         b_side = 0.5 + (b_side - 0.5) * (1 - ROAD_CONFLICT_SHRINK)
 
-    b_side = _clamp(b_side, 0.30, 0.70)
+    # Road Lifecycle 會判斷規律是健康可跟、疲乏、斷點壓力或已斷，再做方向偏移。
+    b_side = _apply_lifecycle_bias(b_side, lifecycle)
+    b_side = _clamp(b_side, 0.28, 0.72)
     p_side = 1 - b_side
 
     tie_prob = _tie_score(history)
@@ -1420,6 +1685,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     if ml_models.is_trained:
         ml_weight = ML_WEIGHT * (0.5 + 0.5 * min(1.0, ml_models.training_samples / 50))
+        # 如果四路生命週期高信心偏某一邊，而 ML 強烈反向，就縮小 ML 影響，避免 ML 把「該跟/該斷」拉歪。
+        lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
+        lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
+        ml_pick = "B" if ml_b_prob >= 0.5 else "P"
+        if lifecycle_bias_side and lifecycle_conf >= LIFECYCLE_PROTECT_MIN_CONF and ml_pick != lifecycle_bias_side:
+            ml_weight *= _clamp(1.0 - LIFECYCLE_ML_SHRINK, 0.05, 1.0)
         b_prob = b_prob * (1 - ml_weight) + ml_b_prob * ml_weight
         p_prob = p_prob * (1 - ml_weight) + (1 - ml_b_prob) * ml_weight
 
@@ -1438,6 +1709,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "cockroach_model": cockroach,
         "road_consensus": road_consensus,
         "road_family": road_family,
+        "road_lifecycle": lifecycle,
         "road_engine": road_engine,
         "markov": markov,
         "road": road,
@@ -1468,6 +1740,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 ta = _clamp(float(ai_result.get("tie_adjust", 0)), -0.020, 0.020)
                 ai_conf = _clamp(float(ai_result.get("confidence", 0.4)), 0, 1)
                 blend = AI_BLEND * (0.45 + ai_conf * 0.55)
+                # AI 是校準器；若它與高信心生命周期方向反向，縮小校準幅度，避免覆蓋四路生命周期判斷。
+                lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
+                lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
+                ai_side = "B" if ba > pa else "P" if pa > ba else ""
+                if lifecycle_bias_side and ai_side and lifecycle_conf >= LIFECYCLE_PROTECT_MIN_CONF and ai_side != lifecycle_bias_side:
+                    blend *= _clamp(1.0 - LIFECYCLE_AI_SHRINK, 0.05, 1.0)
                 b_prob += ba * blend
                 p_prob += pa * blend
                 tie_prob += ta * blend
@@ -1511,6 +1789,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     # ============ 7. 原因說明 ==========
     reason_parts = [
         f"四路:{road_consensus.get('label', '')}",
+        f"生命周期:{lifecycle.get('label', '')}",
         big_road.get("label", ""),
         big_eye.get("label", ""),
         small_road.get("label", ""),
@@ -1554,6 +1833,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_consensus_ratio": road_consensus.get("consensus_ratio", 0.5),
         "road_conflict_ratio": road_consensus.get("conflict_ratio", 0.5),
         "road_family": road_family,
+        "road_lifecycle": lifecycle,
+        "road_lifecycle_state": lifecycle.get("state", ""),
+        "road_lifecycle_label": lifecycle.get("label", ""),
+        "road_follow_score": lifecycle.get("follow_score", 0.5),
+        "road_break_score": lifecycle.get("break_score", 0.0),
+        "road_fatigue_score": lifecycle.get("fatigue_score", 0.0),
         "road_engine_label": road_engine.get("label", ""),
         "road_engine_break_risk": road_engine.get("break_risk", 0.0),
         "road_engine_consistency": road_engine.get("consistency", 0.5),
