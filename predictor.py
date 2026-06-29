@@ -159,6 +159,22 @@ ROAD_MEMORY_PROTECT_MIN_CONF = float(os.getenv("ROAD_MEMORY_PROTECT_MIN_CONF", "
 ROAD_MEMORY_ML_SHRINK = float(os.getenv("ROAD_MEMORY_ML_SHRINK", "0.45"))
 ROAD_MEMORY_AI_SHRINK = float(os.getenv("ROAD_MEMORY_AI_SHRINK", "0.40"))
 
+# Road Rhythm Controller：多週期牌路節奏控制器
+# 目的：不要太看當前一兩口，而是分辨「短暫波動 / 假斷」與「節奏真的轉折」。
+USE_ROAD_RHYTHM = os.getenv("USE_ROAD_RHYTHM", "1") == "1"
+ROAD_RHYTHM_MIN_HISTORY = int(os.getenv("ROAD_RHYTHM_MIN_HISTORY", "18"))
+ROAD_RHYTHM_SHORT_WINDOW = int(os.getenv("ROAD_RHYTHM_SHORT_WINDOW", "8"))
+ROAD_RHYTHM_MID_WINDOW = int(os.getenv("ROAD_RHYTHM_MID_WINDOW", "18"))
+ROAD_RHYTHM_LONG_WINDOW = int(os.getenv("ROAD_RHYTHM_LONG_WINDOW", "36"))
+ROAD_RHYTHM_WEIGHT = float(os.getenv("ROAD_RHYTHM_WEIGHT", "0.20"))
+ROAD_RHYTHM_MAX_BIAS = float(os.getenv("ROAD_RHYTHM_MAX_BIAS", "0.050"))
+ROAD_RHYTHM_INERTIA = float(os.getenv("ROAD_RHYTHM_INERTIA", "0.62"))
+ROAD_RHYTHM_FALSE_BREAK_GUARD = float(os.getenv("ROAD_RHYTHM_FALSE_BREAK_GUARD", "0.58"))
+ROAD_RHYTHM_TURN_CONFIRM = float(os.getenv("ROAD_RHYTHM_TURN_CONFIRM", "0.60"))
+ROAD_RHYTHM_BLUE_RISE_MIN = float(os.getenv("ROAD_RHYTHM_BLUE_RISE_MIN", "0.08"))
+ROAD_RHYTHM_ML_SHRINK = float(os.getenv("ROAD_RHYTHM_ML_SHRINK", "0.35"))
+ROAD_RHYTHM_AI_SHRINK = float(os.getenv("ROAD_RHYTHM_AI_SHRINK", "0.32"))
+
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
@@ -1595,6 +1611,305 @@ def _apply_road_memory_bias(b_side: float, memory: Dict[str, Any]) -> float:
     return _clamp(b_side + signed * strength, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
 
 
+
+def _window_rhythm_features(non_tie: List[str], window: int) -> Dict[str, Any]:
+    """單一週期節奏特徵：用來看短 / 中 / 長牌段，不只看當前一口。"""
+    tail = non_tie[-window:] if window and len(non_tie) > window else list(non_tie)
+    if not tail:
+        return {
+            "window": window,
+            "count": 0,
+            "side": "",
+            "last_side": "",
+            "streak": 0,
+            "switch_rate": 0.5,
+            "b_rate": 0.5,
+            "mode": "empty",
+            "strength": 0.0,
+        }
+
+    last_side, streak_n = _streak(tail)
+    opp = "P" if last_side == "B" else "B" if last_side == "P" else ""
+    switches = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(tail) - 1), 0.5)
+    b_rate = tail.count("B") / len(tail)
+
+    # 這裡不是直接下注方向，而是該週期目前的節奏傾向。
+    if len(tail) < 4:
+        side = last_side
+        mode = "cold"
+        strength = 0.10
+    elif switch_rate >= 0.72:
+        side = opp
+        mode = "jump"
+        strength = _clamp(0.45 + (switch_rate - 0.72) * 0.85, 0.20, 0.86)
+    elif streak_n >= 3:
+        side = last_side
+        mode = "streak"
+        strength = _clamp(0.42 + (streak_n - 3) * 0.08, 0.20, 0.88)
+    elif abs(b_rate - 0.5) >= 0.16:
+        side = "B" if b_rate > 0.5 else "P"
+        mode = "side_bias"
+        strength = _clamp(abs(b_rate - 0.5) * 2.2, 0.20, 0.72)
+    else:
+        # 沒有明顯節奏時，避免過度反應當前一口，給中性。
+        side = ""
+        mode = "neutral"
+        strength = 0.05
+
+    return {
+        "window": window,
+        "count": len(tail),
+        "side": side,
+        "last_side": last_side,
+        "streak": streak_n,
+        "switch_rate": round(switch_rate, 4),
+        "b_rate": round(b_rate, 4),
+        "mode": mode,
+        "strength": round(strength, 4),
+    }
+
+
+def _derived_pressure_by_window(non_tie: List[str], window: int) -> Dict[str, Any]:
+    """用不同 lookback 看下三路紅藍壓力，判斷是短暫波動還是節奏轉折。"""
+    if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
+        return {"red": 0.5, "blue": 0.5, "count": 0, "tails": {}}
+    try:
+        layout = _build_big_road(non_tie)
+        stats = {
+            "big_eye": _color_stats(_derived_series(layout, 1), lookback=window),
+            "small_road": _color_stats(_derived_series(layout, 2), lookback=window),
+            "cockroach": _color_stats(_derived_series(layout, 3), lookback=window),
+        }
+        valid = [v for v in stats.values() if int(v.get("count", 0)) > 0]
+        if not valid:
+            return {"red": 0.5, "blue": 0.5, "count": 0, "tails": stats}
+        red = sum(float(v.get("red_rate", 0.5)) for v in valid) / len(valid)
+        blue = sum(float(v.get("blue_rate", 0.5)) for v in valid) / len(valid)
+        count = sum(int(v.get("count", 0)) for v in valid)
+        return {"red": round(red, 4), "blue": round(blue, 4), "count": count, "tails": stats}
+    except Exception:
+        return {"red": 0.5, "blue": 0.5, "count": 0, "tails": {}}
+
+
+def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycle: Dict[str, Any], regime_info: Dict[str, Any], memory: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Road Rhythm Controller：多週期牌路節奏控制器。
+
+    跟 Lifecycle / Memory 不同，Rhythm 不是問「現在紅還藍」，而是問：
+    - 短週期的變化，是否已被中週期、長週期確認？
+    - 目前像是真轉折，還是只是一口假斷 / 短暫波動？
+    - 要不要保留方向慣性，避免被當局帶走？
+    """
+    default = {
+        "enabled": False,
+        "state": "RHYTHM_COLD",
+        "label": "節奏資料不足",
+        "bias_side": "",
+        "dominant_side": "",
+        "confidence": 0.0,
+        "false_break_score": 0.0,
+        "turn_score": 0.0,
+        "inertia_score": 0.0,
+        "blue_rise": 0.0,
+        "red_stability": 0.0,
+        "windows": {},
+        "derived_windows": {},
+    }
+    if not USE_ROAD_RHYTHM or not USE_ROAD_ENGINE or len(non_tie) < ROAD_RHYTHM_MIN_HISTORY:
+        return default
+
+    short_w = max(4, ROAD_RHYTHM_SHORT_WINDOW)
+    mid_w = max(short_w + 2, ROAD_RHYTHM_MID_WINDOW)
+    long_w = max(mid_w + 2, ROAD_RHYTHM_LONG_WINDOW)
+
+    short_f = _window_rhythm_features(non_tie, short_w)
+    mid_f = _window_rhythm_features(non_tie, mid_w)
+    long_f = _window_rhythm_features(non_tie, long_w)
+
+    short_d = _derived_pressure_by_window(non_tie, short_w)
+    mid_d = _derived_pressure_by_window(non_tie, mid_w)
+    long_d = _derived_pressure_by_window(non_tie, long_w)
+
+    consensus = road_family.get("consensus", {}) if road_family else {}
+    consensus_side = consensus.get("pick", "")
+    lifecycle_side = lifecycle.get("bias_side", "") if lifecycle and lifecycle.get("enabled") else ""
+    memory_side = memory.get("bias_side", "") if memory and memory.get("enabled") else ""
+
+    # dominant_side 優先採中長週期一致，其次四路共識，不讓短週期獨自支配。
+    mid_side = mid_f.get("side", "")
+    long_side = long_f.get("side", "")
+    short_side = short_f.get("side", "")
+    if mid_side and long_side and mid_side == long_side:
+        dominant_side = mid_side
+        dominant_source = "mid_long"
+    elif long_side:
+        dominant_side = long_side
+        dominant_source = "long"
+    elif consensus_side:
+        dominant_side = consensus_side
+        dominant_source = "consensus"
+    elif lifecycle_side:
+        dominant_side = lifecycle_side
+        dominant_source = "lifecycle"
+    else:
+        dominant_side = mid_side or short_side or ""
+        dominant_source = "fallback"
+
+    if dominant_side not in {"B", "P"}:
+        return {**default, "enabled": True, "state": "RHYTHM_NEUTRAL", "windows": {"short": short_f, "mid": mid_f, "long": long_f}}
+    opp_side = "P" if dominant_side == "B" else "B"
+
+    mid_long_agree = 1.0 if mid_side and long_side and mid_side == long_side else 0.0
+    short_against = 1.0 if short_side and short_side != dominant_side else 0.0
+    short_with = 1.0 if short_side and short_side == dominant_side else 0.0
+    mid_against_long = 1.0 if mid_side and long_side and mid_side != long_side else 0.0
+
+    short_strength = float(short_f.get("strength", 0.0))
+    mid_strength = float(mid_f.get("strength", 0.0))
+    long_strength = float(long_f.get("strength", 0.0))
+    consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
+    conflict_ratio = float(consensus.get("conflict_ratio", 0.5))
+    lifecycle_break = float(lifecycle.get("break_score", 0.0)) if lifecycle else 0.0
+    lifecycle_follow = float(lifecycle.get("follow_score", 0.5)) if lifecycle else 0.5
+    memory_conf = float(memory.get("confidence", 0.0)) if memory else 0.0
+
+    blue_rise = _clamp(float(short_d.get("blue", 0.5)) - float(long_d.get("blue", 0.5)), -1.0, 1.0)
+    red_stability = _clamp((float(mid_d.get("red", 0.5)) + float(long_d.get("red", 0.5))) / 2.0, 0.0, 1.0)
+    blue_rising_pressure = _clamp((blue_rise - ROAD_RHYTHM_BLUE_RISE_MIN) / 0.22, 0.0, 1.0)
+
+    inertia_score = _clamp(
+        mid_long_agree * 0.38
+        + long_strength * 0.24
+        + max(0.0, consensus_ratio - 0.5) * 0.44
+        + max(0.0, red_stability - 0.5) * 0.24
+        - conflict_ratio * 0.18,
+        0.0,
+        1.0,
+    )
+
+    false_break_score = _clamp(
+        short_against * 0.32
+        + mid_long_agree * 0.24
+        + inertia_score * 0.26
+        + max(0.0, lifecycle_follow - 0.50) * 0.24
+        - blue_rising_pressure * 0.28
+        - max(0.0, lifecycle_break - 0.50) * 0.20,
+        0.0,
+        1.0,
+    )
+
+    turn_score = _clamp(
+        short_against * 0.22
+        + mid_against_long * 0.24
+        + blue_rising_pressure * 0.30
+        + max(0.0, lifecycle_break - 0.48) * 0.46
+        + (1.0 if memory_side and memory_side == opp_side else 0.0) * memory_conf * 0.16
+        - inertia_score * 0.16,
+        0.0,
+        1.0,
+    )
+
+    state = "RHYTHM_NEUTRAL"
+    bias_side = ""
+    confidence = 0.0
+    if false_break_score >= ROAD_RHYTHM_FALSE_BREAK_GUARD and false_break_score >= turn_score + 0.06:
+        state = "RHYTHM_FALSE_BREAK_GUARD"
+        bias_side = dominant_side
+        confidence = _clamp(false_break_score * 0.72 + inertia_score * 0.28, 0.0, 1.0)
+    elif turn_score >= ROAD_RHYTHM_TURN_CONFIRM and turn_score >= false_break_score + 0.03:
+        state = "RHYTHM_TURN_CONFIRM"
+        bias_side = short_side if short_side in {"B", "P"} and short_side != dominant_side else opp_side
+        confidence = _clamp(turn_score * 0.78 + blue_rising_pressure * 0.22, 0.0, 1.0)
+    elif short_with and inertia_score >= ROAD_RHYTHM_INERTIA:
+        state = "RHYTHM_CONTINUATION"
+        bias_side = dominant_side
+        confidence = _clamp(inertia_score * 0.80 + short_strength * 0.20, 0.0, 1.0)
+    elif conflict_ratio >= 0.48 or (not short_side and not mid_side):
+        state = "RHYTHM_CHOP"
+        bias_side = ""
+        confidence = _clamp(conflict_ratio, 0.0, 1.0)
+
+    state_text = {
+        "RHYTHM_FALSE_BREAK_GUARD": "疑似假斷保護",
+        "RHYTHM_TURN_CONFIRM": "節奏轉折確認",
+        "RHYTHM_CONTINUATION": "中長節奏延續",
+        "RHYTHM_CHOP": "節奏混亂",
+        "RHYTHM_NEUTRAL": "節奏中性",
+        "RHYTHM_COLD": "節奏資料不足",
+    }.get(state, state)
+    side_text = {"B": "莊", "P": "閒", "": "無"}.get(bias_side, bias_side)
+
+    return {
+        "enabled": True,
+        "state": state,
+        "label": f"{state_text}:{side_text} 假斷{int(false_break_score*100)} 轉折{int(turn_score*100)} 慣性{int(inertia_score*100)}",
+        "bias_side": bias_side,
+        "dominant_side": dominant_side,
+        "dominant_source": dominant_source,
+        "confidence": round(confidence, 4),
+        "false_break_score": round(false_break_score, 4),
+        "turn_score": round(turn_score, 4),
+        "inertia_score": round(inertia_score, 4),
+        "blue_rise": round(blue_rise, 4),
+        "red_stability": round(red_stability, 4),
+        "windows": {"short": short_f, "mid": mid_f, "long": long_f},
+        "derived_windows": {"short": short_d, "mid": mid_d, "long": long_d},
+    }
+
+
+def _apply_road_rhythm_weighting(weights: Dict[str, float], rhythm: Dict[str, Any]) -> Dict[str, float]:
+    """依多週期節奏微調權重：避免短線 recent/streak 過度主導。"""
+    if not USE_ROAD_RHYTHM or not rhythm.get("enabled"):
+        return _normalize_weights(weights)
+    state = rhythm.get("state", "RHYTHM_NEUTRAL")
+    conf = float(rhythm.get("confidence", 0.0))
+    if conf <= 0:
+        return _normalize_weights(weights)
+    adjusted = dict(weights)
+    scale = _clamp(ROAD_RHYTHM_WEIGHT / 0.20, 0.10, 2.20)
+    if state == "RHYTHM_FALSE_BREAK_GUARD":
+        # 疑似假斷時，降低當前短線 recent/streak，保留中長週期與四路主體。
+        adjusted["recent"] = adjusted.get("recent", 0.0) * (1.0 - 0.24 * conf * scale)
+        adjusted["streak"] = adjusted.get("streak", 0.0) * (1.0 - 0.20 * conf * scale)
+        adjusted["big_road"] = adjusted.get("big_road", 0.0) * (1.0 + 0.10 * conf * scale)
+        adjusted["ngram"] = adjusted.get("ngram", 0.0) * (1.0 + 0.08 * conf * scale)
+    elif state == "RHYTHM_TURN_CONFIRM":
+        # 真轉折時，下三路與 NGram 輔助轉向，降低單純跟龍。
+        adjusted["streak"] = adjusted.get("streak", 0.0) * (1.0 - 0.26 * conf * scale)
+        adjusted["recent"] = adjusted.get("recent", 0.0) * (1.0 - 0.08 * conf * scale)
+        for k in ["big_eye", "small_road", "cockroach", "ngram"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.13 * conf * scale)
+    elif state == "RHYTHM_CONTINUATION":
+        for k in ["big_road", "big_eye", "small_road", "cockroach"]:
+            adjusted[k] = adjusted.get(k, 0.0) * (1.0 + 0.08 * conf * scale)
+    elif state == "RHYTHM_CHOP":
+        adjusted["recent"] = adjusted.get("recent", 0.0) * 0.86
+        adjusted["streak"] = adjusted.get("streak", 0.0) * 0.82
+    return _normalize_weights(adjusted)
+
+
+def _apply_road_rhythm_bias(b_side: float, rhythm: Dict[str, Any]) -> float:
+    """將多週期節奏轉成柔性偏移，避免一口變化就大改方向。"""
+    if not USE_ROAD_RHYTHM or not rhythm.get("enabled"):
+        return b_side
+    state = rhythm.get("state", "RHYTHM_NEUTRAL")
+    bias_side = rhythm.get("bias_side", "")
+    if state not in {"RHYTHM_FALSE_BREAK_GUARD", "RHYTHM_TURN_CONFIRM", "RHYTHM_CONTINUATION"} or bias_side not in {"B", "P"}:
+        if state == "RHYTHM_CHOP":
+            return _clamp(0.5 + (b_side - 0.5) * 0.88, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+        return b_side
+    conf = float(rhythm.get("confidence", 0.0))
+    scale = _clamp(ROAD_RHYTHM_WEIGHT / 0.20, 0.10, 2.20)
+    if state == "RHYTHM_FALSE_BREAK_GUARD":
+        base = ROAD_RHYTHM_MAX_BIAS * 0.78
+    elif state == "RHYTHM_TURN_CONFIRM":
+        base = ROAD_RHYTHM_MAX_BIAS
+    else:
+        base = ROAD_RHYTHM_MAX_BIAS * 0.55
+    signed = 1 if bias_side == "B" else -1
+    return _clamp(b_side + signed * base * conf * scale, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
 def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     舊欄位相容：把四路共識包裝成 road_engine。
@@ -1932,7 +2247,7 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
 # ============ 主要預測函數 ============
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
-    整合預測函數：四路主模型 + Road Lifecycle + Adaptive Road Memory + NGram + 動態權重 + ML模型 + DeepSeek校準
+    整合預測函數：四路主模型 + Road Lifecycle + Adaptive Road Memory + Road Rhythm + NGram + 動態權重 + ML模型 + DeepSeek校準
     注意：本版加入低信心/四路分歧觀望機制；仍不做下注金額/EV 配注決策。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
@@ -1958,9 +2273,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     online_performance = _rolling_model_performance(non_tie)
     lifecycle = _road_lifecycle_score(non_tie, road_family, regime_info)
     road_memory = _adaptive_road_memory_score(non_tie, road_family, lifecycle, regime_info)
+    road_rhythm = _road_rhythm_score(non_tie, road_family, lifecycle, regime_info, road_memory)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
     dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
     dynamic_weights = _apply_road_memory_weighting(dynamic_weights, road_memory)
+    dynamic_weights = _apply_road_rhythm_weighting(dynamic_weights, road_rhythm)
 
     total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
@@ -1990,6 +2307,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     b_side = _apply_lifecycle_bias(b_side, lifecycle)
     # Adaptive Road Memory 會看本靴過去相似牌路到底是跟準還是斷準，再做柔性修正。
     b_side = _apply_road_memory_bias(b_side, road_memory)
+    # Road Rhythm 會看短 / 中 / 長週期，避免太看當局，分辨假斷與真轉折。
+    b_side = _apply_road_rhythm_bias(b_side, road_rhythm)
     b_side = _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
     p_side = 1 - b_side
 
@@ -2025,9 +2344,17 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
         memory_bias_side = road_memory.get("bias_side", "") if road_memory.get("enabled") else ""
         memory_conf = float(road_memory.get("confidence", 0.0)) if road_memory.get("enabled") else 0.0
-        protect_side = memory_bias_side if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF else lifecycle_bias_side
-        protect_conf = memory_conf if protect_side == memory_bias_side else lifecycle_conf
-        shrink = ROAD_MEMORY_ML_SHRINK if protect_side == memory_bias_side else LIFECYCLE_ML_SHRINK
+        rhythm_bias_side = road_rhythm.get("bias_side", "") if road_rhythm.get("enabled") else ""
+        rhythm_conf = float(road_rhythm.get("confidence", 0.0)) if road_rhythm.get("enabled") else 0.0
+        protect_side = ""
+        protect_conf = 0.0
+        shrink = LIFECYCLE_ML_SHRINK
+        if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF:
+            protect_side, protect_conf, shrink = memory_bias_side, memory_conf, ROAD_MEMORY_ML_SHRINK
+        elif rhythm_bias_side and rhythm_conf >= ROAD_RHYTHM_TURN_CONFIRM:
+            protect_side, protect_conf, shrink = rhythm_bias_side, rhythm_conf, ROAD_RHYTHM_ML_SHRINK
+        else:
+            protect_side, protect_conf, shrink = lifecycle_bias_side, lifecycle_conf, LIFECYCLE_ML_SHRINK
         ml_pick = "B" if ml_b_prob >= 0.5 else "P"
         if protect_side and protect_conf >= min(LIFECYCLE_PROTECT_MIN_CONF, ROAD_MEMORY_PROTECT_MIN_CONF) and ml_pick != protect_side:
             ml_weight *= _clamp(1.0 - shrink, 0.05, 1.0)
@@ -2051,6 +2378,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_family": road_family,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
+        "road_rhythm": road_rhythm,
         "road_engine": road_engine,
         "markov": markov,
         "road": road,
@@ -2086,9 +2414,17 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
                 memory_bias_side = road_memory.get("bias_side", "") if road_memory.get("enabled") else ""
                 memory_conf = float(road_memory.get("confidence", 0.0)) if road_memory.get("enabled") else 0.0
-                protect_side = memory_bias_side if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF else lifecycle_bias_side
-                protect_conf = memory_conf if protect_side == memory_bias_side else lifecycle_conf
-                shrink = ROAD_MEMORY_AI_SHRINK if protect_side == memory_bias_side else LIFECYCLE_AI_SHRINK
+                rhythm_bias_side = road_rhythm.get("bias_side", "") if road_rhythm.get("enabled") else ""
+                rhythm_conf = float(road_rhythm.get("confidence", 0.0)) if road_rhythm.get("enabled") else 0.0
+                protect_side = ""
+                protect_conf = 0.0
+                shrink = LIFECYCLE_AI_SHRINK
+                if memory_bias_side and memory_conf >= ROAD_MEMORY_PROTECT_MIN_CONF:
+                    protect_side, protect_conf, shrink = memory_bias_side, memory_conf, ROAD_MEMORY_AI_SHRINK
+                elif rhythm_bias_side and rhythm_conf >= ROAD_RHYTHM_TURN_CONFIRM:
+                    protect_side, protect_conf, shrink = rhythm_bias_side, rhythm_conf, ROAD_RHYTHM_AI_SHRINK
+                else:
+                    protect_side, protect_conf, shrink = lifecycle_bias_side, lifecycle_conf, LIFECYCLE_AI_SHRINK
                 ai_side = "B" if ba > pa else "P" if pa > ba else ""
                 if protect_side and ai_side and protect_conf >= min(LIFECYCLE_PROTECT_MIN_CONF, ROAD_MEMORY_PROTECT_MIN_CONF) and ai_side != protect_side:
                     blend *= _clamp(1.0 - shrink, 0.05, 1.0)
@@ -2164,6 +2500,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         f"四路:{road_consensus.get('label', '')}",
         f"生命周期:{lifecycle.get('label', '')}",
         f"記憶:{road_memory.get('label', '')}",
+        f"節奏:{road_rhythm.get('label', '')}",
         big_road.get("label", ""),
         big_eye.get("label", ""),
         small_road.get("label", ""),
@@ -2215,6 +2552,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_family": road_family,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
+        "road_rhythm": road_rhythm,
+        "road_rhythm_state": road_rhythm.get("state", ""),
+        "road_rhythm_label": road_rhythm.get("label", ""),
+        "road_rhythm_confidence": road_rhythm.get("confidence", 0.0),
+        "road_rhythm_false_break_score": road_rhythm.get("false_break_score", 0.0),
+        "road_rhythm_turn_score": road_rhythm.get("turn_score", 0.0),
+        "road_rhythm_inertia_score": road_rhythm.get("inertia_score", 0.0),
         "road_memory_state": road_memory.get("state", ""),
         "road_memory_label": road_memory.get("label", ""),
         "road_memory_sample": road_memory.get("sample", 0),
