@@ -248,6 +248,32 @@ def button(
     }
 
 
+def uri_button(
+    label: str,
+    uri: str,
+    color: str = "#FFD000",
+    style: str = "primary",
+) -> Dict[str, Any]:
+    return {
+        "type": "button",
+        "style": style,
+        "color": color,
+        "height": "sm",
+        "action": {
+            "type": "uri",
+            "label": label[:20],
+            "uri": uri[:1000],
+        },
+    }
+
+
+def venue_web_button(v: Dict[str, str]) -> Dict[str, Any]:
+    url = build_liff_url(v.get("code", ""))
+    if url.startswith("http://") or url.startswith("https://"):
+        return uri_button(v.get("name", ""), url, "#FFD000")
+    return button(v.get("name", ""), {"action": "select_venue", "venue": v.get("code", "")}, "#FFD000")
+
+
 def get_source_user_id(event: Dict[str, Any]) -> str:
     source = event.get("source") or {}
     return source.get("userId") or source.get("groupId") or source.get("roomId") or "anonymous"
@@ -343,7 +369,7 @@ def start_menu_flex(title: str = "AI 百家樂規律分析", subtitle: str = "�
                             button("開始分析", {"action": "open_venue"}, "#FFD000"),
                         ],
                     },
-                    {"type": "text", "text": "全流程採聊天室按鈕操作，不會導到 LIFF 網頁。", "size": "xs", "color": "#AAAAAA", "margin": "lg", "wrap": True},
+                    {"type": "text", "text": "點擊遊戲館後會開啟網頁操作面板。", "size": "xs", "color": "#AAAAAA", "margin": "lg", "wrap": True},
                 ],
             },
         },
@@ -351,7 +377,7 @@ def start_menu_flex(title: str = "AI 百家樂規律分析", subtitle: str = "�
 
 
 def venue_flex() -> Dict[str, Any]:
-    buttons = [button(v["name"], {"action": "select_venue", "venue": v["code"]}) for v in parse_venues()]
+    buttons = [venue_web_button(v) for v in parse_venues()]
     return {
         "type": "flex",
         "altText": "請選擇遊戲館",
@@ -365,7 +391,7 @@ def venue_flex() -> Dict[str, Any]:
                 "paddingAll": "18px",
                 "contents": [
                     {"type": "text", "text": "AI 規律模型", "weight": "bold", "size": "xl", "color": "#FFD000"},
-                    {"type": "text", "text": "請選擇遊戲館，接著會在聊天室內操作。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
+                    {"type": "text", "text": "請選擇遊戲館，點擊後會開啟網頁操作面板。", "size": "sm", "color": "#FFFFFF", "margin": "md", "wrap": True},
                     {"type": "separator", "margin": "lg", "color": "#FFD000"},
                     {"type": "box", "layout": "vertical", "spacing": "md", "margin": "lg", "contents": buttons},
                 ],
