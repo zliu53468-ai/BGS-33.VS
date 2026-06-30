@@ -119,15 +119,16 @@ def venue_name(venue_code: str) -> str:
 
 def build_liff_url(venue_code: str = "") -> str:
     """
-    保留舊 LIFF API 相容用。
-    主流程已改成 Postback，不會主動用這個網址導頁。
+    產生前端頁面網址。
+    優先使用 PUBLIC_BASE_URL，讓遊戲館點擊後直接開 Render 網頁。
+    若未設定 PUBLIC_BASE_URL，才退回 LIFF_ID。
     """
     query = urllib.parse.urlencode({"venue": venue_code}) if venue_code else ""
-    if LIFF_ID:
-        url = f"https://liff.line.me/{LIFF_ID}"
-        return f"{url}?{query}" if query else url
     if PUBLIC_BASE_URL:
         url = f"{PUBLIC_BASE_URL}/liff"
+        return f"{url}?{query}" if query else url
+    if LIFF_ID:
+        url = f"https://liff.line.me/{LIFF_ID}"
         return f"{url}?{query}" if query else url
     return f"/liff?{query}" if query else "/liff"
 
