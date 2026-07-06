@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: baccarat-ai-line-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt && playwright install chromium
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: HEADLESS
+        value: "true"
+      - key: POLL_INTERVAL_SECONDS
+        value: "5"
+      - key: USE_DOM_READER
+        value: "true"
+      - key: USE_COLOR_READER
+        value: "false"
