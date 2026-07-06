@@ -1,89 +1,164 @@
-import json
-import os
-import re
-from typing import Any, Dict, Optional
+# deepseek_client.py
+# -*- coding: utf-8 -*-
 
+import json
+from typing import Any, Dict, List, Optional
 import requests
+
+from config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_API_URL,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_TIMEOUT_SECONDS,
+)
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 兼容模型用 ```json 包住
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            return None
+    return None
 
 
 class DeepSeekClient:
-    def __init__(self) -> None:
-        self.api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-        self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-        self.model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        self.timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "8"))
-        self.enabled = os.getenv("DEEPSEEK_ENABLED", "1") == "1" and bool(self.api_key)
-        self.thinking = os.getenv("DEEPSEEK_THINKING", "disabled")
-        self.reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT", "low")
+    def __init__(self, api_key: str = ""):
+        self.api_key = (api_key or DEEPSEEK_API_KEY).strip()
+        self.api_url = DEEPSEEK_API_URL
+        self.model = DEEPSEEK_MODEL
+        self.timeout = DEEPSEEK_TIMEOUT_SECONDS
 
-    def calibrate(self, feature_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def analyze_road(self, road: List[str], local_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        回傳格式固定：
+        {
+          side: "B" | "P" | "OBSERVE",
+          confidence: 0-100,
+          reason: "...",
+          pattern: "..."
+        }
+        """
         if not self.enabled:
-            return None
+            return {
+                "ok": False,
+                "side": "OBSERVE",
+                "confidence": 0,
+                "reason": "DeepSeek API Key 未設定。",
+                "pattern": "DISABLED",
+            }
 
-        system = (
-            "你是百家樂牌路資料的統計校準器，不保證獲利。"
-            "你只能根據輸入的 B/P/T 歷史與模型特徵，輸出小幅機率校準。"
-            "不要使用玄學，不要宣稱穩贏。"
-            "只回傳 JSON，不要 markdown。"
+        road_text = "".join(road[-80:])
+        local_summary = {
+            "recommend": local_result.get("recommend"),
+            "signal_level": local_result.get("signal_level"),
+            "pattern_detail": local_result.get("pattern_detail"),
+            "banker_percent": local_result.get("banker_percent"),
+            "player_percent": local_result.get("player_percent"),
+            "tie_percent": local_result.get("tie_percent"),
+            "reason": local_result.get("reason"),
+        }
+
+        system_prompt = (
+            "你是百家樂牌路分析校準器，只能基於使用者給的 B/P/T 牌路做統計與型態分析。"
+            "B=莊，P=閒，T=和。請不要保證命中，不要誇大勝率。"
+            "你的任務是獨立判斷下一手偏向 B、P 或 OBSERVE。"
+            "請只輸出 JSON，不要加多餘文字。"
         )
-        user = {
-            "task": "baccarat_pattern_calibration",
-            "rule": "adjustment 必須很小，建議落在 -0.035 到 0.035。confidence 0~1。",
-            "feature_payload": feature_payload,
+        user_prompt = {
+            "road": road_text,
+            "local_model_result": local_summary,
             "output_schema": {
-                "banker_adjust": "float -0.035..0.035",
-                "player_adjust": "float -0.035..0.035",
-                "tie_adjust": "float -0.020..0.020",
-                "confidence": "float 0..1",
-                "pattern_label": "string",
-                "reason": "string <= 50 Chinese chars",
+                "side": "B 或 P 或 OBSERVE",
+                "confidence": "0到100的整數",
+                "pattern": "看到的主要牌路型態",
+                "reason": "50字內中文原因",
             },
         }
 
-        body: Dict[str, Any] = {
+        payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
             ],
-            "stream": False,
-            "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", "0.1")),
-            "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "220")),
+            "temperature": 0.15,
+            "max_tokens": 300,
         }
-        if self.thinking in {"enabled", "disabled"}:
-            body["thinking"] = {"type": self.thinking}
-        if self.reasoning_effort:
-            body["reasoning_effort"] = self.reasoning_effort
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
         try:
-            r = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            return self._parse_json(content)
-        except Exception as exc:
-            return {"error": str(exc)}
+            res = requests.post(self.api_url, headers=headers, json=payload, timeout=self.timeout)
+            if res.status_code >= 400:
+                return {
+                    "ok": False,
+                    "side": "OBSERVE",
+                    "confidence": 0,
+                    "reason": f"DeepSeek API 錯誤：HTTP {res.status_code}",
+                    "pattern": "API_ERROR",
+                    "raw": res.text[:300],
+                }
 
-    @staticmethod
-    def _parse_json(text: str) -> Optional[Dict[str, Any]]:
-        if not text:
-            return None
-        text = text.strip()
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            return None
+            data = res.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = _extract_json(content)
+            if not parsed:
+                return {
+                    "ok": False,
+                    "side": "OBSERVE",
+                    "confidence": 0,
+                    "reason": "DeepSeek 回傳格式無法解析。",
+                    "pattern": "PARSE_ERROR",
+                    "raw": content[:300],
+                }
+
+            side = str(parsed.get("side", "OBSERVE")).upper().strip()
+            if side in ("莊", "BANKER"):
+                side = "B"
+            elif side in ("閒", "闲", "PLAYER"):
+                side = "P"
+            elif side not in ("B", "P"):
+                side = "OBSERVE"
+
+            try:
+                confidence = int(float(parsed.get("confidence", 0)))
+            except Exception:
+                confidence = 0
+            confidence = max(0, min(100, confidence))
+
+            return {
+                "ok": True,
+                "side": side,
+                "confidence": confidence,
+                "pattern": str(parsed.get("pattern", "AI_PATTERN"))[:80],
+                "reason": str(parsed.get("reason", "AI 獨立校準完成。"))[:120],
+                "raw": parsed,
+            }
+
+        except Exception as e:
+            return {
+                "ok": False,
+                "side": "OBSERVE",
+                "confidence": 0,
+                "reason": f"DeepSeek 呼叫失敗：{e}",
+                "pattern": "EXCEPTION",
+            }

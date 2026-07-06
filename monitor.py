@@ -1,94 +1,131 @@
+# monitor.py
+# -*- coding: utf-8 -*-
+
 import asyncio
 from typing import Any, Callable, Dict, Optional
 
-from baccarat_reader import BaccaratReader
-from config import AUTO_PUSH_NEW_ROUND, POLL_INTERVAL_SECONDS
-from line_client import push_message
-from line_messages import build_analysis_message, text_message
+from config import POLL_INTERVAL_SECONDS, AUTO_PUSH_NEW_ROUND
+from baccarat_reader import BaccaratLivePage
 from predictor import predict
-from session_store import get_session, update_session
-
-PushCallback = Callable[[str, Dict[str, Any], Dict[str, Any]], None]
+from session_store import update_session, get_session
 
 
 class MonitorManager:
-    def __init__(self, reader: BaccaratReader) -> None:
-        self.reader = reader
+    def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.stop_flags: Dict[str, asyncio.Event] = {}
+        self.live_pages: Dict[str, BaccaratLivePage] = {}
+        self.latest: Dict[str, Dict[str, Any]] = {}
+        self.on_push: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], Any]] = None
+
+    def set_push_callback(self, cb: Callable[[str, Dict[str, Any], Dict[str, Any]], Any]) -> None:
+        self.on_push = cb
 
     def is_running(self, user_id: str) -> bool:
         task = self.tasks.get(user_id)
         return bool(task and not task.done())
 
-    async def start(self, user_id: str) -> None:
+    async def start(self, user_id: str, platform: str, hall: str, table_id: str) -> Dict[str, Any]:
         await self.stop(user_id)
+        live = BaccaratLivePage(platform, hall, table_id)
+        self.live_pages[user_id] = live
+        await live.start()
+        data = await live.read()
+        prediction = predict(data.get("road", []))
+        self.latest[user_id] = {"data": data, "prediction": prediction}
+        update_session(
+            user_id,
+            step="ANALYZING",
+            running=True,
+            platform=platform,
+            hall=hall,
+            table_id=table_id,
+            game_no=data.get("game_no"),
+            dealer=data.get("dealer"),
+            online_count=data.get("online_count", 0),
+            countdown=data.get("countdown", 0),
+            status=data.get("status", "讀取中"),
+            road=data.get("road", []),
+            last_round_key=data.get("round_key"),
+            last_prediction=prediction,
+            real_data=data.get("real_data", False),
+        )
+        self.tasks[user_id] = asyncio.create_task(self._loop(user_id))
+        return self.latest[user_id]
 
-        stop_event = asyncio.Event()
-        self.stop_flags[user_id] = stop_event
-        task = asyncio.create_task(self._run_loop(user_id, stop_event))
-        self.tasks[user_id] = task
+    async def _loop(self, user_id: str) -> None:
+        while True:
+            try:
+                session = get_session(user_id)
+                if not session.get("running"):
+                    break
+                live = self.live_pages.get(user_id)
+                if not live:
+                    break
+                data = await live.read()
+                prediction = predict(data.get("road", []))
+                previous_key = session.get("last_round_key")
+                current_key = data.get("round_key")
+                changed = bool(current_key and current_key != previous_key)
+                self.latest[user_id] = {"data": data, "prediction": prediction}
+                update_session(
+                    user_id,
+                    game_no=data.get("game_no"),
+                    dealer=data.get("dealer"),
+                    online_count=data.get("online_count", 0),
+                    countdown=data.get("countdown", 0),
+                    status=data.get("status", "讀取中"),
+                    road=data.get("road", []),
+                    last_round_key=current_key,
+                    last_prediction=prediction,
+                    real_data=data.get("real_data", False),
+                )
+                if AUTO_PUSH_NEW_ROUND and changed and self.on_push:
+                    maybe_coro = self.on_push(user_id, data, prediction)
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                update_session(user_id, status=f"監控錯誤：{e}")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    async def read_now(self, user_id: str) -> Dict[str, Any]:
+        live = self.live_pages.get(user_id)
+        session = get_session(user_id)
+        if not live:
+            platform = session.get("platform")
+            hall = session.get("hall")
+            table_id = session.get("table_id")
+            if not platform or not hall or not table_id:
+                return {"error": "請先選擇平台、遊戲廳與桌號。"}
+            return await self.start(user_id, platform, hall, table_id)
+        data = await live.read()
+        prediction = predict(data.get("road", []))
+        self.latest[user_id] = {"data": data, "prediction": prediction}
+        update_session(
+            user_id,
+            game_no=data.get("game_no"),
+            dealer=data.get("dealer"),
+            online_count=data.get("online_count", 0),
+            countdown=data.get("countdown", 0),
+            status=data.get("status", "讀取中"),
+            road=data.get("road", []),
+            last_round_key=data.get("round_key"),
+            last_prediction=prediction,
+            real_data=data.get("real_data", False),
+        )
+        return self.latest[user_id]
 
     async def stop(self, user_id: str) -> None:
-        stop_event = self.stop_flags.get(user_id)
-        if stop_event:
-            stop_event.set()
-
-        task = self.tasks.get(user_id)
+        task = self.tasks.pop(user_id, None)
         if task and not task.done():
             task.cancel()
             try:
                 await task
             except Exception:
                 pass
-
-        self.tasks.pop(user_id, None)
-        self.stop_flags.pop(user_id, None)
-
-    async def _run_loop(self, user_id: str, stop_event: asyncio.Event) -> None:
-        while not stop_event.is_set():
-            try:
-                session = get_session(user_id)
-                if not session.get("running"):
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                platform = session.get("platform")
-                hall = session.get("hall")
-                table_id = session.get("table_id")
-
-                if not platform or not hall or not table_id:
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                data = await self.reader.read_table_data(platform, hall, table_id)
-                road = data.get("road", [])
-                prediction = predict(road)
-                new_key = data.get("round_key")
-                old_key = session.get("last_round_key")
-
-                update_session(
-                    user_id,
-                    game_no=data.get("game_no"),
-                    dealer=data.get("dealer"),
-                    online_count=data.get("online_count"),
-                    road=road,
-                    last_round_key=new_key,
-                    running=True,
-                    step="ANALYZING",
-                )
-
-                if AUTO_PUSH_NEW_ROUND and old_key and new_key and new_key != old_key:
-                    push_message(user_id, [build_analysis_message(data, prediction)])
-
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                print(f"monitor error user={user_id}: {exc}")
-                if AUTO_PUSH_NEW_ROUND:
-                    push_message(user_id, [text_message(f"自動讀取暫時失敗：{exc}")])
-
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL_SECONDS)
-            except asyncio.TimeoutError:
-                pass
+        live = self.live_pages.pop(user_id, None)
+        if live:
+            await live.close()
+        update_session(user_id, running=False, step="STOPPED", status="已停止")

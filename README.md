@@ -1,32 +1,21 @@
-# 富百家 AI Pro LINE Bot｜百家樂自動分析流程
+# 富百家 AI Pro 自動分析版
 
-這是一份可以直接放到 GitHub + Render 部署的完整專案。
+## 這版已修正
 
-## 功能流程
+1. 關閉假桌號 fallback：沒有真實抓到桌號時，不會再顯示假 RB01。
+2. `baccarat_reader.py` 加強 DOM / iframe / attribute / Network JSON 抓取。
+3. `monitor.py` 使用常駐瀏覽器頁面，降低每次分析都重新開 Chromium 的延遲。
+4. `predictor.py` 加入本地牌路判斷：長龍、斷龍風險、單跳、雙跳、成對、散盤觀望、歷史重複規律。
+5. `deepseek_client.py` 可啟用 DeepSeek API 做獨立 AI 校準。
+6. 前端改為：開始預測 → 選平台 → 選遊戲廳 → 選真實桌號 → 分析數據。
 
-1. LINE 輸入「開始預測」
-2. 顯示使用指南
-3. 選擇平台：歐博真人 / DG真人 / Rebirth真人
-4. 選擇遊戲廳：經典百家樂 / 龍虎門
-5. 選擇桌號
-6. 讀取桌台資料與牌路
-7. predictor.py 回傳莊/閒/和機率與推薦
-8. 按「繼續分析」可重新讀取
-9. 按「結束分析」停止背景監控
-
-## 重要安全提醒
-
-平台網址若帶有 token，請放在 Render Environment Variables，不要提交到公開 GitHub。
-
-## Render 設定
-
-Build Command:
+## Render Build Command
 
 ```bash
-pip install -r requirements.txt && playwright install chromium
+pip install --upgrade pip && pip install -r requirements.txt && python -m playwright install --with-deps chromium
 ```
 
-Start Command:
+## Render Start Command
 
 ```bash
 uvicorn app:app --host 0.0.0.0 --port $PORT
@@ -37,32 +26,55 @@ uvicorn app:app --host 0.0.0.0 --port $PORT
 ```env
 LINE_CHANNEL_ACCESS_TOKEN=
 LINE_CHANNEL_SECRET=
+LIFF_ID=
+PUBLIC_BASE_URL=https://你的-render網址.onrender.com
+
 BACCARAT_URL_GSA=
 BACCARAT_URL_DG=
 BACCARAT_URL_REBIRTH=
+
+PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/.playwright
+HEADLESS=true
+POLL_INTERVAL_SECONDS=5
+FRONTEND_AUTO_POLL_MS=6000
+AUTO_PUSH_NEW_ROUND=true
+USE_DOM_READER=true
+USE_NETWORK_READER=true
+USE_COLOR_READER=false
+ALLOW_DEFAULT_TABLE_IDS=false
+READER_WAIT_MS=8000
 ```
 
-## Webhook
+## DeepSeek 環境變數
 
-Render 部署完成後，LINE Developers Webhook URL 設定：
+```env
+DEEPSEEK_ENABLED=true
+DEEPSEEK_API_KEY=你的DeepSeek API Key
+DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_TIMEOUT_SECONDS=8
+DEEPSEEK_WEIGHT=0.30
+LOCAL_MODEL_WEIGHT=0.70
+```
+
+## Debug API
 
 ```text
-https://你的-render-url.onrender.com/webhook
+/health
+/api/debug/playwright
+/api/debug/baccarat?platform=DG&hall=BACCARAT
+/api/debug/tables?platform=DG&hall=BACCARAT
+/api/debug/table?platform=DG&hall=BACCARAT&table_id=RB05
 ```
 
-## 測試 API
+判斷是否真的爬到資料：
 
-```bash
-curl -X POST https://你的-render-url.onrender.com/api/test-analyze \
-  -H "Content-Type: application/json" \
-  -d '{"platform":"DG","hall":"BACCARAT","table_id":"RB05"}'
+- `table_count > 0` 且 `source != fallback_default`：有抓到真實桌號。
+- `road_length > 0`：有抓到牌路。
+- `prediction.ai_used=true`：DeepSeek 有成功參與校準。
+
+## LINE Webhook
+
+```text
+https://你的-render網址.onrender.com/webhook
 ```
-
-## 關於實際抓取準確度
-
-不同百家樂系統可能使用 HTML、API、WebSocket、Canvas 或圖片牌路。
-這份專案先提供通用讀取架構：
-
-- 先嘗試 DOM 文字/class 讀取
-- 若抓不到，再可開啟 OpenCV 顏色辨識
-- 若平台有明確 API/WebSocket，後續可把 baccarat_reader.py 改成 API 直讀，會最穩
