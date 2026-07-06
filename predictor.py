@@ -34,7 +34,7 @@ def normalize_road(road: Any) -> List[str]:
 
 
 def side_text(side: str) -> str:
-    return {"B": "莊", "P": "閒", "T": "和", "OBSERVE": "觀望", "觀望": "觀望"}.get(side, "觀望")
+    return {"B": "莊", "P": "閒", "T": "和", "OBSERVE": "觀望", "觀望": "觀望", "莊": "莊", "閒": "閒"}.get(side, "觀望")
 
 
 def opposite(side: str) -> str:
@@ -302,6 +302,7 @@ def local_predict(road: List[str]) -> Dict[str, Any]:
             "score_player": 0,
             "gap": 0,
             "road_summary": build_road_summary(road),
+            "ai_used": False,
         }
         base["banker_rate"] = base["banker_percent"]
         base["player_rate"] = base["player_percent"]
@@ -446,7 +447,7 @@ def combine_with_ai(local: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, Any]
     tie_percent = int(local.get("tie_percent", 8))
     bp_total = 100 - tie_percent
     denom = final_b_raw + final_p_raw
-    banker_percent = int(round(bp_total * final_b_raw / denom)) if denom > 0 else local.get("banker_percent", 33)
+    banker_percent = int(round(bp_total * final_b_raw / denom)) if denom > 0 else int(local.get("banker_percent", 33))
     player_percent = int(100 - tie_percent - banker_percent)
     gap = abs(banker_percent - player_percent)
 
@@ -460,9 +461,12 @@ def combine_with_ai(local: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, Any]
         entry_allowed = False
     else:
         recommend = "莊" if banker_percent > player_percent else "閒"
-        if local_side in ("莊", "閒") and ai_side in ("B", "P") and ((local_side == "莊" and ai_side == "B") or (local_side == "閒" and ai_side == "P")):
+        same_side = (local_side == "莊" and ai_side == "B") or (local_side == "閒" and ai_side == "P")
+        disagree = ai_side in ("B", "P") and ((recommend == "莊" and ai_side != "B") or (recommend == "閒" and ai_side != "P"))
+        if same_side:
             signal_level = "AI共振強信號" if gap >= 7 else "AI共振中信號"
-        elif ai_side in ("B", "P") and ((recommend == "莊" and ai_side != "B") or (recommend == "閒" and ai_side != "P")):
+            entry_allowed = gap >= 6
+        elif disagree:
             signal_level = "AI分歧觀察"
             if gap < 10:
                 recommend = "觀望"
@@ -499,8 +503,14 @@ def predict(road: Any) -> Dict[str, Any]:
     normalized = normalize_road(road)
     local = local_predict(normalized)
     if DEEPSEEK_ENABLED and DEEPSEEK_API_KEY and len(normalized) >= 5:
-        ai = DeepSeekClient().analyze_road(normalized, local)
-        return combine_with_ai(local, ai)
+        try:
+            ai = DeepSeekClient().analyze_road(normalized, local)
+            return combine_with_ai(local, ai)
+        except Exception as e:
+            local["deepseek"] = {"ok": False, "side": "OBSERVE", "confidence": 0, "reason": f"DeepSeek 例外：{e}", "pattern": "EXCEPTION"}
+            local["ai_used"] = False
+            local["ai_reason"] = f"DeepSeek 例外：{e}"
+            return local
     local["deepseek"] = {
         "ok": False,
         "side": "OBSERVE",

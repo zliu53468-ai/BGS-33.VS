@@ -6,4 +6,3 @@ playwright
 opencv-python-headless
 numpy
 pillow
-pydantic

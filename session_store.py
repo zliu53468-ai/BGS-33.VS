@@ -3,11 +3,13 @@
 
 import json
 import os
+import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 SESSIONS_FILE = os.getenv("SESSIONS_FILE", "sessions.json")
-USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_LOCK = threading.RLock()
+_USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 def _default_session() -> Dict[str, Any]:
@@ -18,62 +20,69 @@ def _default_session() -> Dict[str, Any]:
         "table_id": None,
         "game_no": None,
         "dealer": None,
-        "online_count": 0,
+        "online_count": None,
         "countdown": 0,
-        "status": "未開始",
+        "status": "待機",
         "road": [],
         "last_round_key": None,
         "last_prediction": None,
+        "last_data": None,
         "running": False,
-        "real_data": False,
         "created_at": time.time(),
         "updated_at": time.time(),
     }
 
 
-def load_sessions() -> None:
-    global USER_SESSIONS
+def _load() -> None:
+    global _USER_SESSIONS
+    if not os.path.exists(SESSIONS_FILE):
+        return
     try:
-        if os.path.exists(SESSIONS_FILE):
-            with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    USER_SESSIONS = data
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                _USER_SESSIONS = data
     except Exception:
-        USER_SESSIONS = {}
+        _USER_SESSIONS = {}
 
 
-def save_sessions() -> None:
+def _save() -> None:
     try:
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(USER_SESSIONS, f, ensure_ascii=False, indent=2)
+            json.dump(_USER_SESSIONS, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
+_load()
+
+
 def get_session(user_id: str) -> Dict[str, Any]:
-    if not USER_SESSIONS:
-        load_sessions()
-    if user_id not in USER_SESSIONS:
-        USER_SESSIONS[user_id] = _default_session()
-        save_sessions()
-    USER_SESSIONS[user_id]["updated_at"] = time.time()
-    return USER_SESSIONS[user_id]
-
-
-def reset_session(user_id: str) -> Dict[str, Any]:
-    USER_SESSIONS[user_id] = _default_session()
-    save_sessions()
-    return USER_SESSIONS[user_id]
+    with _LOCK:
+        if user_id not in _USER_SESSIONS:
+            _USER_SESSIONS[user_id] = _default_session()
+            _save()
+        _USER_SESSIONS[user_id]["updated_at"] = time.time()
+        return dict(_USER_SESSIONS[user_id])
 
 
 def update_session(user_id: str, **kwargs) -> Dict[str, Any]:
-    session = get_session(user_id)
-    session.update(kwargs)
-    session["updated_at"] = time.time()
-    save_sessions()
-    return session
+    with _LOCK:
+        if user_id not in _USER_SESSIONS:
+            _USER_SESSIONS[user_id] = _default_session()
+        _USER_SESSIONS[user_id].update(kwargs)
+        _USER_SESSIONS[user_id]["updated_at"] = time.time()
+        _save()
+        return dict(_USER_SESSIONS[user_id])
 
 
-def session_to_public(session: Dict[str, Any]) -> Dict[str, Any]:
-    return dict(session)
+def reset_session(user_id: str) -> Dict[str, Any]:
+    with _LOCK:
+        _USER_SESSIONS[user_id] = _default_session()
+        _save()
+        return dict(_USER_SESSIONS[user_id])
+
+
+def all_sessions() -> Dict[str, Dict[str, Any]]:
+    with _LOCK:
+        return dict(_USER_SESSIONS)

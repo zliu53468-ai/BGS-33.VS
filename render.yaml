@@ -27,7 +27,7 @@ services:
       - key: ALLOW_DEFAULT_TABLE_IDS
         value: "false"
       - key: READER_WAIT_MS
-        value: "8000"
+        value: "3500"
       - key: ROAD_X
         value: "0"
       - key: ROAD_Y

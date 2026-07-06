@@ -6,239 +6,119 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Page, Browser, Playwright
+from playwright.async_api import async_playwright, Page
 
 from config import (
-    get_platform,
-    HEADLESS,
-    USE_DOM_READER,
-    USE_NETWORK_READER,
-    USE_COLOR_READER,
     ALLOW_DEFAULT_TABLE_IDS,
     DEFAULT_TABLE_IDS,
+    HEADLESS,
     READER_WAIT_MS,
-    READER_TIMEOUT_MS,
-    BROWSER_WIDTH,
-    BROWSER_HEIGHT,
+    USE_COLOR_READER,
+    USE_DOM_READER,
+    USE_NETWORK_READER,
+    get_platform,
 )
 from color_reader import parse_road_from_screenshot
 
-
-BROWSER_ARGS = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-blink-features=AutomationControlled",
-]
-
-TABLE_ID_PATTERNS = [
-    r"\bRB\d{1,3}\b",
-    r"\bSB\d{1,3}\b",
-    r"\bCB\d{1,3}\b",
-    r"\bTB\d{1,3}\b",
-    r"\bBAC\d{1,4}\b",
-    r"\bB\d{1,4}\b",
-    r"\bR\d{1,5}\b",
-    r"\b[A-Z]{1,4}-?\d{1,4}\b",
-    r"\d{1,3}\s*號桌",
-    r"百家樂\s*\d{1,3}",
-    r"百家乐\s*\d{1,3}",
-]
-
-GAME_NO_PATTERNS = [
-    r"20\d{8,}[A-Z0-9_-]*",
-    r"[A-Z]{1,4}\d{8,}[A-Z0-9_-]*",
-]
-
-RESULT_MAP = {
-    "B": "B", "BANKER": "B", "莊": "B", "庄": "B", "BANK": "B",
-    "P": "P", "PLAYER": "P", "閒": "P", "闲": "P", "PLAY": "P",
+ROAD_SIDE_MAP = {
+    "B": "B", "BANKER": "B", "莊": "B", "庄": "B",
+    "P": "P", "PLAYER": "P", "閒": "P", "闲": "P",
     "T": "T", "TIE": "T", "和": "T",
 }
 
 
-def _uniq(seq: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in seq:
-        key = str(x).strip()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(key)
-    return out
+class NetworkCollector:
+    def __init__(self) -> None:
+        self.text_chunks: List[str] = []
+        self.json_chunks: List[Any] = []
+        self.max_items = 200
+
+    async def record_response(self, response) -> None:
+        if not USE_NETWORK_READER:
+            return
+        try:
+            req = response.request
+            resource_type = req.resource_type
+            url = response.url.lower()
+            ctype = (response.headers.get("content-type") or "").lower()
+
+            if resource_type not in {"xhr", "fetch", "websocket", "document"} and "json" not in ctype:
+                return
+            if any(skip in url for skip in [".png", ".jpg", ".jpeg", ".gif", ".css", ".woff", ".mp4"]):
+                return
+
+            body = await response.text()
+            if not body:
+                return
+            body = body[:200000]
+            self.text_chunks.append(body)
+            if len(self.text_chunks) > self.max_items:
+                self.text_chunks = self.text_chunks[-self.max_items:]
+
+            if "json" in ctype or body.strip().startswith(("{", "[")):
+                try:
+                    self.json_chunks.append(json.loads(body))
+                    if len(self.json_chunks) > self.max_items:
+                        self.json_chunks = self.json_chunks[-self.max_items:]
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    def all_text(self) -> str:
+        return "\n".join(self.text_chunks[-60:])
 
 
-def _safe_json_text(value: Any, limit: int = 1200) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False)[:limit]
-    except Exception:
-        return str(value)[:limit]
-
-
-def _normalize_result(value: Any) -> str:
-    if value is None:
-        return ""
-    v = str(value).strip().upper()
-    if v in RESULT_MAP:
-        return RESULT_MAP[v]
-    # 部分 API 用 1/2/3 或 0/1/2 表示，這裡不強猜，避免誤判。
+def normalize_side(value: Any) -> str:
+    v = str(value or "").strip().upper()
+    if v in ROAD_SIDE_MAP:
+        return ROAD_SIDE_MAP[v]
+    if "BANKER" in v or "莊" in v or "庄" in v:
+        return "B"
+    if "PLAYER" in v or "閒" in v or "闲" in v:
+        return "P"
+    if "TIE" in v or v == "和":
+        return "T"
     return ""
 
 
-def _walk_json(obj: Any, results: Dict[str, Any]) -> None:
-    """從 API JSON 中盡量挖桌台、牌路、局號資料。"""
+def flatten_json_values(obj: Any, depth: int = 0) -> List[Any]:
+    if depth > 8:
+        return []
+    out: List[Any] = []
     if isinstance(obj, dict):
-        lower_keys = {str(k).lower(): k for k in obj.keys()}
-
-        # 桌台資料
-        table_id = None
-        for key in ("tableid", "table_id", "tableno", "table_no", "table", "vid", "roomid", "room_id"):
-            if key in lower_keys:
-                table_id = str(obj.get(lower_keys[key], "")).strip()
-                break
-        if table_id:
-            item = {
-                "table_id": table_id.upper(),
-                "game_no": "",
-                "dealer": "",
-                "online_count": 0,
-                "source": "network_json",
-            }
-            for key in ("gameno", "game_no", "roundno", "round_no", "shoe", "boot"):
-                if key in lower_keys:
-                    item["game_no"] = str(obj.get(lower_keys[key], "")).strip()
-                    break
-            for key in ("dealer", "dealername", "dealer_name", "荷官", "荷官姓名"):
-                if key in lower_keys:
-                    item["dealer"] = str(obj.get(lower_keys[key], "")).strip()
-                    break
-            for key in ("online", "onlinecount", "online_count", "players", "playercount", "usercount"):
-                if key in lower_keys:
-                    try:
-                        item["online_count"] = int(float(obj.get(lower_keys[key], 0) or 0))
-                    except Exception:
-                        pass
-                    break
-            results.setdefault("tables", []).append(item)
-
-        # 牌路資料
-        for key in ("road", "roads", "beadroad", "bigroad", "results", "history", "rounds", "resultlist", "result_list"):
-            if key in lower_keys:
-                road = _extract_road_from_any(obj.get(lower_keys[key]))
-                if road:
-                    results.setdefault("roads", []).append(road)
-
-        # 單一結果
-        for key in ("result", "winner", "win", "side", "outcome"):
-            if key in lower_keys:
-                r = _normalize_result(obj.get(lower_keys[key]))
-                if r:
-                    results.setdefault("single_results", []).append(r)
-
+        out.append(obj)
         for v in obj.values():
-            _walk_json(v, results)
+            out.extend(flatten_json_values(v, depth + 1))
     elif isinstance(obj, list):
-        road = _extract_road_from_any(obj)
-        if len(road) >= 3:
-            results.setdefault("roads", []).append(road)
-        for v in obj:
-            _walk_json(v, results)
-
-
-def _extract_road_from_any(value: Any) -> List[str]:
-    road: List[str] = []
-    if isinstance(value, str):
-        # 只接受看起來像連續牌路的字串，避免一般文字誤判。
-        compact = re.sub(r"[^BPT莊庄閒闲和]", "", value.upper())
-        if len(compact) >= 3:
-            for ch in compact:
-                r = _normalize_result(ch)
-                if r:
-                    road.append(r)
-        return road
-    if isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                found = ""
-                for key in ("result", "winner", "win", "side", "outcome", "value"):
-                    if key in item:
-                        found = _normalize_result(item.get(key))
-                        if found:
-                            break
-                if found:
-                    road.append(found)
-            else:
-                r = _normalize_result(item)
-                if r:
-                    road.append(r)
-        return road
-    if isinstance(value, dict):
-        return _extract_road_from_any(list(value.values()))
-    return []
-
-
-class NetworkCollector:
-    def __init__(self):
-        self.json_payloads: List[Any] = []
-        self.text_payloads: List[str] = []
-        self.urls: List[str] = []
-
-    def attach(self, page: Page) -> None:
-        if not USE_NETWORK_READER:
-            return
-
-        async def on_response(response):
-            try:
-                url = response.url
-                ctype = (response.headers or {}).get("content-type", "").lower()
-                if any(x in url.lower() for x in (".png", ".jpg", ".jpeg", ".gif", ".woff", ".css")):
-                    return
-                if len(self.urls) < 120:
-                    self.urls.append(url)
-                if "json" in ctype or "api" in url.lower() or "game" in url.lower() or "table" in url.lower():
-                    try:
-                        data = await response.json()
-                        self.json_payloads.append(data)
-                    except Exception:
-                        try:
-                            text = await response.text()
-                            if text and len(text) < 300000:
-                                self.text_payloads.append(text[:5000])
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        page.on("response", lambda response: asyncio.create_task(on_response(response)))
-
-    def extract(self) -> Dict[str, Any]:
-        results: Dict[str, Any] = {"tables": [], "roads": [], "single_results": []}
-        for data in self.json_payloads[-80:]:
-            _walk_json(data, results)
-        for text in self.text_payloads[-30:]:
-            # 嘗試從文字裡找 JSON
-            for m in re.finditer(r"\{.*?\}|\[.*?\]", text, flags=re.S):
-                snippet = m.group(0)
-                if len(snippet) > 20000:
-                    continue
-                try:
-                    obj = json.loads(snippet)
-                    _walk_json(obj, results)
-                except Exception:
-                    continue
-        return results
+        for item in obj:
+            out.extend(flatten_json_values(item, depth + 1))
+    else:
+        out.append(obj)
+    return out
 
 
 class BaccaratReader:
-    def __init__(self):
-        self.viewport = {"width": BROWSER_WIDTH, "height": BROWSER_HEIGHT}
+    def __init__(self) -> None:
+        self.viewport = {"width": 1365, "height": 900}
+        self._playwright = None
 
-    async def _new_page(self, platform_key: str) -> Tuple[Playwright, Browser, Page, NetworkCollector]:
+    async def _start_playwright(self):
+        return await async_playwright().start()
+
+    async def new_browser_page(self, platform_key: str) -> Tuple[Any, Any, Page, NetworkCollector]:
         platform = get_platform(platform_key)
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
+        playwright = await self._start_playwright()
+        browser = await playwright.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+            ],
+        )
         context = await browser.new_context(
             viewport=self.viewport,
             ignore_https_errors=True,
@@ -250,278 +130,338 @@ class BaccaratReader:
         )
         page = await context.new_page()
         collector = NetworkCollector()
-        collector.attach(page)
-        await page.goto(platform.url, wait_until="domcontentloaded", timeout=READER_TIMEOUT_MS)
+        page.on("response", lambda response: asyncio.create_task(collector.record_response(response)))
+        await page.goto(platform.url, wait_until="domcontentloaded", timeout=60000)
         try:
-            await page.wait_for_load_state("networkidle", timeout=READER_TIMEOUT_MS)
+            await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
         await page.wait_for_timeout(READER_WAIT_MS)
         return playwright, browser, page, collector
 
-    async def _close(self, playwright: Optional[Playwright], browser: Optional[Browser]) -> None:
-        if browser:
-            try:
+    async def close_browser(self, playwright, browser) -> None:
+        try:
+            if browser:
                 await browser.close()
-            except Exception:
-                pass
-        if playwright:
-            try:
+        except Exception:
+            pass
+        try:
+            if playwright:
                 await playwright.stop()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    async def _click_any_text(self, page: Page, labels: List[str]) -> bool:
+    async def click_any_text(self, page: Page, labels: List[str]) -> bool:
         for label in labels:
             if not label:
                 continue
             for frame in page.frames:
                 try:
-                    locator = frame.get_by_text(label, exact=False)
-                    if await locator.count() > 0:
-                        await locator.first.click(timeout=4000)
-                        await page.wait_for_timeout(2500)
+                    loc = frame.get_by_text(label, exact=False)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=2500)
+                        await page.wait_for_timeout(READER_WAIT_MS)
                         return True
                 except Exception:
                     continue
-            # JS 文字模糊點擊備用
-            try:
-                ok = await page.evaluate(
-                    """(label) => {
-                        const nodes = Array.from(document.querySelectorAll('button,a,div,span,li'));
-                        const n = nodes.find(x => (x.innerText || x.textContent || '').includes(label));
-                        if (n) { n.click(); return true; }
-                        return false;
-                    }""",
-                    label,
-                )
-                if ok:
-                    await page.wait_for_timeout(2500)
-                    return True
-            except Exception:
-                pass
+            for frame in page.frames:
+                try:
+                    loc = frame.locator(f"[aria-label*='{label}'], [title*='{label}'], [alt*='{label}'], [data-name*='{label}'], [data-title*='{label}']")
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=2500)
+                        await page.wait_for_timeout(READER_WAIT_MS)
+                        return True
+                except Exception:
+                    continue
         return False
 
-    async def _extract_dom_dump(self, page: Page) -> Dict[str, Any]:
-        texts: List[str] = []
-        attrs: List[str] = []
-        url_list: List[str] = []
-        frame_count = len(page.frames)
+    async def prepare_page(self, platform_key: str, hall_key: Optional[str] = None) -> Tuple[Any, Any, Page, NetworkCollector]:
+        playwright, browser, page, collector = await self.new_browser_page(platform_key)
+        if hall_key:
+            platform = get_platform(platform_key)
+            labels = platform.hall_labels.get(hall_key, [])
+            await self.click_any_text(page, labels)
+        return playwright, browser, page, collector
 
-        script = """
-        () => {
-          const data = { text: '', attrs: [], hrefs: [] };
-          data.text = document.body ? (document.body.innerText || document.body.textContent || '') : '';
-          const nodes = Array.from(document.querySelectorAll('*')).slice(0, 6000);
-          for (const n of nodes) {
-            const parts = [];
-            for (const a of ['id','class','title','aria-label','alt','data-table','data-table-id','data-id','data-room','data-game','data-result','data-type','data-value','data-side']) {
-              const v = n.getAttribute && n.getAttribute(a);
-              if (v) parts.push(`${a}=${v}`);
-            }
-            const t = (n.innerText || n.textContent || '').trim();
-            if (t && t.length <= 80) parts.push(`text=${t}`);
-            if (parts.length) data.attrs.push(parts.join(' | '));
-            const href = n.getAttribute && (n.getAttribute('href') || n.getAttribute('src'));
-            if (href) data.hrefs.push(href);
-          }
-          return data;
-        }
-        """
+    async def extract_visible_text(self, page: Page) -> str:
+        chunks: List[str] = []
         for frame in page.frames:
             try:
-                dump = await frame.evaluate(script)
-                if dump.get("text"):
-                    texts.append(dump["text"])
-                attrs.extend(dump.get("attrs") or [])
-                url_list.extend(dump.get("hrefs") or [])
+                body = await frame.locator("body").inner_text(timeout=3000)
+                if body:
+                    chunks.append(body)
             except Exception:
-                continue
-        return {
-            "text": "\n".join(_uniq(texts)),
-            "attrs": _uniq(attrs)[:2500],
-            "hrefs": _uniq(url_list)[:500],
-            "frame_count": frame_count,
-        }
+                pass
 
-    def _parse_tables_from_blob(self, blob: str, source: str = "dom_text") -> List[Dict[str, Any]]:
-        tables: Dict[str, Dict[str, Any]] = {}
-        if not blob:
+            script = """
+            () => {
+              const out = [];
+              const nodes = Array.from(document.querySelectorAll('button,a,div,span,p,li,td,th,img,input,[aria-label],[title],[alt]'));
+              for (const n of nodes) {
+                const vals = [];
+                vals.push(n.innerText || n.textContent || '');
+                vals.push(n.getAttribute('aria-label') || '');
+                vals.push(n.getAttribute('title') || '');
+                vals.push(n.getAttribute('alt') || '');
+                vals.push(n.getAttribute('value') || '');
+                vals.push(n.getAttribute('data-table') || '');
+                vals.push(n.getAttribute('data-table-id') || '');
+                vals.push(n.getAttribute('data-id') || '');
+                vals.push(n.getAttribute('data-name') || '');
+                vals.push(n.getAttribute('data-game') || '');
+                vals.push(n.getAttribute('data-result') || '');
+                const cls = typeof n.className === 'string' ? n.className : '';
+                vals.push(cls);
+                const s = vals.map(x => String(x || '').trim()).filter(Boolean).join(' ');
+                if (s) out.push(s);
+              }
+              return out.slice(0, 4000).join('\n');
+            }
+            """
+            try:
+                attrs = await frame.evaluate(script)
+                if attrs:
+                    chunks.append(attrs)
+            except Exception:
+                pass
+
+        seen = set()
+        unique: List[str] = []
+        for c in chunks:
+            c = str(c).strip()
+            if c and c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return "\n".join(unique)
+
+    def extract_road_from_json(self, collector: Optional[NetworkCollector]) -> List[str]:
+        if not collector:
             return []
+        candidates: List[str] = []
+        keys = {"result", "winner", "win", "side", "banker", "player", "tie", "gameResult", "road", "roads", "bead", "history"}
 
-        for pattern in TABLE_ID_PATTERNS:
-            for m in re.finditer(pattern, blob, flags=re.IGNORECASE):
-                table_id = re.sub(r"\s+", "", m.group(0)).upper()
-                # 避免把超長局號切成桌號誤收
-                if len(table_id) > 18:
-                    continue
-                if table_id not in tables:
-                    tables[table_id] = {
-                        "table_id": table_id,
-                        "game_no": "",
-                        "dealer": "",
-                        "online_count": 0,
-                        "source": source,
-                    }
+        def walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    lk = str(k).lower()
+                    if lk in {x.lower() for x in keys}:
+                        if isinstance(v, str):
+                            candidates.append(v)
+                        elif isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, str):
+                                    candidates.append(item)
+                                elif isinstance(item, dict):
+                                    for kk in ["result", "winner", "side", "value", "type"]:
+                                        if kk in item:
+                                            candidates.append(str(item.get(kk)))
+                    walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
 
-        # 嘗試找局號、荷官、在線人數，但不硬配對；只補到第一個資料。
-        game_nos: List[str] = []
-        for p in GAME_NO_PATTERNS:
-            game_nos.extend(re.findall(p, blob, flags=re.IGNORECASE))
-        game_nos = _uniq([x.strip() for x in game_nos])
+        for item in collector.json_chunks[-80:]:
+            walk(item)
 
-        dealers = re.findall(
-            r"(?:荷官姓名|荷官|Dealer|dealerName|dealer_name)\s*[:：=]?\s*([A-Za-z\u4e00-\u9fff0-9_-]{1,30})",
-            blob,
-            flags=re.IGNORECASE,
-        )
-        online_counts = re.findall(
-            r"(?:在線人數|在线人数|Online|onlineCount|players|userCount)\s*[:：=]?\s*(\d+)",
-            blob,
-            flags=re.IGNORECASE,
-        )
+        road: List[str] = []
+        for c in candidates:
+            if not c:
+                continue
+            s = str(c).strip().upper()
+            if len(s) > 1 and all(ch in "BPT" for ch in s):
+                road.extend([normalize_side(ch) for ch in s if normalize_side(ch)])
+            else:
+                side = normalize_side(s)
+                if side:
+                    road.append(side)
+        # 去除過度重複造成的雜訊，只取最後 120 手
+        return road[-120:]
 
-        table_items = list(tables.values())
-        for i, item in enumerate(table_items):
-            if i < len(game_nos):
-                item["game_no"] = game_nos[i]
-            if i < len(dealers):
-                item["dealer"] = dealers[i]
-            if i < len(online_counts):
-                try:
-                    item["online_count"] = int(online_counts[i])
-                except Exception:
-                    pass
-
-        return table_items
-
-    def _merge_tables(self, *groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        merged: Dict[str, Dict[str, Any]] = {}
-        for group in groups:
-            for item in group or []:
-                table_id = str(item.get("table_id", "")).strip().upper()
-                if not table_id:
-                    continue
-                if table_id not in merged:
-                    merged[table_id] = {
-                        "table_id": table_id,
-                        "game_no": item.get("game_no", "") or "",
-                        "dealer": item.get("dealer", "") or "",
-                        "online_count": item.get("online_count", 0) or 0,
-                        "source": item.get("source", "unknown"),
-                    }
-                else:
-                    if item.get("game_no") and not merged[table_id].get("game_no"):
-                        merged[table_id]["game_no"] = item.get("game_no")
-                    if item.get("dealer") and not merged[table_id].get("dealer"):
-                        merged[table_id]["dealer"] = item.get("dealer")
-                    if item.get("online_count") and not merged[table_id].get("online_count"):
-                        merged[table_id]["online_count"] = item.get("online_count")
-                    merged[table_id]["source"] = merged[table_id].get("source", "") + "+" + str(item.get("source", ""))
-        return list(merged.values())[:50]
-
-    async def _extract_dom_road(self, page: Page) -> List[str]:
+    async def extract_dom_road(self, page: Page) -> List[str]:
         if not USE_DOM_READER:
             return []
         script = """
         () => {
           const out = [];
-          const nodes = Array.from(document.querySelectorAll('div,span,i,li,td,p,button')).slice(0, 8000);
+          const nodes = Array.from(document.querySelectorAll('div,span,i,li,td,p,button,[data-result],[data-side],[data-value],[class]'));
           for (const n of nodes) {
             const rect = n.getBoundingClientRect();
             if (!rect || rect.width < 2 || rect.height < 2) continue;
             const text = (n.innerText || n.textContent || '').trim();
             const cls = typeof n.className === 'string' ? n.className : '';
             const style = n.getAttribute('style') || '';
-            const data = ['data-result','data-type','data-value','data-side','aria-label','title']
-              .map(a => n.getAttribute(a) || '').join(' ');
+            const data = [
+              n.getAttribute('data-result') || '',
+              n.getAttribute('data-type') || '',
+              n.getAttribute('data-value') || '',
+              n.getAttribute('data-side') || '',
+              n.getAttribute('aria-label') || '',
+              n.getAttribute('title') || '',
+            ].join(' ');
             const combo = `${text} ${cls} ${style} ${data}`.toLowerCase();
-            const looks = combo.includes('road') || combo.includes('result') || combo.includes('banker') || combo.includes('player') || combo.includes('tie') || combo.includes('莊') || combo.includes('庄') || combo.includes('閒') || combo.includes('闲') || combo.includes('和');
-            if (!looks) continue;
-            if (combo.includes('banker') || combo.includes('莊') || combo.includes('庄') || combo === 'b') out.push('B');
-            else if (combo.includes('player') || combo.includes('閒') || combo.includes('闲') || combo === 'p') out.push('P');
-            else if (combo.includes('tie') || combo.includes('和') || combo === 't') out.push('T');
+            const roadHint = combo.includes('road') || combo.includes('bead') || combo.includes('result') || combo.includes('banker') || combo.includes('player') || combo.includes('tie') || combo.includes('莊') || combo.includes('庄') || combo.includes('閒') || combo.includes('闲') || combo.includes('和');
+            if (!roadHint) continue;
+            if (combo.includes('banker') || combo.includes('庄') || combo.includes('莊') || text === 'B') out.push('B');
+            else if (combo.includes('player') || combo.includes('閒') || combo.includes('闲') || text === 'P') out.push('P');
+            else if (combo.includes('tie') || combo.includes('和') || text === 'T') out.push('T');
           }
-          return out.slice(-160);
+          return out.slice(-150);
         }
         """
-        results: List[str] = []
+        out: List[str] = []
         for frame in page.frames:
             try:
-                values = await frame.evaluate(script)
-                if values:
-                    results.extend([x for x in values if x in ("B", "P", "T")])
+                vals = await frame.evaluate(script)
+                if vals:
+                    out.extend([v for v in vals if v in ("B", "P", "T")])
             except Exception:
                 continue
-        return results[-160:]
+        return out[-120:]
 
-    async def _extract_color_road(self, page: Page, platform_key: str, table_id: str) -> List[str]:
+    async def extract_color_road(self, page: Page, platform_key: str, table_id: str) -> List[str]:
         if not USE_COLOR_READER:
             return []
         os.makedirs("tmp", exist_ok=True)
-        screenshot_path = f"tmp/{platform_key}_{table_id}.png"
+        path = f"tmp/{platform_key}_{table_id}.png"
         try:
-            await page.screenshot(path=screenshot_path, full_page=True)
-            return parse_road_from_screenshot(screenshot_path)
+            await page.screenshot(path=path, full_page=True)
+            return parse_road_from_screenshot(path)
         except Exception:
             return []
 
-    def _parse_basic_data(self, blob: str, fallback_table_id: str, road: List[str], network: Dict[str, Any]) -> Dict[str, Any]:
+    def parse_tables_from_text(self, text: str, collector: Optional[NetworkCollector] = None) -> List[Dict[str, Any]]:
+        combined = text or ""
+        if collector:
+            combined += "\n" + collector.all_text()
+
+        tables: Dict[str, Dict[str, Any]] = {}
+
+        # 1. 常見桌號 / 局號中的桌號
+        patterns = [
+            r"\bRB\d{1,3}\b",
+            r"\bSB\d{1,3}\b",
+            r"\bCB\d{1,3}\b",
+            r"\b[A-Z]{1,3}\d{1,4}\b",
+            r"\bR\d{3,6}\b",
+            r"(?:百家樂|百家乐)\s*(\d{1,3})\s*(?:號桌|号桌|桌)?",
+            r"(?:桌號|桌号|Table|tableId|table_id)\s*[:：= ]+\s*([A-Za-z0-9_-]{2,30})",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, combined, flags=re.IGNORECASE):
+                val = m.group(1) if m.lastindex else m.group(0)
+                val = str(val).strip().upper()
+                if val.isdigit():
+                    val = f"TABLE{val}"
+                if len(val) < 2:
+                    continue
+                tables.setdefault(val, {"table_id": val, "game_no": "", "dealer": "", "online_count": 0, "source": "text"})
+
+        # 2. 遊戲編號，例如 202607060020R5037，抽 R5037 作桌碼備援
+        game_nos = re.findall(r"20\d{8,}[A-Z0-9]*", combined, flags=re.IGNORECASE)
+        for game_no in game_nos:
+            m = re.search(r"([A-Z]{1,3}\d{3,6})$", game_no, flags=re.IGNORECASE)
+            table_id = m.group(1).upper() if m else game_no[-6:].upper()
+            item = tables.setdefault(table_id, {"table_id": table_id, "game_no": "", "dealer": "", "online_count": 0, "source": "game_no"})
+            if not item.get("game_no"):
+                item["game_no"] = game_no
+
+        # 3. 從 JSON 中找 table 類資料
+        if collector:
+            for obj in collector.json_chunks[-80:]:
+                for item in flatten_json_values(obj):
+                    if not isinstance(item, dict):
+                        continue
+                    raw_id = item.get("tableId") or item.get("table_id") or item.get("table") or item.get("tableNo") or item.get("tableName") or item.get("id")
+                    raw_game = item.get("gameNo") or item.get("game_no") or item.get("gameId") or item.get("roundId") or item.get("shoeId")
+                    raw_dealer = item.get("dealer") or item.get("dealerName") or item.get("dealer_name") or item.get("荷官姓名")
+                    raw_online = item.get("online") or item.get("onlineCount") or item.get("online_count") or item.get("players")
+                    if raw_id or raw_game:
+                        table_id = str(raw_id or "").strip().upper()
+                        if not table_id and raw_game:
+                            m = re.search(r"([A-Z]{1,3}\d{2,6})$", str(raw_game), flags=re.IGNORECASE)
+                            table_id = m.group(1).upper() if m else str(raw_game)[-6:].upper()
+                        if table_id:
+                            row = tables.setdefault(table_id, {"table_id": table_id, "game_no": "", "dealer": "", "online_count": 0, "source": "network"})
+                            row["source"] = "network"
+                            if raw_game:
+                                row["game_no"] = str(raw_game)
+                            if raw_dealer:
+                                row["dealer"] = str(raw_dealer)
+                            try:
+                                if raw_online is not None:
+                                    row["online_count"] = int(raw_online)
+                            except Exception:
+                                pass
+
+        out = list(tables.values())
+        # 避免把太通用的年份、數字、空值當桌號
+        filtered = []
+        for t in out:
+            tid = str(t.get("table_id", "")).upper()
+            if not tid or tid in {"TRUE", "FALSE", "NULL", "NONE"}:
+                continue
+            if re.fullmatch(r"20\d{2}", tid):
+                continue
+            filtered.append(t)
+
+        if not filtered and ALLOW_DEFAULT_TABLE_IDS:
+            filtered = [{"table_id": tid, "game_no": "", "dealer": "", "online_count": 0, "source": "fallback_default"} for tid in DEFAULT_TABLE_IDS]
+        return filtered[:30]
+
+    def parse_basic_data(self, text: str, collector: Optional[NetworkCollector], fallback_table_id: str, road: List[str]) -> Dict[str, Any]:
+        combined = (text or "") + "\n" + (collector.all_text() if collector else "")
         table_id = fallback_table_id
         game_no = ""
         dealer = ""
         online_count = 0
         countdown = 0
 
-        game_match = re.search(r"20\d{8,}[A-Z0-9_-]*", blob, flags=re.IGNORECASE)
-        if game_match:
-            game_no = game_match.group(0)
+        m = re.search(r"(?:桌號|桌号|Table|tableId|table_id)\s*[:：= ]+\s*([A-Za-z0-9_-]{2,30})", combined, flags=re.IGNORECASE)
+        if m:
+            table_id = m.group(1).upper()
 
-        dealer_match = re.search(
-            r"(?:荷官姓名|荷官|Dealer|dealerName|dealer_name)\s*[:：=]?\s*([A-Za-z\u4e00-\u9fff0-9_-]{1,30})",
-            blob,
-            flags=re.IGNORECASE,
-        )
-        if dealer_match:
-            dealer = dealer_match.group(1)
+        gm = re.search(r"20\d{8,}[A-Z0-9]*", combined, flags=re.IGNORECASE)
+        if gm:
+            game_no = gm.group(0)
 
-        online_match = re.search(
-            r"(?:在線人數|在线人数|Online|onlineCount|players|userCount)\s*[:：=]?\s*(\d+)",
-            blob,
-            flags=re.IGNORECASE,
-        )
-        if online_match:
-            try:
-                online_count = int(online_match.group(1))
-            except Exception:
-                pass
+        dm = re.search(r"(?:荷官姓名|荷官|Dealer|dealerName)\s*[:：= ]+\s*([A-Za-z\u4e00-\u9fff0-9_-]{1,30})", combined, flags=re.IGNORECASE)
+        if dm:
+            dealer = dm.group(1)
 
-        countdown_match = re.search(
-            r"(?:倒數計時|倒数计时|倒數|倒数|countdown|remain|timer)\s*[:：=]?\s*(\d+)",
-            blob,
-            flags=re.IGNORECASE,
-        )
-        if countdown_match:
-            try:
-                countdown = int(countdown_match.group(1))
-            except Exception:
-                pass
+        om = re.search(r"(?:在線人數|在线人数|Online|onlineCount)\s*[:：= ]+\s*(\d+)", combined, flags=re.IGNORECASE)
+        if om:
+            online_count = int(om.group(1))
 
-        # 從 network tables 補資料
-        for t in network.get("tables", []) or []:
-            if str(t.get("table_id", "")).upper() == table_id.upper() or not table_id:
-                table_id = str(t.get("table_id") or table_id).upper()
-                game_no = t.get("game_no") or game_no
-                dealer = t.get("dealer") or dealer
-                online_count = t.get("online_count") or online_count
-                break
+        cm = re.search(r"(?:倒數計時|倒数计时|倒數|倒数|countdown)\s*[:：= ]+\s*(\d+)", combined, flags=re.IGNORECASE)
+        if cm:
+            countdown = int(cm.group(1))
 
-        status = "讀取中"
-        low = blob.lower()
-        if "可押注" in blob or "可下注" in blob or "betting" in low or "bet" in low:
+        # JSON 補強
+        if collector:
+            for obj in collector.json_chunks[-80:]:
+                for item in flatten_json_values(obj):
+                    if not isinstance(item, dict):
+                        continue
+                    raw_id = item.get("tableId") or item.get("table_id") or item.get("table") or item.get("tableNo")
+                    if raw_id and str(raw_id).upper() != str(fallback_table_id).upper():
+                        continue
+                    game_no = str(item.get("gameNo") or item.get("game_no") or item.get("gameId") or game_no or "")
+                    dealer = str(item.get("dealer") or item.get("dealerName") or item.get("dealer_name") or dealer or "")
+                    try:
+                        online_count = int(item.get("online") or item.get("onlineCount") or item.get("online_count") or online_count or 0)
+                    except Exception:
+                        pass
+                    try:
+                        countdown = int(item.get("countdown") or item.get("countDown") or item.get("timer") or countdown or 0)
+                    except Exception:
+                        pass
+
+        if "可押注" in combined or "可下注" in combined or "betting" in combined.lower():
             status = "可押注"
-        elif "停止下注" in blob or "不可押注" in blob or "closed" in low:
+        elif "停止下注" in combined or "不可押注" in combined or "dealing" in combined.lower():
             status = "停止下注"
+        else:
+            status = "讀取中"
 
         last_result = road[-1] if road else ""
         round_key = f"{table_id}:{game_no}:{len(road)}:{last_result}:{countdown}"
@@ -534,141 +474,35 @@ class BaccaratReader:
             "status": status,
             "road": road,
             "round_key": round_key,
-            "real_data": bool(game_no or dealer or online_count or road),
+            "source": "network/dom/color" if road else "no_road",
         }
 
-    async def prepare_page(self, platform_key: str, hall_key: Optional[str] = None):
-        playwright, browser, page, collector = await self._new_page(platform_key)
-        if hall_key:
-            platform = get_platform(platform_key)
-            labels = platform.hall_labels.get(hall_key, [])
-            if labels:
-                await self._click_any_text(page, labels)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(2500)
-        return playwright, browser, page, collector
-
-    async def list_tables(self, platform_key: str, hall_key: str) -> List[Dict[str, Any]]:
-        playwright = None
-        browser = None
-        try:
-            playwright, browser, page, collector = await self.prepare_page(platform_key, hall_key)
-            dom = await self._extract_dom_dump(page)
-            network = collector.extract()
-            blob = "\n".join([dom.get("text", ""), "\n".join(dom.get("attrs", [])), _safe_json_text(network)])
-            tables = self._merge_tables(
-                network.get("tables", []),
-                self._parse_tables_from_blob(dom.get("text", ""), "dom_text"),
-                self._parse_tables_from_blob("\n".join(dom.get("attrs", [])), "dom_attrs"),
-                self._parse_tables_from_blob(_safe_json_text(network), "network_blob"),
-            )
-            if not tables and ALLOW_DEFAULT_TABLE_IDS and DEFAULT_TABLE_IDS:
-                return [{"table_id": x, "game_no": "", "dealer": "", "online_count": 0, "source": "fallback_default"} for x in DEFAULT_TABLE_IDS]
-            return tables
-        finally:
-            await self._close(playwright, browser)
-
-    async def read_table_data(self, platform_key: str, hall_key: str, table_id: str) -> Dict[str, Any]:
-        playwright = None
-        browser = None
-        try:
-            playwright, browser, page, collector = await self.prepare_page(platform_key, hall_key)
-            await self._click_any_text(page, [table_id])
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(2500)
-
-            dom = await self._extract_dom_dump(page)
-            network = collector.extract()
-            blob = "\n".join([dom.get("text", ""), "\n".join(dom.get("attrs", [])), _safe_json_text(network)])
-
-            road: List[str] = []
-            roads = network.get("roads", []) or []
-            if roads:
-                road = max(roads, key=len)
-            if len(road) < 3:
-                road = await self._extract_dom_road(page)
-            if len(road) < 3:
-                color_road = await self._extract_color_road(page, platform_key, table_id)
-                if color_road:
-                    road = color_road
-
-            return self._parse_basic_data(blob=blob, fallback_table_id=table_id, road=road, network=network)
-        finally:
-            await self._close(playwright, browser)
-
-    async def debug_page(self, platform_key: str, hall_key: str = "BACCARAT") -> Dict[str, Any]:
-        playwright = None
-        browser = None
-        try:
-            playwright, browser, page, collector = await self.prepare_page(platform_key, hall_key)
-            dom = await self._extract_dom_dump(page)
-            network = collector.extract()
-            return {
-                "ok": True,
-                "platform": platform_key,
-                "hall": hall_key,
-                "title": await page.title(),
-                "current_url": page.url,
-                "frame_count": dom.get("frame_count", 0),
-                "text_length": len(dom.get("text", "")),
-                "text_preview": dom.get("text", "")[:1000],
-                "attrs_preview": dom.get("attrs", [])[:80],
-                "network_url_count": len(collector.urls),
-                "network_urls_preview": collector.urls[-30:],
-                "network_tables": network.get("tables", [])[:20],
-                "network_roads_count": len(network.get("roads", [])),
-                "message": "如果 text_length=0 且 network_tables 空，代表平台資料可能是 canvas/加密 ws/未登入或尚未進入大廳。",
-            }
-        finally:
-            await self._close(playwright, browser)
-
-
-class BaccaratLivePage:
-    """常駐瀏覽器頁面，用於降低延遲。"""
-    def __init__(self, platform_key: str, hall_key: str, table_id: str):
-        self.platform_key = platform_key
-        self.hall_key = hall_key
-        self.table_id = table_id
-        self.reader = BaccaratReader()
-        self.playwright: Optional[Playwright] = None
-        self.browser: Optional[Browser] = None
-        self.page: Optional[Page] = None
-        self.collector: Optional[NetworkCollector] = None
-        self.ready = False
-
-    async def start(self) -> None:
-        self.playwright, self.browser, self.page, self.collector = await self.reader.prepare_page(self.platform_key, self.hall_key)
-        if self.page:
-            await self.reader._click_any_text(self.page, [self.table_id])
-            await self.page.wait_for_timeout(2500)
-        self.ready = True
-
-    async def read(self) -> Dict[str, Any]:
-        if not self.ready or not self.page or not self.collector:
-            await self.start()
-        assert self.page is not None
-        assert self.collector is not None
-        dom = await self.reader._extract_dom_dump(self.page)
-        network = self.collector.extract()
-        blob = "\n".join([dom.get("text", ""), "\n".join(dom.get("attrs", [])), _safe_json_text(network)])
-        road: List[str] = []
-        roads = network.get("roads", []) or []
-        if roads:
-            road = max(roads, key=len)
+    async def read_from_page(self, page: Page, collector: Optional[NetworkCollector], platform_key: str, hall_key: str, table_id: str) -> Dict[str, Any]:
+        text = await self.extract_visible_text(page)
+        road = self.extract_road_from_json(collector)
         if len(road) < 3:
-            road = await self.reader._extract_dom_road(self.page)
+            road = await self.extract_dom_road(page)
         if len(road) < 3:
-            color_road = await self.reader._extract_color_road(self.page, self.platform_key, self.table_id)
+            color_road = await self.extract_color_road(page, platform_key, table_id)
             if color_road:
                 road = color_road
-        return self.reader._parse_basic_data(blob, self.table_id, road, network)
+        return self.parse_basic_data(text, collector, table_id, road)
 
-    async def close(self) -> None:
-        await self.reader._close(self.playwright, self.browser)
-        self.ready = False
+    async def list_tables(self, platform_key: str, hall_key: str) -> List[Dict[str, Any]]:
+        playwright = browser = None
+        try:
+            playwright, browser, page, collector = await self.prepare_page(platform_key, hall_key)
+            text = await self.extract_visible_text(page)
+            return self.parse_tables_from_text(text, collector)
+        finally:
+            await self.close_browser(playwright, browser)
+
+    async def read_table_data(self, platform_key: str, hall_key: str, table_id: str) -> Dict[str, Any]:
+        playwright = browser = None
+        try:
+            playwright, browser, page, collector = await self.prepare_page(platform_key, hall_key)
+            await self.click_any_text(page, [table_id])
+            await page.wait_for_timeout(READER_WAIT_MS)
+            return await self.read_from_page(page, collector, platform_key, hall_key, table_id)
+        finally:
+            await self.close_browser(playwright, browser)

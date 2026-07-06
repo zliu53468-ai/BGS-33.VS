@@ -2,130 +2,158 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-from config import POLL_INTERVAL_SECONDS, AUTO_PUSH_NEW_ROUND
-from baccarat_reader import BaccaratLivePage
+from baccarat_reader import BaccaratReader
+from config import AUTO_PUSH_NEW_ROUND, POLL_INTERVAL_SECONDS
 from predictor import predict
-from session_store import update_session, get_session
+from session_store import update_session
+
+OnUpdate = Callable[[str, Dict[str, Any], Dict[str, Any]], Awaitable[None]]
+
+
+class MonitorSession:
+    def __init__(self, user_id: str, platform: str, hall: str, table_id: str, on_update: Optional[OnUpdate] = None) -> None:
+        self.user_id = user_id
+        self.platform = platform
+        self.hall = hall
+        self.table_id = table_id
+        self.on_update = on_update
+        self.reader = BaccaratReader()
+        self.running = False
+        self.task: Optional[asyncio.Task] = None
+        self.latest_data: Optional[Dict[str, Any]] = None
+        self.latest_prediction: Optional[Dict[str, Any]] = None
+        self.last_round_key: Optional[str] = None
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        self.collector = None
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except Exception:
+                pass
+        await self._close()
+
+    async def _close(self) -> None:
+        try:
+            await self.reader.close_browser(self.playwright, self.browser)
+        except Exception:
+            pass
+        self.playwright = self.browser = self.page = self.collector = None
+
+    async def _open(self) -> None:
+        self.playwright, self.browser, self.page, self.collector = await self.reader.prepare_page(self.platform, self.hall)
+        await self.reader.click_any_text(self.page, [self.table_id])
+
+    async def refresh_once(self) -> Dict[str, Any]:
+        if not self.page:
+            await self._open()
+        data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id)
+        road = data.get("road", [])
+        prediction = predict(road)
+        self.latest_data = data
+        self.latest_prediction = prediction
+        self.last_round_key = data.get("round_key")
+        update_session(
+            self.user_id,
+            step="ANALYZING",
+            platform=self.platform,
+            hall=self.hall,
+            table_id=self.table_id,
+            game_no=data.get("game_no"),
+            dealer=data.get("dealer"),
+            online_count=data.get("online_count"),
+            countdown=data.get("countdown"),
+            status=data.get("status"),
+            road=road,
+            last_round_key=self.last_round_key,
+            last_prediction=prediction,
+            last_data=data,
+            running=True,
+        )
+        return {"data": data, "prediction": prediction}
+
+    async def _run(self) -> None:
+        try:
+            await self._open()
+            while self.running:
+                try:
+                    data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id)
+                    road = data.get("road", [])
+                    prediction = predict(road)
+                    round_key = data.get("round_key")
+
+                    changed = round_key and round_key != self.last_round_key
+                    first = self.last_round_key is None
+                    self.latest_data = data
+                    self.latest_prediction = prediction
+                    self.last_round_key = round_key
+
+                    update_session(
+                        self.user_id,
+                        step="ANALYZING",
+                        platform=self.platform,
+                        hall=self.hall,
+                        table_id=self.table_id,
+                        game_no=data.get("game_no"),
+                        dealer=data.get("dealer"),
+                        online_count=data.get("online_count"),
+                        countdown=data.get("countdown"),
+                        status=data.get("status"),
+                        road=road,
+                        last_round_key=round_key,
+                        last_prediction=prediction,
+                        last_data=data,
+                        running=True,
+                    )
+
+                    if self.on_update and (first or (AUTO_PUSH_NEW_ROUND and changed)):
+                        await self.on_update(self.user_id, data, prediction)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    update_session(self.user_id, status=f"監控錯誤：{e}", running=self.running)
+                    if self.on_update:
+                        await self.on_update(self.user_id, {"error": str(e), "table_id": self.table_id, "road": []}, {"recommend": "觀望", "reason": str(e)})
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        finally:
+            await self._close()
 
 
 class MonitorManager:
-    def __init__(self):
-        self.tasks: Dict[str, asyncio.Task] = {}
-        self.live_pages: Dict[str, BaccaratLivePage] = {}
-        self.latest: Dict[str, Dict[str, Any]] = {}
-        self.on_push: Optional[Callable[[str, Dict[str, Any], Dict[str, Any]], Any]] = None
+    def __init__(self) -> None:
+        self.sessions: Dict[str, MonitorSession] = {}
 
-    def set_push_callback(self, cb: Callable[[str, Dict[str, Any], Dict[str, Any]], Any]) -> None:
-        self.on_push = cb
-
-    def is_running(self, user_id: str) -> bool:
-        task = self.tasks.get(user_id)
-        return bool(task and not task.done())
-
-    async def start(self, user_id: str, platform: str, hall: str, table_id: str) -> Dict[str, Any]:
+    async def start(self, user_id: str, platform: str, hall: str, table_id: str, on_update: Optional[OnUpdate] = None) -> MonitorSession:
         await self.stop(user_id)
-        live = BaccaratLivePage(platform, hall, table_id)
-        self.live_pages[user_id] = live
-        await live.start()
-        data = await live.read()
-        prediction = predict(data.get("road", []))
-        self.latest[user_id] = {"data": data, "prediction": prediction}
-        update_session(
-            user_id,
-            step="ANALYZING",
-            running=True,
-            platform=platform,
-            hall=hall,
-            table_id=table_id,
-            game_no=data.get("game_no"),
-            dealer=data.get("dealer"),
-            online_count=data.get("online_count", 0),
-            countdown=data.get("countdown", 0),
-            status=data.get("status", "讀取中"),
-            road=data.get("road", []),
-            last_round_key=data.get("round_key"),
-            last_prediction=prediction,
-            real_data=data.get("real_data", False),
-        )
-        self.tasks[user_id] = asyncio.create_task(self._loop(user_id))
-        return self.latest[user_id]
-
-    async def _loop(self, user_id: str) -> None:
-        while True:
-            try:
-                session = get_session(user_id)
-                if not session.get("running"):
-                    break
-                live = self.live_pages.get(user_id)
-                if not live:
-                    break
-                data = await live.read()
-                prediction = predict(data.get("road", []))
-                previous_key = session.get("last_round_key")
-                current_key = data.get("round_key")
-                changed = bool(current_key and current_key != previous_key)
-                self.latest[user_id] = {"data": data, "prediction": prediction}
-                update_session(
-                    user_id,
-                    game_no=data.get("game_no"),
-                    dealer=data.get("dealer"),
-                    online_count=data.get("online_count", 0),
-                    countdown=data.get("countdown", 0),
-                    status=data.get("status", "讀取中"),
-                    road=data.get("road", []),
-                    last_round_key=current_key,
-                    last_prediction=prediction,
-                    real_data=data.get("real_data", False),
-                )
-                if AUTO_PUSH_NEW_ROUND and changed and self.on_push:
-                    maybe_coro = self.on_push(user_id, data, prediction)
-                    if asyncio.iscoroutine(maybe_coro):
-                        await maybe_coro
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                update_session(user_id, status=f"監控錯誤：{e}")
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
-    async def read_now(self, user_id: str) -> Dict[str, Any]:
-        live = self.live_pages.get(user_id)
-        session = get_session(user_id)
-        if not live:
-            platform = session.get("platform")
-            hall = session.get("hall")
-            table_id = session.get("table_id")
-            if not platform or not hall or not table_id:
-                return {"error": "請先選擇平台、遊戲廳與桌號。"}
-            return await self.start(user_id, platform, hall, table_id)
-        data = await live.read()
-        prediction = predict(data.get("road", []))
-        self.latest[user_id] = {"data": data, "prediction": prediction}
-        update_session(
-            user_id,
-            game_no=data.get("game_no"),
-            dealer=data.get("dealer"),
-            online_count=data.get("online_count", 0),
-            countdown=data.get("countdown", 0),
-            status=data.get("status", "讀取中"),
-            road=data.get("road", []),
-            last_round_key=data.get("round_key"),
-            last_prediction=prediction,
-            real_data=data.get("real_data", False),
-        )
-        return self.latest[user_id]
+        session = MonitorSession(user_id, platform, hall, table_id, on_update=on_update)
+        self.sessions[user_id] = session
+        await session.start()
+        return session
 
     async def stop(self, user_id: str) -> None:
-        task = self.tasks.pop(user_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except Exception:
-                pass
-        live = self.live_pages.pop(user_id, None)
-        if live:
-            await live.close()
-        update_session(user_id, running=False, step="STOPPED", status="已停止")
+        session = self.sessions.pop(user_id, None)
+        if session:
+            await session.stop()
+
+    def get(self, user_id: str) -> Optional[MonitorSession]:
+        return self.sessions.get(user_id)
+
+    async def refresh_once(self, user_id: str) -> Optional[Dict[str, Any]]:
+        session = self.sessions.get(user_id)
+        if not session:
+            return None
+        return await session.refresh_once()

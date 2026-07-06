@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import json
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List
+
 import requests
 
 from config import (
@@ -13,48 +15,40 @@ from config import (
 )
 
 
-def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+def _extract_json(text: str) -> Dict[str, Any]:
     if not text:
-        return None
-    text = text.strip()
+        return {}
     try:
         return json.loads(text)
     except Exception:
         pass
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return {}
 
-    # 兼容模型用 ```json 包住
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            return None
-    return None
+
+def _normalize_side(value: Any) -> str:
+    v = str(value or "").strip().upper()
+    if v in {"B", "BANKER", "莊", "庄"}:
+        return "B"
+    if v in {"P", "PLAYER", "閒", "闲"}:
+        return "P"
+    return "OBSERVE"
 
 
 class DeepSeekClient:
-    def __init__(self, api_key: str = ""):
-        self.api_key = (api_key or DEEPSEEK_API_KEY).strip()
+    def __init__(self) -> None:
+        self.api_key = DEEPSEEK_API_KEY
         self.api_url = DEEPSEEK_API_URL
         self.model = DEEPSEEK_MODEL
         self.timeout = DEEPSEEK_TIMEOUT_SECONDS
 
-    @property
-    def enabled(self) -> bool:
-        return bool(self.api_key)
-
     def analyze_road(self, road: List[str], local_result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        回傳格式固定：
-        {
-          side: "B" | "P" | "OBSERVE",
-          confidence: 0-100,
-          reason: "...",
-          pattern: "..."
-        }
-        """
-        if not self.enabled:
+        if not self.api_key:
             return {
                 "ok": False,
                 "side": "OBSERVE",
@@ -63,7 +57,7 @@ class DeepSeekClient:
                 "pattern": "DISABLED",
             }
 
-        road_text = "".join(road[-80:])
+        recent_road = "".join(road[-60:])
         local_summary = {
             "recommend": local_result.get("recommend"),
             "signal_level": local_result.get("signal_level"),
@@ -71,89 +65,71 @@ class DeepSeekClient:
             "banker_percent": local_result.get("banker_percent"),
             "player_percent": local_result.get("player_percent"),
             "tie_percent": local_result.get("tie_percent"),
+            "gap": local_result.get("gap"),
             "reason": local_result.get("reason"),
         }
 
-        system_prompt = (
-            "你是百家樂牌路分析校準器，只能基於使用者給的 B/P/T 牌路做統計與型態分析。"
-            "B=莊，P=閒，T=和。請不要保證命中，不要誇大勝率。"
-            "你的任務是獨立判斷下一手偏向 B、P 或 OBSERVE。"
-            "請只輸出 JSON，不要加多餘文字。"
-        )
-        user_prompt = {
-            "road": road_text,
-            "local_model_result": local_summary,
-            "output_schema": {
-                "side": "B 或 P 或 OBSERVE",
-                "confidence": "0到100的整數",
-                "pattern": "看到的主要牌路型態",
-                "reason": "50字內中文原因",
-            },
-        }
+        prompt = f"""
+你是一個百家樂牌路分析校準器。請基於牌路資料獨立判斷下一局方向，但請保守處理，不要硬推。
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
-            ],
-            "temperature": 0.15,
-            "max_tokens": 300,
-        }
+規則：
+- B=莊、P=閒、T=和。
+- 和局 T 不作為主要推薦方向，只作參考。
+- 若牌路混亂、差距不明顯、長龍過長、或模型分歧，請建議 OBSERVE。
+- 只輸出 JSON，不要輸出多餘文字。
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+最近牌路：{recent_road}
+本地模型摘要：{json.dumps(local_summary, ensure_ascii=False)}
+
+請輸出格式：
+{{
+  "side": "B 或 P 或 OBSERVE",
+  "confidence": 0-100,
+  "pattern": "你觀察到的牌路型態",
+  "reason": "50字內原因"
+}}
+""".strip()
 
         try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "你是嚴謹、保守的百家樂牌路分析校準器，只輸出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300,
+            }
             res = requests.post(self.api_url, headers=headers, json=payload, timeout=self.timeout)
             if res.status_code >= 400:
                 return {
                     "ok": False,
                     "side": "OBSERVE",
                     "confidence": 0,
-                    "reason": f"DeepSeek API 錯誤：HTTP {res.status_code}",
+                    "reason": f"DeepSeek HTTP {res.status_code}: {res.text[:120]}",
                     "pattern": "API_ERROR",
-                    "raw": res.text[:300],
                 }
-
             data = res.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             parsed = _extract_json(content)
-            if not parsed:
-                return {
-                    "ok": False,
-                    "side": "OBSERVE",
-                    "confidence": 0,
-                    "reason": "DeepSeek 回傳格式無法解析。",
-                    "pattern": "PARSE_ERROR",
-                    "raw": content[:300],
-                }
-
-            side = str(parsed.get("side", "OBSERVE")).upper().strip()
-            if side in ("莊", "BANKER"):
-                side = "B"
-            elif side in ("閒", "闲", "PLAYER"):
-                side = "P"
-            elif side not in ("B", "P"):
-                side = "OBSERVE"
-
+            side = _normalize_side(parsed.get("side"))
             try:
-                confidence = int(float(parsed.get("confidence", 0)))
+                confidence = int(parsed.get("confidence", 0))
             except Exception:
                 confidence = 0
             confidence = max(0, min(100, confidence))
-
             return {
                 "ok": True,
                 "side": side,
                 "confidence": confidence,
-                "pattern": str(parsed.get("pattern", "AI_PATTERN"))[:80],
-                "reason": str(parsed.get("reason", "AI 獨立校準完成。"))[:120],
+                "pattern": str(parsed.get("pattern") or "AI_PATTERN"),
+                "reason": str(parsed.get("reason") or "AI 已完成校準。"),
                 "raw": parsed,
             }
-
         except Exception as e:
             return {
                 "ok": False,
