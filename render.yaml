@@ -3,14 +3,50 @@ services:
     name: baccarat-ai-line-bot
     env: python
     plan: starter
-    buildCommand: pip install -r requirements.txt && playwright install chromium
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python -m playwright install chromium
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "/opt/render/project/.playwright"
+
       - key: HEADLESS
         value: "true"
+
       - key: POLL_INTERVAL_SECONDS
         value: "5"
+
+      - key: FRONTEND_AUTO_POLL_MS
+        value: "6000"
+
+      - key: AUTO_PUSH_NEW_ROUND
+        value: "true"
+
       - key: USE_DOM_READER
         value: "true"
+
       - key: USE_COLOR_READER
         value: "false"
+
+      - key: ROAD_X
+        value: "0"
+
+      - key: ROAD_Y
+        value: "0"
+
+      - key: CELL_W
+        value: "28"
+
+      - key: CELL_H
+        value: "28"
+
+      - key: ROAD_COLS
+        value: "30"
+
+      - key: ROAD_ROWS
+        value: "6"
+
+      - key: DEFAULT_TABLE_IDS
+        value: "RB01,RB02,RB03,RB04,RB05,RB06,RB07,RB08,RB09,RB10,RB11,RB12,RB13"
