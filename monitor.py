@@ -4,7 +4,7 @@
 import asyncio
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from baccarat_reader import BaccaratReader
+from baccarat_reader import BaccaratReader, LoginExpiredError
 from config import AUTO_PUSH_NEW_ROUND, POLL_INTERVAL_SECONDS
 from predictor import predict
 from session_store import update_session
@@ -29,6 +29,7 @@ class MonitorSession:
         self.browser = None
         self.page = None
         self.collector = None
+        self.target_locked = False
 
     async def start(self) -> None:
         if self.running:
@@ -55,12 +56,14 @@ class MonitorSession:
 
     async def _open(self) -> None:
         self.playwright, self.browser, self.page, self.collector = await self.reader.prepare_page(self.platform, self.hall)
-        await self.reader.click_any_text(self.page, [self.table_id])
+        self.target_locked = await self.reader.click_any_text(self.page, [self.table_id])
 
     async def refresh_once(self) -> Dict[str, Any]:
         if not self.page:
             await self._open()
-        data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id)
+        if not self.target_locked:
+            self.target_locked = await self.reader.click_any_text(self.page, [self.table_id])
+        data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id, target_locked=self.target_locked)
         road = data.get("road", [])
         prediction = predict(road)
         self.latest_data = data
@@ -90,7 +93,9 @@ class MonitorSession:
             await self._open()
             while self.running:
                 try:
-                    data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id)
+                    if not self.target_locked:
+                        self.target_locked = await self.reader.click_any_text(self.page, [self.table_id])
+                    data = await self.reader.read_from_page(self.page, self.collector, self.platform, self.hall, self.table_id, target_locked=self.target_locked)
                     road = data.get("road", [])
                     prediction = predict(road)
                     round_key = data.get("round_key")
@@ -124,6 +129,13 @@ class MonitorSession:
 
                 except asyncio.CancelledError:
                     raise
+                except LoginExpiredError as e:
+                    data = self.reader.login_expired_data(self.platform, self.table_id, e.diagnostics)
+                    update_session(self.user_id, status="登入失效", running=False, last_data=data)
+                    self.running = False
+                    if self.on_update:
+                        await self.on_update(self.user_id, data, {"recommend": "觀望", "reason": str(e), "ai_used": False})
+                    break
                 except Exception as e:
                     update_session(self.user_id, status=f"監控錯誤：{e}", running=self.running)
                     if self.on_update:

@@ -23,11 +23,49 @@ services:
       - key: USE_NETWORK_READER
         value: "true"
       - key: USE_COLOR_READER
-        value: "false"
+        value: "true"
       - key: ALLOW_DEFAULT_TABLE_IDS
         value: "false"
       - key: READER_WAIT_MS
         value: "3500"
+      - key: LINE_LOADING_ENABLED
+        value: "true"
+      - key: LINE_LOADING_SECONDS
+        value: "20"
+      - key: STRICT_TABLE_METADATA
+        value: "false"
+      - key: MANUAL_FIRST_TABLE_MODE
+        value: "false"
+      - key: AUTO_SCAN_TABLES_ON_HALL
+        value: "true"
+      - key: TABLE_CLICK_TIMEOUT_MS
+        value: "2500"
+      - key: TARGET_TABLE_ONLY
+        value: "true"
+      - key: ROAD_AUTO_DETECT
+        value: "true"
+      - key: AUTO_COLOR_FULL_SCAN
+        value: "true"
+      - key: ROAD_ROI_X
+        value: "0"
+      - key: ROAD_ROI_Y
+        value: "0"
+      - key: ROAD_ROI_W
+        value: "0"
+      - key: ROAD_ROI_H
+        value: "0"
+      - key: COLOR_MIN_AREA
+        value: "30"
+      - key: COLOR_MAX_AREA
+        value: "2500"
+      - key: TARGET_ROAD_ROI_X
+        value: "0"
+      - key: TARGET_ROAD_ROI_Y
+        value: "0"
+      - key: TARGET_ROAD_ROI_W
+        value: "0"
+      - key: TARGET_ROAD_ROI_H
+        value: "0"
       - key: ROAD_X
         value: "0"
       - key: ROAD_Y
@@ -40,3 +78,7 @@ services:
         value: "30"
       - key: ROAD_ROWS
         value: "6"
+      - key: LOGIN_CHECK_ENABLED
+        value: "true"
+      - key: LOGIN_MIN_TEXT_LENGTH
+        value: "80"

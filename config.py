@@ -43,9 +43,55 @@ AUTO_PUSH_NEW_ROUND = env_bool("AUTO_PUSH_NEW_ROUND", True)
 
 USE_DOM_READER = env_bool("USE_DOM_READER", True)
 USE_NETWORK_READER = env_bool("USE_NETWORK_READER", True)
-USE_COLOR_READER = env_bool("USE_COLOR_READER", False)
+USE_COLOR_READER = env_bool("USE_COLOR_READER", True)
 ALLOW_DEFAULT_TABLE_IDS = env_bool("ALLOW_DEFAULT_TABLE_IDS", False)
 READER_WAIT_MS = env_int("READER_WAIT_MS", 3500)
+
+# Login/session health detection. If the token URL expires or the game account is kicked out,
+# the reader will return a clear login_expired state instead of pretending table data was read.
+LOGIN_CHECK_ENABLED = env_bool("LOGIN_CHECK_ENABLED", True)
+LOGIN_EXPIRED_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv(
+        "LOGIN_EXPIRED_KEYWORDS",
+        "token expired,session expired,expired token,invalid token,token invalid,login expired,session timeout,please login,please sign in,重新登入,請重新登入,请重新登录,請登入,请登录,登入失效,登录失效,登入逾時,登录超时,連線逾時,连接超时,無效連結,无效链接,試玩已結束,试玩已结束,帳號已登出,账号已登出"
+    ).split(",")
+    if x.strip()
+]
+LOGIN_MIN_TEXT_LENGTH = env_int("LOGIN_MIN_TEXT_LENGTH", 80)
+
+# LINE chat loading animation. Works in one-on-one chats only.
+LINE_LOADING_ENABLED = env_bool("LINE_LOADING_ENABLED", True)
+LINE_LOADING_SECONDS = env_int("LINE_LOADING_SECONDS", 20)
+
+# Reader strictness: avoid showing fake text-only table ids like DG66/E9 unless they contain real metadata.
+STRICT_TABLE_METADATA = env_bool("STRICT_TABLE_METADATA", False)
+
+# v5: manual-first table selection. Recommended for live casino lobby UIs where table text/card data is delayed or canvas-rendered.
+MANUAL_FIRST_TABLE_MODE = env_bool("MANUAL_FIRST_TABLE_MODE", False)
+AUTO_SCAN_TABLES_ON_HALL = env_bool("AUTO_SCAN_TABLES_ON_HALL", True)
+TABLE_CLICK_TIMEOUT_MS = env_int("TABLE_CLICK_TIMEOUT_MS", 2500)
+TARGET_TABLE_ONLY = env_bool("TARGET_TABLE_ONLY", True)
+
+
+# Color road recognition. If ROAD_X/ROAD_Y are 0, fixed-grid mode is disabled; use ROI auto-detect instead.
+ROAD_AUTO_DETECT = env_bool("ROAD_AUTO_DETECT", True)
+AUTO_COLOR_FULL_SCAN = env_bool("AUTO_COLOR_FULL_SCAN", True)
+ROAD_ROI_X = env_int("ROAD_ROI_X", 0)
+ROAD_ROI_Y = env_int("ROAD_ROI_Y", 0)
+ROAD_ROI_W = env_int("ROAD_ROI_W", 0)
+ROAD_ROI_H = env_int("ROAD_ROI_H", 0)
+COLOR_MIN_AREA = env_int("COLOR_MIN_AREA", 30)
+COLOR_MAX_AREA = env_int("COLOR_MAX_AREA", 2500)
+
+# Optional per-selected-table ROI. If you manually input a table/room and the page is opened there,
+# set these to the bead-road/roadmap area only, not the full game lobby.
+TARGET_ROAD_ROI_X = env_int("TARGET_ROAD_ROI_X", 0)
+TARGET_ROAD_ROI_Y = env_int("TARGET_ROAD_ROI_Y", 0)
+TARGET_ROAD_ROI_W = env_int("TARGET_ROAD_ROI_W", 0)
+TARGET_ROAD_ROI_H = env_int("TARGET_ROAD_ROI_H", 0)
+
+
 
 PLAYWRIGHT_BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
 
