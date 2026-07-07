@@ -49,7 +49,7 @@
         <h1>富百家 AI Pro</h1>
         <span class="pill" id="statusPill">初始化</span>
       </div>
-      <p class="muted" style="color:#ddd;margin:10px 0 0;">開始預測 → 選平台 → 選遊戲廳 → 選真實桌號 → 自動分析。</p>
+      <p class="muted" style="color:#ddd;margin:10px 0 0;">開始預測 → 選平台 → 選遊戲廳 → 自動抓取牌桌 → 選桌 → 自動分析。</p>
     </div>
 
     <div class="card" id="guideCard">
@@ -71,9 +71,13 @@
     </div>
 
     <div class="card hidden" id="tableCard">
-      <div class="title">3. 選擇桌號</div>
-      <p class="muted">此處只顯示爬蟲實際讀到的桌號；如果沒有資料，代表尚未接到平台真實資料。</p>
-      <div id="tableList"></div>
+      <div class="title">3. 指定房號 / 桌號</div>
+      <p class="muted">系統會先自動抓取目前遊戲廳的所有牌桌。你用按鈕選擇牌桌後，才會針對該桌的紅藍綠牌路開始分析。</p>
+      <button class="btn btn-dark" style="margin-top:10px;" onclick="autoScanTables()">重新自動抓取牌桌</button>
+      <p class="muted" style="margin-top:10px;">若自動抓不到，可手動輸入房號：</p>
+      <input id="manualTable" placeholder="例如 E5 / R5037 / RB05" />
+      <button class="btn btn-yellow" style="margin-top:10px;" onclick="manualSelectTable()">手動監控此桌</button>
+      <div id="tableList" style="margin-top:12px;"></div>
     </div>
 
     <div class="card hidden" id="analysisCard">
@@ -182,21 +186,39 @@ async function selectPlatform(platform) {
 async function selectHall(hall) {
   setLoading(true);
   try {
-    setStatus('讀取桌號');
+    setStatus('自動抓牌桌');
     const data = await api('/api/flow/hall', {method:'POST', body:JSON.stringify({user_id:USER_ID, hall})});
     SESSION = data.session;
     renderTables(data.tables || []);
     show('tableCard', true); show('analysisCard', false);
-    setStatus('選桌號');
-  } catch(e) { alert('讀取桌號失敗：' + e.message); }
+    setStatus((data.tables || []).length ? '選桌號' : '等待牌桌');
+  } catch(e) { alert('設定遊戲廳失敗：' + e.message); }
   finally { setLoading(false); }
+}
+
+async function autoScanTables() {
+  setLoading(true);
+  try {
+    setStatus('自動掃描');
+    const data = await api('/api/flow/tablescan', {method:'POST', body:JSON.stringify({user_id:USER_ID})});
+    SESSION = data.session;
+    renderTables(data.tables || []);
+    setStatus('選桌號');
+  } catch(e) { alert('自動掃描失敗：' + e.message); }
+  finally { setLoading(false); }
+}
+
+async function manualSelectTable() {
+  const tableId = (document.getElementById('manualTable').value || '').trim().toUpperCase();
+  if (!tableId) { alert('請輸入房號或桌號，例如 E5'); return; }
+  await selectTable(tableId);
 }
 
 function renderTables(tables) {
   const box = document.getElementById('tableList');
   box.innerHTML = '';
   if (!tables.length) {
-    box.innerHTML = '<p class="muted">目前沒有讀取到真實桌號。請確認平台 token 是否有效，或開 /api/debug/tables 測試。</p>';
+    box.innerHTML = '<p class="muted">尚未抓到牌桌。可按「重新自動抓取牌桌」，或手動輸入房號。</p>'; 
     return;
   }
   tables.forEach(t => {
